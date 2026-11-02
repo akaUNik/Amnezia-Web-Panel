@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.9.0-rc.1] - 2026-11-02
+
 ### Added
 - Verified Linux/Windows binary builds, GHCR digest promotion, and resumable releases (#5).
 - Stable update checks from this repository with feedback in all five locales (#5).
