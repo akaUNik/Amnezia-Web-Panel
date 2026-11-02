@@ -989,5 +989,12 @@
     "full_backup_offline": "Complete archives can only be restored offline after independent VPN-node reconciliation. The JSON restore below is a limited legacy operation.",
     "legacy_json_backup": "Legacy JSON export (not a complete backup)",
     "full_backup_busy": "State is busy or could not be read consistently. Wait for pending operations, then retry; inspect private storage if the error persists.",
-    "full_backup_error": "Backup could not be downloaded. Check administrator access and storage."
+    "full_backup_error": "Backup could not be downloaded. Check administrator access and storage.",
+  "view_releases": "View releases",
+  "update_no_newer": "No newer stable version was found.",
+  "update_no_release": "No stable release has been published yet.",
+  "update_rate_limit": "GitHub API limit reached. Try again later or open Releases.",
+  "update_timeout": "Update check timed out. Try again or open Releases.",
+  "update_uncomparable": "Unable to compare these versions. Check Releases manually.",
+  "update_error": "Unable to check for updates. Try again or open Releases."
 }

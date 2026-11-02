@@ -62,6 +62,7 @@ from mail_service import (
     merge_mail_settings,
 )
 from pwa import build_manifest
+from project_info import UPDATE_SOURCE
 from captcha_challenges import captcha_challenges
 from user_state import reconcile_user_state, apply_traffic_samples, traffic_server_identity
 from connection_service import (
@@ -8011,6 +8012,7 @@ def settings_page(request: Request):
         settings=data.get('settings', {}),
         servers=data.get('servers', []),
         current_version=CURRENT_VERSION,
+        update_source=UPDATE_SOURCE,
         backup_csrf=backup_csrf,
         self_service_protocol_choices=self_service_protocol_choices(),
     )

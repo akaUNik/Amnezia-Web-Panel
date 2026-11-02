@@ -30,6 +30,19 @@ coverage.xml
 
 # User data
 data.json
+data.json.*
+.aws/
+.ssh/
+.env
+.env.*
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+known_hosts*
+ssh_known_hosts*
+ssl_temp/
+bin/
 *.runtime.lock
 .DS_Store
 
@@ -38,4 +51,5 @@ data.json
 .vscode/
 .idea/
 .worktrees/
-docs/
+docs/*
+!docs/github-ci.md
