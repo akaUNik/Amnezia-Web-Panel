@@ -2,12 +2,27 @@
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 
+from project_info import GITHUB_PROJECT
 from .artifacts import checksum, verify_release
 from .github import GitHub
 from .promote import summary
 from .version import parse_version, read_version, validate_tag
+
+
+def release_notes(tag, sha, github, changelog=Path('CHANGELOG.md')):
+    if changelog.is_file():
+        text=changelog.read_text(encoding='utf-8')
+        section=re.search(r'^## \['+re.escape(tag.removeprefix('v'))+r'\][^\n]*\n(.*?)(?=^## \[|\Z)',text,re.M|re.S)
+        if section:
+            previous=re.search(r'^## \[([0-9]+\.[0-9]+\.[0-9]+[^\]]*)\]',text[section.end():],re.M)
+            base='https://github.com/'+GITHUB_PROJECT
+            link=(base+'/compare/v'+previous[1]+'...'+tag if previous else base+'/commits/'+tag)
+            return section[1].strip()+'\n\n**Full Changelog**: '+link
+    return github.repo('releases/generate-notes',method='POST',
+                       data={'tag_name':tag,'target_commitish':sha})['body']
 
 
 def readback(github, release, directory, names):
@@ -36,11 +51,10 @@ def publish(directory, tag, sha, version, github, emit=summary):
     current=github.release(tag)
     prerelease=bool(parse_version(version).prerelease)
     if current is None:
-        notes=github.repo('releases/generate-notes',method='POST',
-                          data={'tag_name':tag,'target_commitish':sha})
+        notes=release_notes(tag,sha,github)
         current=github.repo('releases',method='POST',data={
             'tag_name':tag,'target_commitish':sha,'name':tag,'draft':True,
-            'prerelease':prerelease,'body':marker+'\n\n'+notes['body']})
+            'prerelease':prerelease,'body':marker+'\n\n'+notes})
         emit(f'Created draft release `{tag}` for `{sha}`')
     with tempfile.TemporaryDirectory(prefix='release-readback-') as tmp:
         downloaded=Path(tmp)

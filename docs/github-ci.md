@@ -41,7 +41,10 @@ current main SHA before promoting main/latest aliases.
 ## Version and dependencies
 
 Before a release, update `CURRENT_VERSION` in `app.py` and the project version
-in `pyproject.toml`, then run `uv lock` and commit `uv.lock`. Push the release
+in `pyproject.toml`, move Unreleased entries to the matching version section
+in `CHANGELOG.md`, then run `uv lock` and commit `uv.lock`. Release notes use
+that version's changelog sections and a comparison link when available.
+Push the release
 tag only after the normal Gitflow release PR process. The tag must be valid
 SemVer and match the application version, ignoring the optional `v` prefix.
 A mismatch or malformed tag stops the build graph before GHCR push. Release

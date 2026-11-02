@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from scripts.ci import artifacts as a
 from scripts.ci.github import GitHub
-from scripts.ci.release import publish
+from scripts.ci.release import publish, release_notes
 
 SHA='a'*40
 
@@ -143,3 +143,12 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(github.release('v1.9.0'),draft)
         with patch.object(github,'repo',side_effect=[{'object':{'type':'tag','sha':'b'*40}}, {'object':{'type':'commit','sha':SHA}}]):
             self.assertEqual(github.tag_sha('v1.9.0'),SHA)
+
+    def test_release_notes_use_version_sections_and_comparison_link(self):
+        path=self.root/'CHANGELOG.md'
+        path.write_text('# Changelog\n## [Unreleased]\nFuture changes\n## [1.9.0] - 2026-11-02\n### Added\n- Distribution (#5)\n## [1.8.4] - 2026-10-01\n### Fixed\n- Previous change\n')
+        notes=release_notes('v1.9.0',SHA,GitHubDouble(),path)
+        self.assertTrue(notes.startswith('### Added\n- Distribution (#5)'))
+        self.assertIn('/compare/v1.8.4...v1.9.0',notes)
+        self.assertNotIn('Future changes',notes)
+        self.assertNotIn('## [1.9.0]',notes)
