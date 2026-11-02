@@ -14,16 +14,37 @@ def workflow(name):
     return yaml.load((ROOT / '.github/workflows' / name).read_text(), Loader=yaml.BaseLoader)
 
 
-def evaluate(expression, repository, event, ref):
+def evaluate(expression, repository, event, ref, qualify=False):
     expression = expression.removeprefix('${{').removesuffix('}}').strip()
     expression = expression.replace('&&', ' and ').replace('||', ' or ')
+    expression = re.sub(r'!(?!=)', 'not ', expression)
     return eval(expression, {'__builtins__': {}}, {
         'github': SimpleNamespace(repository=repository, event_name=event, ref=ref),
+        'inputs': SimpleNamespace(qualify_published=qualify),
         'startsWith': lambda value, prefix: value.startswith(prefix),
     })
 
 
 class WorkflowContracts(unittest.TestCase):
+    def test_published_compose_requires_own_manual_opt_in(self):
+        config = workflow('test.yml')
+        job = config['jobs']['published-compose']
+        self.assertEqual(config['on']['workflow_dispatch']['inputs']['qualify_published']['default'], 'false')
+        self.assertEqual(job['runs-on'], 'ubuntu-24.04')
+        self.assertEqual(job['timeout-minutes'], '15')
+        self.assertNotIn('permissions', job)
+        self.assertEqual(config['permissions'], {'contents': 'read'})
+        for repository in ('akaUNik/Amnezia-Web-Panel', 'someone/fork'):
+            for event in ('push', 'pull_request', 'workflow_dispatch'):
+                for enabled in (True, False):
+                    self.assertEqual(bool(evaluate(job['if'], repository, event, 'refs/heads/test', enabled)),
+                                     repository == 'akaUNik/Amnezia-Web-Panel' and event == 'workflow_dispatch' and enabled)
+                    self.assertEqual(bool(evaluate(config['jobs']['unittest']['if'], repository, event,
+                                                   'refs/heads/test', enabled)),
+                                     event != 'workflow_dispatch' or not enabled)
+        self.assertFalse(any('login-action' in step.get('uses', '') for step in job['steps']))
+        self.assertNotIn('GH_TOKEN', str(job))
+
     def test_binary_matrix_contains_linux_and_windows_only(self):
         build = workflow('build.yml')['jobs']['build']
         entries = build['strategy']['matrix']['include']

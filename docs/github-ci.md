@@ -344,3 +344,30 @@ The reviewed main history was back-merged into develop through
 [#11](https://github.com/akaUNik/Amnezia-Web-Panel/pull/11), whose full
 [verification](https://github.com/akaUNik/Amnezia-Web-Panel/actions/runs/41443922627)
 passed. Both protected branches were retained.
+
+
+## Optional published Compose qualification
+
+`Tests` offers a separate `published-compose` job only for an explicit manual
+run in this repository. Default, PR, reusable, and publishing runs skip it.
+It has read-only repository permission, uses an empty Docker auth config,
+pins both images by digest, and never builds or publishes images/releases.
+Use a full expected source SHA when qualifying a specific main publication:
+
+```sh
+gh workflow run test.yml --repo akaUNik/Amnezia-Web-Panel --ref develop \
+  -f qualify_published=true \
+  -f qualification_tag=sha-335ac28683b1a8c1e6123d49ca5a8a95eb03781b \
+  -f qualification_sha=335ac28683b1a8c1e6123d49ca5a8a95eb03781b
+```
+
+`qualification_tag` defaults to `latest`; the WARP selector adds `-warp`.
+Both variants must have the same source identity and expected platforms.
+The Linux runner uses the published Compose configurations with unique
+project/volume names and localhost ports, preserving WARP's device/capability
+requirements. It checks login/static HTTP and compares synthetic persistent
+state hashes across container recreation, including WARP's separate volume.
+Cleanup removes only those generated fixture projects/volumes. JSON evidence
+is retained as `published-compose-qualification` for 30 days. No credentials
+or panel data are uploaded. This opt-in run performs only qualification;
+ordinary manual, PR, and reusable runs retain the full unittest job.
