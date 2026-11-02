@@ -989,5 +989,12 @@
     "full_backup_offline": "La restauration complète exige un arrêt et une vérification indépendante des nœuds VPN. La restauration JSON ci-dessous est limitée.",
     "legacy_json_backup": "Ancien export JSON (sauvegarde incomplète)",
     "full_backup_busy": "État occupé ou instantané cohérent indisponible. Attendez la fin des opérations et réessayez ; vérifiez le stockage privé si nécessaire.",
-    "full_backup_error": "Téléchargement impossible. Vérifiez les droits administrateur et le stockage."
+    "full_backup_error": "Téléchargement impossible. Vérifiez les droits administrateur et le stockage.",
+  "view_releases": "Voir les versions",
+  "update_no_newer": "Aucune version stable plus récente trouvée.",
+  "update_no_release": "Aucune version stable n’a encore été publiée.",
+  "update_rate_limit": "Limite de l’API GitHub atteinte. Réessayez plus tard ou consultez les versions.",
+  "update_timeout": "La vérification a expiré. Réessayez ou consultez les versions.",
+  "update_uncomparable": "Impossible de comparer ces versions. Consultez les versions manuellement.",
+  "update_error": "Impossible de vérifier les mises à jour. Réessayez ou consultez les versions."
 }
