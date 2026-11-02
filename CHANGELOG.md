@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-11-02
+
+### Added
+- AWG kernel and userspace component updates with progress, cancellation, and recovery (#13).
+- Published Compose image qualification on native Linux (#10).
+
+### Fixed
+- Preserve peer access decisions through component updates and rollback (#13).
+- Require authoritative peer state before archiving server accounting ownership (#13).
+- Restore kernel modules and managed AWG/Exit tunnels after failed updates (#13).
+- Recover lost AWG and Exit interfaces while preserving peer configuration (#13).
+- Accept admin API tokens on user and configuration routes (#13).
+- Restore RKN block startup and parallel Smart Route status rendering (#13).
+- Resume update polling when reopening the server modal (#13).
+
+### Security
+- Bind updates to stable server identities and serialize conflicting operations (#13).
+- Use private per-operation userspace staging and verify pinned source build identity (#13).
+
 ## [1.9.0] - 2026-11-02
 
 ### Added
