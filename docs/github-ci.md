@@ -82,7 +82,7 @@ chmod +x linux/Amnezia-Web-Panel-Linux
 ./linux/Amnezia-Web-Panel-Linux
 ```
 
-On Windows, run `windows\Amnezia-Web-Panel-Windows.exe` in PowerShell.
+On Windows, run `.\windows\Amnezia-Web-Panel-Windows.exe` in PowerShell.
 The panel listens on localhost port 5000 by default. Choose an explicit
 `DATA_FILE` path to keep state across upgrades. Remote download and smoke
 qualification remains required before these commands are considered verified
@@ -217,3 +217,55 @@ own-Releases links, and restored controls. Desktop 1280x900 and mobile 375x900
 were checked; labels wrap on mobile. API requests were intercepted and there
 were no page errors or requests to upstream release endpoints. Screenshots
 are local QA artifacts, not committed distribution files.
+
+## Completed qualification, 2026-11-02
+
+The implementation commit tested by the final manual run is
+`eebeefa191b860520034fe18eab26e0a8d60890c`.
+
+- [Manual run 41434416280](https://github.com/akaUNik/Amnezia-Web-Panel/actions/runs/41434416280): verification, both native binaries, default amd64/arm64 Docker, and WARP amd64 Docker all passed. Each native job used the documented `gh run download`, verified metadata and SHA256, then successfully repeated login/static/shutdown smoke on the downloaded file.
+- [PR verification 41434072391](https://github.com/akaUNik/Amnezia-Web-Panel/actions/runs/41434072391): full Linux/Python 3.11 unittest and Chromium coverage passed, followed by all 112 isolated root regressions.
+- Full local Python 3.11/Chromium run: **1286 tests, 0 failures, 0 errors**. The one skipped import is the pre-existing pytest-only live-server module, outside required unittest coverage. No required group was skipped. The host was macOS; only synthetic clients-table SSH shell scripts were executed in isolated Linux containers to preserve the target server's GNU chmod semantics. Original assertions and other shell fixtures were retained. This is a local hybrid run, not a claim of a full native Linux run.
+- Final local Linux arm64/Python 3.14 runtime image: all **112 root regressions** and six focused clients-table/SSH tests passed without skips. Login/static HTTP smoke, clean shutdown, resource presence, ignored local directories, and runtime-only dependency groups were verified.
+- `actionlint`, translation completeness, Node syntax/SemVer/API doubles, release/promotion doubles, lock consistency, and all three Compose configurations passed. `sha256sum -c SHA256SUMS` passed against a complete synthetic four-asset set; release download options were checked against GitHub CLI help. Real version-release qualification remains pending.
+
+| Native artifact | Artifact ID | ZIP bytes | Expires (UTC) |
+| --- | --- | --- | --- |
+| [binaries-Linux](https://github.com/akaUNik/Amnezia-Web-Panel/actions/runs/41434416280/artifacts/13135957399) | 13135957399 | 44308376 | 2026-12-02 11:13:01 |
+| [binaries-Windows](https://github.com/akaUNik/Amnezia-Web-Panel/actions/runs/41434416280/artifacts/13135932378) | 13135932378 | 30244738 | 2026-12-02 11:12:57 |
+
+Readback binary SHA256 (ZIP checksums are different):
+
+```text
+f833e9be300c414bffd83fdbc1b6af37ceb99d65d7d0db343518b29b9b4e90b2  Amnezia-Web-Panel-Linux
+d32db466249a2174247bafb5c7bfe60fedab17f11e7cae339b006e9630c59d95  Amnezia-Web-Panel-Windows.exe
+```
+
+The final manual run produced exactly those two artifacts. `prepare`,
+`promote`, and `release` were skipped. The Releases API returned an empty list
+both before and after manual qualification; no draft or published release was
+created. The GHCR package endpoint returned 404 both before and after with the
+available credentials. Public package visibility, anonymous pulls, and a real
+main pipeline are therefore still **unverified**, tracked in task 7.3; the
+manual run's login/push guards and skipped publishing jobs confirm it did not
+promote production tags.
+
+Actions settings were checked: enabled, all actions allowed, default token
+permissions read-only. Artifact API timestamps confirm the configured 30-day
+retention. Real prerelease/stable publication, complete release readback,
+latest-channel checks, and a live stable update lookup remain task 7.4 and
+require an agreed release version. No synthetic stable release was created.
+
+| Settings UI check | Result |
+| --- | --- |
+| Page identity and meaningful content | Pass: /settings, localized title/content |
+| Framework error overlay / app page errors | Pass: none |
+| New release → 404 → error → retry | Pass in en/ru/fr/zh/fa |
+| Trusted Releases link and safe version text | Pass |
+| Screenshots and label layout | Pass at 1280x900 and 375x900 |
+
+Local QA evidence is stored outside the repository in
+`/private/tmp/amnezia-updates-qa/`; full local and native job logs are in
+`/private/tmp/amnezia-local-full-tests-verified.log`,
+`/private/tmp/amnezia-final-root.log`, and
+`/private/tmp/amnezia-native-{linux,windows}.log`.
