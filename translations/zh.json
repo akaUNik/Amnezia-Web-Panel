@@ -989,5 +989,12 @@
     "full_backup_offline": "完整恢复必须离线进行，并独立核对 VPN 节点状态。下方 JSON 恢复仅支持旧格式。",
     "legacy_json_backup": "旧版 JSON 导出（非完整备份）",
     "full_backup_busy": "状态正忙或无法取得一致快照。请等待操作完成后重试；若持续失败，请检查私有存储。",
-    "full_backup_error": "无法下载备份。请检查管理员权限和存储。"
+    "full_backup_error": "无法下载备份。请检查管理员权限和存储。",
+  "view_releases": "查看发行版",
+  "update_no_newer": "未找到更新的稳定版本。",
+  "update_no_release": "尚未发布稳定版本。",
+  "update_rate_limit": "已达到 GitHub API 限制。请稍后重试或查看发行版。",
+  "update_timeout": "更新检查超时。请重试或查看发行版。",
+  "update_uncomparable": "无法比较这些版本。请手动查看发行版。",
+  "update_error": "无法检查更新。请重试或查看发行版。"
 }

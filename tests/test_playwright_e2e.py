@@ -1,7 +1,7 @@
 """Playwright E2E tests for Amnezia Web Panel.
 
 Run with pytest against a panel already serving on BASE_URL. `unittest
-discover` imports every tests/ module, and pytest is not in requirements.txt,
+discover` imports every tests/ module, and pytest is not a project dependency,
 so the import is guarded: without it the module skips instead of failing the
 whole suite.
 """

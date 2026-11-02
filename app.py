@@ -62,6 +62,7 @@ from mail_service import (
     merge_mail_settings,
 )
 from pwa import build_manifest
+from project_info import UPDATE_SOURCE
 from captcha_challenges import captcha_challenges
 from user_state import reconcile_user_state, apply_traffic_samples, traffic_server_identity
 from connection_service import (
@@ -207,7 +208,7 @@ DATA_FILE = os.path.abspath(os.path.expanduser(
     os.environ.get('DATA_FILE') or os.path.join(application_path, 'data.json')
 ))
 ssh_trust.configure(DATA_FILE)
-CURRENT_VERSION = "v1.8.4"
+CURRENT_VERSION = "v1.9.0"
 
 # Custom protocol instance names: the rename modal caps input at 64 chars.
 CUSTOM_PROTOCOL_NAME_MAX = 64
@@ -8011,6 +8012,7 @@ def settings_page(request: Request):
         settings=data.get('settings', {}),
         servers=data.get('servers', []),
         current_version=CURRENT_VERSION,
+        update_source=UPDATE_SOURCE,
         backup_csrf=backup_csrf,
         self_service_protocol_choices=self_service_protocol_choices(),
     )

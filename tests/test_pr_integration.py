@@ -17,6 +17,7 @@ from unittest.mock import Mock, patch
 from fastapi.testclient import TestClient
 import app as panel
 from managers.ssh_manager import SSHManager
+from managers.ssh_errors import SSHConnectionUnavailable
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -70,9 +71,11 @@ class IntegrationTests(unittest.TestCase):
         try:
             with patch('managers.ssh_manager.paramiko.SSHClient.connect', side_effect=OSError('isolated unreachable')) as connect, \
                  patch('managers.ssh_manager.time.time', return_value=100):
-                with self.assertRaisesRegex(Exception, 'isolated unreachable'):
+                with self.assertRaises(SSHConnectionUnavailable) as failure:
                     ssh.connect()
-                with self.assertRaisesRegex(Exception, 'backing off'):
+                self.assertIsInstance(failure.exception.__cause__, OSError)
+                self.assertEqual(str(failure.exception.__cause__), 'isolated unreachable')
+                with self.assertRaisesRegex(SSHConnectionUnavailable, 'backing off'):
                     ssh.ensure_connected()
                 self.assertEqual(connect.call_count, 2)
         finally:

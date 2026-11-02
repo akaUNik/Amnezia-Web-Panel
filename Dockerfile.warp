@@ -2,9 +2,10 @@
 
 # Optional image variant with Cloudflare WARP installed inside the container.
 # Use with:
-#   docker compose -f docker-compose.yml -f docker-compose.warp.yml up -d --build
+#   docker compose -f docker-compose.yml -f docker-compose.warp.yml -f docker-compose.warp.local.yml up -d --build
 
 FROM python:3.14-slim-bookworm
+COPY --from=ghcr.io/astral-sh/uv:0.10.5 /uv /usr/local/bin/uv
 
 WORKDIR /app
 
@@ -27,8 +28,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends cloudflare-warp \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt requirements.txt
-RUN pip3 install --no-cache-dir -r requirements.txt
+ENV UV_PYTHON_DOWNLOADS=never \
+    PATH="/app/.venv/bin:$PATH"
+COPY pyproject.toml uv.lock ./
+RUN uv sync --locked --no-dev --no-cache --python /usr/local/bin/python3
 
 COPY . .
 COPY docker-entrypoint-warp.sh /usr/local/bin/docker-entrypoint-warp.sh

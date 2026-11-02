@@ -9,6 +9,7 @@ import pathlib
 import time
 import traceback
 import weakref
+from managers.ssh_errors import SSHConnectionUnavailable
 
 
 _mutation_locks = weakref.WeakKeyDictionary()
@@ -133,6 +134,12 @@ def serialize_peer_lifecycle(function):
                     if _uncertain.get()['unknown']:
                         raise PeerLifecycleUncertain('peer_lifecycle_uncertain')
                     return result
+                except SSHConnectionUnavailable:
+                    # Connect/handshake failures and cooldowns submit no command.
+                    # A previous lost reply in this operation must still fence it.
+                    if _uncertain.get()['unknown']:
+                        raise PeerLifecycleUncertain('peer_lifecycle_uncertain') from None
+                    raise
                 except (TimeoutError, ConnectionError):
                     note_ssh_uncertainty()
                     raise PeerLifecycleUncertain('peer_lifecycle_uncertain') from None

@@ -4,6 +4,8 @@ Uses raw Telegram Bot API via httpx — no library version conflicts.
 Runs as a background asyncio task alongside the FastAPI app.
 """
 from peer_accounting import serialize_peer_lifecycle
+from peer_lifecycle_lock import PeerLifecycleUncertain
+from managers.ssh_errors import SSHConnectionUnavailable
 import asyncio
 import html
 import logging
@@ -102,6 +104,8 @@ TG_TRANSLATIONS = {
         "self_service_no_servers": "No servers are available for self-service connection creation.\nPlease contact your administrator.",
         "self_service_disabled_contact": "Self-service is disabled. Contact your administrator.",
         "self_service_unavailable": "Self-service is not available.",
+        "self_service_server_unreachable": "Could not connect to the VPN server. Please try again in a few minutes.",
+        "self_service_recovery_required": "Connection changes are temporarily blocked. Please contact your administrator to restore service.",
         "server_not_self_service": "This server is not available for self-service.",
         "no_protocols_available": "No protocols available on this server.",
         "name_empty": "Name cannot be empty. Send a connection name or /cancel.",
@@ -212,6 +216,8 @@ TG_TRANSLATIONS = {
         "self_service_no_servers": "Нет серверов, доступных для создания подключений через self-service.\nОбратитесь к администратору.",
         "self_service_disabled_contact": "Self-service отключён. Обратитесь к администратору.",
         "self_service_unavailable": "Self-service недоступен.",
+        "self_service_server_unreachable": "Не удалось связаться с VPN-сервером. Повторите попытку через несколько минут.",
+        "self_service_recovery_required": "Изменение подключений временно заблокировано. Обратитесь к администратору для восстановления работы.",
         "server_not_self_service": "Этот сервер недоступен для self-service.",
         "no_protocols_available": "На этом сервере нет доступных протоколов.",
         "name_empty": "Имя не может быть пустым. Отправьте имя подключения или /cancel.",
@@ -1624,6 +1630,12 @@ async def _user_create_connection(api: TelegramAPI, chat_id: int, panel_user: di
             else:
                 if loading_msg_id:
                     await api.edit_message(chat_id, loading_msg_id, f"✅ {_tt(lang, 'connection_created_success')}")
+    except SSHConnectionUnavailable:
+        logger.warning("Bot: self-service server connection unavailable")
+        await api.send_message(chat_id, f"❌ {_tt(lang, 'self_service_server_unreachable')}")
+    except PeerLifecycleUncertain:
+        logger.error("Bot: self-service requires lifecycle recovery")
+        await api.send_message(chat_id, f"❌ {_tt(lang, 'self_service_recovery_required')}")
     except Exception as e:
         logger.exception("Bot: self-service create failed")
         await api.send_message(chat_id, f"❌ {_tt(lang, 'error')}: {_tt(lang, 'self_service_unavailable')}")
