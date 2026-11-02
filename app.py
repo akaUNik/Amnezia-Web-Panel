@@ -2011,6 +2011,19 @@ async def _propagate_user_state(user_id):
 
 async def perform_toggle_user(data: dict, user_id: str, enable: bool) -> bool:
     # The old snapshot/enable arguments are deliberately not authoritative.
+    try:
+        return await _apply_user_state_locked(user_id)
+    except (peer_lifecycle_lock.PeerLifecycleBusy, peer_lifecycle_lock.PeerLifecycleUncertain):
+        # Keep the already-committed intent pending for the next sync. Only
+        # remote propagation waits; callers may still save a newer revocation.
+        return False
+
+
+@serialize_peer_lifecycle(wait_for_completion=True)
+async def _apply_user_state_locked(user_id):
+    # Acquire admission before consulting/creating the per-user task. Otherwise
+    # a mass operation holding the interlock could await a cached worker that
+    # is itself waiting to acquire that same interlock.
     task = _USER_STATE_TASKS.get(user_id)
     if task is None or task.done():
         task = asyncio.create_task(_propagate_user_state(user_id))
@@ -5796,6 +5809,34 @@ async def api_awg_plugin_update(request: Request, server_id: int, req: AwgPlugin
 
 
 async def _run_awg_plugin_update(op_id, server_id, component, target, allow_interrupt):
+    started = asyncio.Event()
+
+    def reject(code, message, state='failed'):
+        op = _awg_plugin_ops[op_id]
+        op['state'] = state
+        op['error'] = {'code': code, 'message': message}
+        op['finished_at'] = datetime.now().isoformat(timespec='seconds')
+        op['finished_ts'] = datetime.now().timestamp()
+        if _awg_plugin_active.get(op['server_uid']) == op_id:
+            _awg_plugin_active.pop(op['server_uid'])
+        _awg_plugin_save()
+
+    try:
+        await _run_awg_plugin_update_locked(op_id, server_id, component, target, allow_interrupt, started)
+    except (peer_lifecycle_lock.PeerLifecycleBusy, peer_lifecycle_lock.PeerLifecycleUncertain) as exc:
+        # Admission can fail before the worker starts. Do not leave a queued
+        # operation running forever. Cancellation, on the other hand, leaves
+        # an admitted worker owning its interlock and operation until it ends.
+        reject(exc.code, str(exc))
+    except asyncio.CancelledError:
+        if not started.is_set():
+            reject('cancelled', 'update cancelled before admission', 'cancelled')
+        raise
+
+
+@serialize_peer_lifecycle(wait_for_completion=True)
+async def _run_awg_plugin_update_locked(op_id, server_id, component, target, allow_interrupt, started):
+    started.set()
     op = _awg_plugin_ops[op_id]
 
     def log(stage, message):

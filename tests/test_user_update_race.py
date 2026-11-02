@@ -16,6 +16,7 @@ import unittest
 from pydantic import BaseModel
 from fastapi.responses import JSONResponse
 from user_state import reconcile_user_state, traffic_server_identity
+import peer_lifecycle_lock
 
 SOURCE = Path(__file__).resolve().parents[1] / 'app.py'
 GIB = 1024 ** 3
@@ -27,6 +28,7 @@ def actual_code(path, data_file, request_type=object, response_type=JSONResponse
         'load_data', 'save_data', 'perform_toggle_user', 'api_update_user',
         'api_toggle_user', '_request_user', 'UpdateUserRequest', 'ToggleUserRequest',
         '_propagate_user_state', '_user_connection_identity',
+        '_apply_user_state_locked',
     }
     tree = ast.parse(path.read_text(encoding='utf-8'))
     nodes = [node for node in tree.body if getattr(node, 'name', '') in names]
@@ -47,6 +49,7 @@ def actual_code(path, data_file, request_type=object, response_type=JSONResponse
         hash_password=lambda value: 'test-hash',
         reconcile_user_state=reconcile_user_state,
         traffic_server_identity=traffic_server_identity, _USER_STATE_TASKS={},
+        peer_lifecycle_lock=peer_lifecycle_lock,
     )
     exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])),
                  str(path), 'exec'), ns)
