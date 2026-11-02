@@ -19,6 +19,7 @@ FORWARD position 1 and keep filtering both paths regardless.
 import ipaddress
 import json
 import re
+import shlex
 
 # Host-side layout (all panel-managed, no docker on the host side)
 SMARTR_DIR = '/etc/smartroute'
@@ -559,7 +560,7 @@ class SmartRouteManager:
         self.ssh.upload_file(body, '/tmp/_smartr_own.cidr')
         try:
             _, err, code = self.ssh.run_sudo_command(
-                f'mkdir -p {SMARTR_DIR} && cp /tmp/_smartr_own.cidr {SMARTR_OWN}')
+                "sh -c " + shlex.quote(f'mkdir -p {SMARTR_DIR} && cp /tmp/_smartr_own.cidr {SMARTR_OWN}'))
         finally:
             self.ssh.run_command('rm -f /tmp/_smartr_own.cidr')
         if code != 0:
@@ -614,7 +615,7 @@ class SmartRouteManager:
         enable or disable.
         """
         _, err, code = self.ssh.run_sudo_command(
-            f'mkdir -p {SMARTR_INSTANCES} && echo {SMARTR_TABLE} > {SMARTR_INSTANCES}/{container}')
+            "sh -c " + shlex.quote(f'mkdir -p {SMARTR_INSTANCES} && echo {SMARTR_TABLE} > {SMARTR_INSTANCES}/{container}'))
         if code != 0:
             raise SmartRouteError((err or 'failed to write the instance marker').strip())
         self._push_merged_list(container)
