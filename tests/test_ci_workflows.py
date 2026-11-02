@@ -31,6 +31,9 @@ class WorkflowContracts(unittest.TestCase):
         self.assertEqual({row['system'] for row in entries}, {'Linux', 'Windows'})
         self.assertTrue(all(row['arch'] == 'x86_64' for row in entries))
         self.assertNotIn('macOS', str(build))
+        self.assertEqual(build['permissions'],{'contents':'read','actions':'read'})
+        self.assertTrue(any('gh run download' in s.get('run','') for s in build['steps']))
+        self.assertTrue(any(s.get('name')=='Smoke downloaded binary on native OS' for s in build['steps']))
 
     def test_shared_verification_and_sha(self):
         build, tests = workflow('build.yml'), workflow('test.yml')

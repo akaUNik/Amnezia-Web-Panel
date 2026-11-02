@@ -30,7 +30,10 @@ Only push events in the distribution repository on main or `v*` can log in
 and push. Only version pushes can create a release. Manual builds and forks
 do not publish. Default permissions are `contents: read`; container jobs
 alone request `packages: write`, and release publication requests
-`contents: write`.
+`contents: write`. Binary jobs also request `actions: read` solely to download
+their just-uploaded artifacts with GitHub CLI. Each native runner validates
+readback SHA/version/architecture/checksum and repeats HTTP/shutdown smoke
+checks on the downloaded executable.
 
 Build workflows share a repository concurrency group with
 `cancel-in-progress: false`. An active publication is never cancelled by a

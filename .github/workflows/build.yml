@@ -37,6 +37,9 @@ jobs:
   build:
     needs: [tests, version]
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      actions: read
 
     strategy:
       matrix:
@@ -108,6 +111,19 @@ jobs:
         path: dist/*
         retention-days: 30
         if-no-files-found: error
+
+    - name: Download uploaded binary artifact
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "binaries-${{ runner.os }}" --dir downloaded
+
+    - name: Verify downloaded binary identity and checksum
+      shell: bash
+      run: python -m scripts.ci.artifacts verify-binary --directory downloaded --system "${{ matrix.system }}" --sha "$GITHUB_SHA"
+
+    - name: Smoke downloaded binary on native OS
+      run: python scripts/ci/smoke.py "downloaded/${{ matrix.binary }}"
 
   docker:
     needs: [tests, version]

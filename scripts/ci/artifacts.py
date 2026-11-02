@@ -59,19 +59,22 @@ def validate_binaries(directory, sha, version):
                 for name in (filename, f'metadata-{system}.json')}
     if {p.name for p in directory.iterdir()} != expected:
         raise ValueError('Expected exactly two binaries and their two metadata files')
-    result = []
-    for system, (filename, arch) in BINARIES.items():
-        path = directory / filename
-        meta = directory / f'metadata-{system}.json'
-        regular_file(path)
-        regular_file(meta)
-        data = json.loads(meta.read_text(encoding='utf-8'))
-        expected_data = {**identity(sha, version), 'os': system, 'arch': arch,
-                         'filename': filename, 'sha256': checksum(path)}
-        if data != expected_data:
-            raise ValueError(f'Binary identity/checksum mismatch: {filename}')
-        result.append(data)
-    return result
+    return [validate_binary(directory, system, sha, version) for system in BINARIES]
+
+
+def validate_binary(directory, system, sha, version):
+    directory = Path(directory)
+    filename, arch = BINARIES[system]
+    path = directory / filename
+    meta = directory / f'metadata-{system}.json'
+    regular_file(path)
+    regular_file(meta)
+    data = json.loads(meta.read_text(encoding='utf-8'))
+    expected = {**identity(sha, version), 'os': system, 'arch': arch,
+                'filename': filename, 'sha256': checksum(path)}
+    if data != expected:
+        raise ValueError(f'Binary identity/checksum mismatch: {filename}')
+    return data
 
 
 def digest_metadata(variant, digest, sha, version):
@@ -150,7 +153,7 @@ def verify_release(directory, sha, version):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=('binary', 'digest', 'prepare'))
+    parser.add_argument('operation', choices=('binary', 'verify-binary', 'digest', 'prepare'))
     parser.add_argument('--directory', default='dist')
     parser.add_argument('--system', choices=BINARIES)
     parser.add_argument('--variant', choices=PLATFORMS)
@@ -164,6 +167,11 @@ def main():
     version = read_version('app.py')
     if args.operation == 'binary':
         binary_metadata(args.directory, args.system, args.sha, version)
+    elif args.operation == 'verify-binary':
+        data = validate_binary(args.directory, args.system, args.sha, version)
+        if args.system != 'Windows':
+            (Path(args.directory) / data['filename']).chmod(0o755)
+        print(f'Artifact readback verified: {data["filename"]} SHA256={data["sha256"]}')
     elif args.operation == 'digest':
         Path(args.directory).mkdir(parents=True, exist_ok=True)
         write_json(Path(args.directory) / f'digest-{args.variant}.json',
