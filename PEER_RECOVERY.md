@@ -178,6 +178,9 @@ source lines omitted (these may contain secrets).
 A lost command reply persists `DATA_FILE.lifecycle-uncertain.json`; it is a
 logical admission fence even after the local worker exits/restarts. Subsequent
 lifecycle/SSH work fails closed. Do not clear it on a timer or HTTP disconnect.
+Failed SSH connection attempts and connect cooldowns submit no command and
+return `ssh_connection_unavailable` without creating this fence. They never
+clear a fence established by a preceding uncertain command.
 An administrator must independently establish remote quiescence, stop the panel,
 retain this marker as incident evidence, and only then archive it before restart.
 If the marker could not be persisted, keep the panel offline after shutdown.
