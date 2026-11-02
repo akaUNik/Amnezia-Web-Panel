@@ -1,12 +1,15 @@
 # syntax=docker/dockerfile:1
 
 FROM python:3.14-slim
+COPY --from=ghcr.io/astral-sh/uv:0.10.5 /uv /usr/local/bin/uv
 
 WORKDIR /app
 
-# Копируем requirements.txt и устанавливаем зависимости
-COPY requirements.txt requirements.txt
-RUN pip3 install --no-cache-dir -r requirements.txt
+# Install the locked runtime dependencies using the base image's Python.
+ENV UV_PYTHON_DOWNLOADS=never \
+    PATH="/app/.venv/bin:$PATH"
+COPY pyproject.toml uv.lock ./
+RUN uv sync --locked --no-dev --no-cache --python /usr/local/bin/python3
 
 # Копируем остальные файлы проекта
 COPY . .
