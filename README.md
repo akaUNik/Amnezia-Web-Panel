@@ -145,6 +145,7 @@ If you require any custom features not currently available in the panel, **let u
 ## 🏗 Prerequisites
 
 *   **Python 3.10+**
+*   **[uv](https://docs.astral.sh/uv/getting-started/installation/) 0.10.5+** (manages Python and dependencies).
 *   Target servers: **Ubuntu 20.04/22.04/24.04** (Architecture: x86_64 or ARM64).
 *   SSH access to target servers (Password or Private Key).
 
@@ -152,29 +153,45 @@ If you require any custom features not currently available in the panel, **let u
 
 1.  **Clone the repository**:
     ```bash
-    git clone https://github.com/PRVTPRO/Amnezia-Web-Panel.git
+    git clone https://github.com/akaUNik/Amnezia-Web-Panel.git
     cd Amnezia-Web-Panel
     ```
 
-2.  **Set up Virtual Environment**:
+2.  **Install the locked runtime dependencies**:
     ```bash
-    python -m venv venv
-    source venv/bin/activate  # Windows: venv\Scripts\activate
+    uv sync --locked --no-dev
     ```
+    uv creates `.venv` automatically and uses Python 3.11 from `.python-version`.
 
-3.  **Install Dependencies**:
+3.  **For development and browser tests**:
     ```bash
-    pip install -r requirements.txt
+    uv sync --locked
+    uv run --locked python -m playwright install chromium
+    uv run --locked python -m unittest discover -s tests -v
     ```
+    Binary builds use `uv sync --locked --no-dev --group build`.
+    Dependencies are declared in `pyproject.toml` and resolved in `uv.lock`.
+    Use `uv add <package>` (or `uv add --dev <package>`) to update them,
+    and commit both files. Runtime installs and Docker images omit the dev
+    and build groups. Docker keeps Python 3.14 from its base image.
 ## 🚀 Getting Started
 
 Launch the application:
 
 ```bash
-python app.py
+uv run --locked --no-dev python app.py
 ```
 
 The panel will be accessible at `http://localhost:5000`.
+
+In **Settings → About & Updates**, the panel checks the latest published
+stable release of `akaUNik/Amnezia-Web-Panel` anonymously. It compares SemVer
+numerically, ignores build metadata, and distinguishes a newer version,
+no newer version, no published stable release, and a failed check. Drafts
+and prereleases are excluded. GitHub rate limits, browser/network restrictions,
+and the 10-second timeout may prevent checking; the Releases link remains
+available and checking can be retried. Updates are downloaded and installed
+manually.
 
 ## 📦 Installation Method 2
 
@@ -182,22 +199,67 @@ Download and run the executable file for your system.
 ```
 Windows
 Linux
-Mac
 ```
+
+Builds provide Linux x86_64 and Windows x86_64 executables. macOS builds are
+excluded. Actions artifacts `binaries-Linux` and `binaries-Windows` include
+commit/version/architecture metadata and expire after 30 days. Download them
+from a successful run in this repository's Actions tab (sign-in required),
+or use the commands in [GitHub CI and downloads](docs/github-ci.md).
+After downloading on Linux, run `chmod +x Amnezia-Web-Panel-Linux` before
+`./Amnezia-Web-Panel-Linux`. On Windows, run `Amnezia-Web-Panel-Windows.exe`.
 
 ## 🐳 Docker Image
 
-https://hub.docker.com/r/prvtpro/amnezia-panel
+Own package: [GHCR amnezia-panel](https://github.com/akaUNik/Amnezia-Web-Panel/pkgs/container/amnezia-panel).
 
-Images are also published to GitHub Container Registry on every push to `main` and on every `v*` tag:
+Upstream attribution: [PRVTPRO/Amnezia-Web-Panel](https://github.com/PRVTPRO/Amnezia-Web-Panel)
+and its [historical Docker Hub image](https://hub.docker.com/r/prvtpro/amnezia-panel).
+
+After successful verification and complete builds, pushes to `main` and valid `v*` tags publish images to this repository’s GHCR package:
 
 ```bash
 # Panel
-docker pull ghcr.io/prvtpro/amnezia-panel:latest
+docker pull ghcr.io/akaunik/amnezia-panel:latest
 
 # Panel with Cloudflare WARP inside the container
-docker pull ghcr.io/prvtpro/amnezia-panel:latest-warp
+docker pull ghcr.io/akaunik/amnezia-panel:latest-warp
 ```
+
+Use the published default or WARP image:
+
+```bash
+docker compose pull
+docker compose up -d
+
+# Published WARP (linux/amd64)
+docker compose -f docker-compose.yml -f docker-compose.warp.yml pull
+docker compose -f docker-compose.yml -f docker-compose.warp.yml up -d
+
+# Local WARP build: add the local override last
+docker compose -f docker-compose.yml -f docker-compose.warp.yml -f docker-compose.warp.local.yml up -d --build
+```
+
+The default image supports linux/amd64 and linux/arm64. WARP requires the
+existing TUN device, NET_ADMIN/SYS_MODULE capabilities, and its persistent
+Cloudflare volume. Upgrading the image keeps the existing Compose project
+name and `amnezia_data` volume. Avoid `docker compose down -v`, which deletes
+persistent volumes. Back up state before upgrading or rolling back.
+
+Select a known version or digest for rollback without deleting volumes:
+
+```bash
+PANEL_IMAGE=ghcr.io/akaunik/amnezia-panel:1.9.0 docker compose up -d
+PANEL_IMAGE=ghcr.io/akaunik/amnezia-panel@sha256:KNOWN_DIGEST docker compose up -d
+PANEL_WARP_IMAGE=ghcr.io/akaunik/amnezia-panel:1.9.0-warp docker compose -f docker-compose.yml -f docker-compose.warp.yml up -d
+```
+
+Replace the example version/digest with a published, verified value. Image
+rollback keeps data files; it does not undo data changes made by a newer version.
+Releases contain both executables, `build-info.json`, and `SHA256SUMS`, and
+persist independently of 30-day Actions artifacts. Download from
+[own Releases](https://github.com/akaUNik/Amnezia-Web-Panel/releases) and verify
+all checksums before running. See [CI, checksums, retries, and draft recovery](docs/github-ci.md).
 
 The bundled `docker-compose.yml` sets `DATA_FILE=/app/data/data.json` so panel state lands on the
 `amnezia_data` volume and survives container rebuilds — see [Environment Variables](#-environment-variables)
@@ -240,9 +302,9 @@ comes from **Settings** as well and overrides an inherited `NGROK_AUTHTOKEN`.
 Running from source or from a binary:
 
 ```bash
-export SECRET_KEY="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+export SECRET_KEY="$(uv run --locked --no-dev python -c 'import secrets; print(secrets.token_hex(32))')"
 export DATA_FILE=/var/lib/amnezia-panel/data.json
-python app.py
+uv run --locked --no-dev python app.py
 ```
 
 With Docker, pass the same variables through `-e`:
@@ -253,7 +315,7 @@ docker run -d \
   -e SECRET_KEY=change-me \
   -e DATA_FILE=/state/data.json \
   -v panel_state:/state \
-  ghcr.io/prvtpro/amnezia-panel:latest
+  ghcr.io/akaunik/amnezia-panel:latest
 ```
 
 Docker Compose additionally reads these from your shell or from an `.env` file next to

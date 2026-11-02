@@ -1,0 +1,7 @@
+# Add last to opt into a local WARP build; published WARP remains the default.
+services:
+  amnezia_panel:
+    build:
+      context: .
+      dockerfile: Dockerfile.warp
+    image: amnezia-panel:warp-local
