@@ -447,7 +447,7 @@ class UserspaceUpdateTests(unittest.TestCase):
             next(i for i, c in enumerate(ssh.commands) if c.startswith('docker build')),
             next(i for i, c in enumerate(ssh.commands) if c.startswith('docker stop')),
             next(i for i, c in enumerate(ssh.commands) if c.startswith('docker run -d')),
-            next(i for i, c in enumerate(ssh.commands) if c.startswith('docker cp /tmp/awg-plugin-backup')),
+            next(i for i, c in enumerate(ssh.commands) if c.startswith('docker cp /tmp/awg-plugin-userspace.')),
             next(i for i, c in enumerate(ssh.commands) if c.startswith('docker restart')),
         ]
         self.assertEqual(order, sorted(order))

@@ -70,15 +70,18 @@ SOURCE_COMMIT = 'a' * 40
 SOURCE_IMAGE = 'sha256:' + 'a' * 64
 DERIVED_IMAGE = 'sha256:' + 'b' * 64
 BINARY_HASH = 'c' * 64
+USERSPACE_TMP = '/tmp/awg-plugin-userspace.0123456789'
 
 def source_build_response(command):
+    if command == 'umask 077; mktemp -d /tmp/awg-plugin-userspace.XXXXXXXXXX':
+        return (USERSPACE_TMP, '', 0)
     if "--format '{{json .Config.Labels}}'" in command:
         return ('{}', '', 0)
     if command.startswith('cat /opt/amnezia/') and command.endswith('/Dockerfile'):
         return ('FROM amneziavpn/amneziawg-go:latest\n', '', 0)
-    if command == 'cat /tmp/awg-plugin-update/userspace-source.iid':
+    if command == 'cat ' + USERSPACE_TMP + '/userspace-source.iid':
         return (SOURCE_IMAGE, '', 0)
-    if command == 'cat /tmp/awg-plugin-update/userspace-derived.iid':
+    if command == 'cat ' + USERSPACE_TMP + '/userspace-derived.iid':
         return (DERIVED_IMAGE, '', 0)
     if 'sha256sum' in command and '/usr/bin/amneziawg-go' in command:
         return (BINARY_HASH + '  /usr/bin/amneziawg-go\n', '', 0)

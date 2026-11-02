@@ -34,7 +34,7 @@ from tests.awg_plugin_fixtures import (
     inspect_json,
 )
 
-CLEANUP = 'rm -rf /tmp/awg-plugin-update /tmp/awg-plugin-backup-*'
+CLEANUP = 'rm -rf -- /tmp/awg-plugin-userspace.0123456789'
 PORTS = {'amnezia-awg3': 55424, 'amnezia-awg2': 55425}
 CONTAINERS = ('amnezia-awg3', 'amnezia-awg2')
 
@@ -133,8 +133,8 @@ def userspace_handler(*, containers=CONTAINERS, ports=PORTS, networks=None,
         # Backup: docker cp <name>:/opt/amnezia /tmp/awg-plugin-backup-...
         if command.startswith('docker cp ') and ':/opt/amnezia ' in command:
             return ('', '', 0)
-        # Restore: docker cp /tmp/awg-plugin-backup-.../. <name>:/opt/...
-        if command.startswith('docker cp /tmp/awg-plugin-backup'):
+        # Restore: docker cp /tmp/awg-plugin-userspace.-.../. <name>:/opt/...
+        if command.startswith('docker cp /tmp/awg-plugin-userspace.'):
             return ('', '', 0)
 
         if command.startswith('docker exec') and 'grep -c' in command:
@@ -224,6 +224,12 @@ class AllSucceedTests(_UserspaceAdversarialTest):
         ssh = FakeSSH(userspace_handler())
         result = self.update(ssh)
         self.assertEqual(result['state'], 'updated')
+
+        # Even the last image must be built before the first mutable snapshot.
+        last_build = max(i for i, c in enumerate(ssh.commands) if c.startswith('docker build'))
+        first_backup = min(i for i, c in enumerate(ssh.commands)
+                           if c.startswith('docker cp ') and ':/opt/amnezia ' in c)
+        self.assertLess(last_build, first_backup)
 
         # The tunnel check of the second container is the last verification
         # before anything may be deleted.

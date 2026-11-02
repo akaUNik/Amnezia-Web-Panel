@@ -7,7 +7,7 @@ from managers.awg_plugin_updater import (
     AwgPluginUpdater, PluginUpdateError, USERSPACE, GO_REPO,
     SOURCE_LABEL, HASH_LABEL, _github_commit, _release_dockerfile,
 )
-from tests.awg_plugin_fixtures import SOURCE_COMMIT, SOURCE_IMAGE, DERIVED_IMAGE, BINARY_HASH, GO_NEW
+from tests.awg_plugin_fixtures import SOURCE_COMMIT, SOURCE_IMAGE, DERIVED_IMAGE, BINARY_HASH, GO_NEW, USERSPACE_TMP
 from tests.test_awg_plugin_userspace_update import userspace_handler
 
 
@@ -26,6 +26,8 @@ class IdentitySSH:
 
     def run_command(self, command, timeout=60, **kwargs):
         self.commands.append(command)
+        if command == 'umask 077; mktemp -d /tmp/awg-plugin-userspace.XXXXXXXXXX':
+            return USERSPACE_TMP, '', 0
         if "--format '{{json .Config.Labels}}'" in command:
             return '{}', '', 0
         if command.startswith('cat /opt/amnezia/'):

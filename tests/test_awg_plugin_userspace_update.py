@@ -26,7 +26,7 @@ from tests.awg_plugin_fixtures import (
     inspect_json,
 )
 
-CLEANUP = 'rm -rf /tmp/awg-plugin-update /tmp/awg-plugin-backup-*'
+CLEANUP = 'rm -rf -- /tmp/awg-plugin-userspace.0123456789'
 PROBE_PREFIX = 'docker run --rm --entrypoint sh'
 US_BINARY = '0.0.20250522'
 US_BINARY_OUTPUT = (
@@ -96,8 +96,8 @@ def userspace_handler(*, containers=None, inspect_options=None, peers_before='5'
         # Backup copy: docker cp <name>:/opt/amnezia /tmp/awg-plugin-backup-...
         if command.startswith('docker cp ') and ':/opt/amnezia ' in command:
             return ('', '', 0)
-        # Restore copy: docker cp /tmp/awg-plugin-backup-.../. <name>:/opt/...
-        if command.startswith('docker cp /tmp/awg-plugin-backup'):
+        # Restore copy: docker cp /tmp/awg-plugin-userspace.-.../. <name>:/opt/...
+        if command.startswith('docker cp /tmp/awg-plugin-userspace.'):
             return ('', '', 0)
 
         if command.startswith('docker exec') and 'grep -c' in command:
@@ -294,6 +294,7 @@ class _RollbackFailedUpdater(AwgPluginUpdater):
     """
 
     def _apply_container_update(self, item, version, log, should_cancel=None):
+        self._backup_container_update(item, log)
         item['switched'] = True
         item['old_name'] = 'amnezia-awg3.old-test'
         raise PluginUpdateError('update_failed', 'simulated switch failure')
@@ -326,9 +327,10 @@ class CancelTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 'cancelled')
         self.assertFalse(ssh.find('docker stop'))
         self.assertFalse(ssh.find('docker build'))
-        # Both containers were inspected and backed up before the cancel check.
-        self.assertTrue(ssh.find('docker cp amnezia-awg3:/opt/amnezia'))
-        self.assertTrue(ssh.find('docker cp amnezia-awg2:/opt/amnezia'))
+        # Validation is read-only; cancellation before building needs no copies.
+        self.assertTrue(ssh.find('docker inspect amnezia-awg3'))
+        self.assertTrue(ssh.find('docker inspect amnezia-awg2'))
+        self.assertFalse(ssh.find('docker cp'))
 
 
 class UnsupportedShapeTests(unittest.TestCase):

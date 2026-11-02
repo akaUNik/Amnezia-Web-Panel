@@ -1094,10 +1094,7 @@ class AwgPluginUpdater:
             if not re.fullmatch(r'[0-9a-f]{40}', revision):
                 raise PluginUpdateError('version_check_failed', 'invalid userspace release commit')
             self._userspace_build_tag = 'amnezia-awg-build-' + uuid.uuid4().hex
-            iid = '/tmp/awg-plugin-update/userspace-source.iid'
-            _, _, code = self._run('mkdir -p /tmp/awg-plugin-update', log, 'prepare')
-            if code:
-                raise PluginUpdateError('update_failed', 'cannot prepare source build directory')
+            iid = self._userspace_tmp + '/userspace-source.iid'
             log('build', 'building userspace %s from commit %s' % (version, revision))
             _, _, code = self._run(
                 'docker build --pull --no-cache --iidfile %s -t %s %s'
@@ -1121,10 +1118,10 @@ class AwgPluginUpdater:
             'org.opencontainers.image.revision': release['revision'],
             'org.opencontainers.image.source': GO_REPO,
         }
-        iid = '/tmp/awg-plugin-update/userspace-derived.iid'
+        iid = self._userspace_tmp + '/userspace-derived.iid'
         # Keep the original file unchanged. Do not journal its contents: custom
         # Dockerfiles can contain credentials. Quote the replacement as data.
-        path = '/tmp/awg-plugin-update/Dockerfile.' + item['name']
+        path = self._userspace_tmp + '/Dockerfile.' + item['name']
         _, _, code = self._exec("umask 077; printf '%s' " + shlex.quote(dockerfile) +
                                 ' > ' + shlex.quote(path))
         if code:
@@ -1192,10 +1189,24 @@ class AwgPluginUpdater:
         before = self._userspace_version()
         self._userspace_release = None
         self._userspace_build_tag = None
+        self._userspace_tmp = None
         prepared = []
         try:
+            # Allocate through _exec so non-root SSH sessions elevate too.
+            # mktemp atomically creates a private directory; never adopt a
+            # predictable existing /tmp directory, even if it looks empty.
+            out, _, code = self._exec('umask 077; mktemp -d /tmp/awg-plugin-userspace.XXXXXXXXXX')
+            directory = (out or '').strip()
+            if code or not re.fullmatch(r'/tmp/awg-plugin-userspace\.[A-Za-z0-9]{10}', directory):
+                raise PluginUpdateError('update_failed', 'cannot create private userspace workspace')
+            self._userspace_tmp = directory
             for name, _image in containers:
                 prepared.append(self._prepare_container_update(name, log))
+            # Long builds must finish before any configuration snapshot. The
+            # API worker holds the peer lifecycle interlock for this operation,
+            # including verification/rollback of every container.
+            for item in prepared:
+                item['built'] = self._build_userspace_image(item, version, log, should_cancel)
             for item in prepared:
                 if should_cancel and should_cancel():
                     raise PluginUpdateError(
@@ -1211,7 +1222,7 @@ class AwgPluginUpdater:
                     '%s; could not restore %s - check these containers manually'
                     % (exc.message, ', '.join(failures)),
                 )
-            self._cleanup_tmp(log)
+            self._cleanup_userspace_tmp(log)
             raise
         except Exception as exc:
             failures = self._rollback_containers(prepared, log)
@@ -1221,7 +1232,7 @@ class AwgPluginUpdater:
                     '%s; could not restore %s - check these containers manually'
                     % (exc, ', '.join(failures)),
                 )
-            self._cleanup_tmp(log)
+            self._cleanup_userspace_tmp(log)
             raise PluginUpdateError('update_failed', str(exc))
 
         # Everything is verified: only now are the predecessors removed, and
@@ -1232,7 +1243,7 @@ class AwgPluginUpdater:
                 self._finalize_container_update(item, log)
         except Exception:
             log('cleanup', 'WARNING: could not remove every old container/image')
-        self._cleanup_tmp(log)
+        self._cleanup_userspace_tmp(log)
         return {
             'component': USERSPACE,
             'previous': before,
@@ -1264,16 +1275,24 @@ class AwgPluginUpdater:
         if code != 0:
             log('cleanup', 'note: old image %s is still used elsewhere' % image_id)
 
-    def _cleanup_tmp(self, log):
-        """Remove build/backup artefacts; keep them only after a failed rollback."""
+    def _cleanup_userspace_tmp(self, log):
+        """Remove only this operation's files; retain them on failed rollback."""
         build_tag = getattr(self, '_userspace_build_tag', None)
         if build_tag:
             self._run('docker rmi %s' % build_tag, log, 'cleanup')
             self._userspace_build_tag = None
+        directory = getattr(self, '_userspace_tmp', None)
+        if directory:
+            _, _, code = self._run('rm -rf -- ' + shlex.quote(directory), log, 'cleanup')
+            if not code:
+                self._userspace_tmp = None
+
+    def _cleanup_tmp(self, log):
+        """Kernel build cleanup (userspace owns a separate private directory)."""
         self._run('rm -rf /tmp/awg-plugin-update /tmp/awg-plugin-backup-*', log, 'cleanup')
 
     def _prepare_container_update(self, name, log):
-        """Validate and back up one container before touching anything."""
+        """Validate one container without snapshotting mutable configuration."""
         dockerfile_dir = self._dockerfile_dir(name)
         if not dockerfile_dir:
             raise PluginUpdateError(
@@ -1289,24 +1308,10 @@ class AwgPluginUpdater:
                 'container %s has an unsupported configuration (%s); reinstall the '
                 'protocol to update userspace' % (name, ', '.join(unsupported)),
             )
-        backup = '/tmp/awg-plugin-backup-%s' % name
-        self._run('rm -rf %s' % backup, log, 'prepare')
-        out, err, code = self._run(
-            'docker cp %s:%s %s' % (name, CONTAINER_CONFIG_DIR, backup), log, 'backup',
-        )
-        if code != 0:
-            raise PluginUpdateError('update_failed', 'cannot back up %s configuration' % name)
-        peers_out, _, _ = self._run(
-            "docker exec %s sh -c \"grep -c '^\\[Peer\\]' %s/*.conf 2>/dev/null\" "
-            % (name, CONTAINER_CONFIG_SUBDIR),
-            log, 'backup',
-        )
-        peers = sum(int(value) for value in re.findall(r'\d+', peers_out or '') if value.isdigit())
         return {
             'name': name,
             'dockerfile_dir': dockerfile_dir,
-            'backup': backup,
-            'peers': peers,
+            'container_id': info.get('Id'),
             'image_id': info.get('Image'),
             'host': info.get('HostConfig') or {},
             # The panel attaches the container to amnezia-dns-net after
@@ -1317,6 +1322,26 @@ class AwgPluginUpdater:
             ],
         }
 
+    def _backup_container_update(self, item, log):
+        """Refresh metadata and capture the config after all images are built."""
+        name = item['name']
+        current = self._prepare_container_update(name, log)
+        if (current['container_id'], current['image_id']) != (item['container_id'], item['image_id']):
+            raise PluginUpdateError('update_failed', 'container %s changed during the build' % name)
+        item.update(current)
+        item['backup'] = self._userspace_tmp + '/backup-' + name
+        _, _, code = self._run(
+            'docker cp %s:%s %s' % (name, CONTAINER_CONFIG_DIR, shlex.quote(item['backup'])),
+            log, 'backup',
+        )
+        if code:
+            raise PluginUpdateError('update_failed', 'cannot back up %s configuration' % name)
+        peers_out, _, _ = self._run(
+            "docker exec %s sh -c \"grep -c '^\\[Peer\\]' %s/*.conf 2>/dev/null\" "
+            % (name, CONTAINER_CONFIG_SUBDIR), log, 'backup',
+        )
+        item['peers'] = sum(int(value) for value in re.findall(r'\d+', peers_out or ''))
+
     def _apply_container_update(self, item, version, log, should_cancel=None):
         name = item['name']
         stamp = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
@@ -1324,12 +1349,13 @@ class AwgPluginUpdater:
         item['old_name'] = old_name
         item['switched'] = False
 
-        built = self._build_userspace_image(item, version, log, should_cancel)
+        built = item['built']
         # The service is still untouched at this point: a late cancellation
         # during a long image build must not restart anything.
         if should_cancel and should_cancel():
             raise PluginUpdateError('cancelled', 'update cancelled before %s was replaced' % name)
 
+        self._backup_container_update(item, log)
         host = item['host']
         run_cmd = self._docker_run_from_inspect(name, host, built['image_id'])
         out, err, code = self._run('docker stop %s' % name, log, 'switch')
