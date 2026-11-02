@@ -97,14 +97,19 @@ def note_ssh_uncertainty():
     logger.error('SSH result unknown; lifecycle admission fenced pending independent verification')
 
 
-def serialize_peer_lifecycle(function):
+def serialize_peer_lifecycle(function=None, *, wait_for_completion=False):
     """Interlock ownership changes with destructive network operations.
 
     This is separate from DATA_LOCK: reads, traffic commits and access intent
     updates continue while SSH runs. As with DATA_LOCK, one panel process is
     required. A cancelled waiter never runs; an already-started worker keeps
     the interlock until its external effects and local commit have finished.
+    Background operations can wait for completion instead of the HTTP response
+    budget. They still use the same admission, cancellation and uncertainty
+    handling, and must not publish a terminal result while work continues.
     """
+    if function is None:
+        return functools.partial(serialize_peer_lifecycle, wait_for_completion=wait_for_completion)
     @functools.wraps(function)
     async def wrapped(*args, **kwargs):
         async def invoke():
@@ -166,6 +171,8 @@ def serialize_peer_lifecycle(function):
                              frames, type(error).__name__)
         task.add_done_callback(finished)
         try:
+            if wait_for_completion:
+                return await asyncio.shield(task)
             return await asyncio.wait_for(asyncio.shield(task), RESPONSE_WAIT_SECONDS)
         except asyncio.TimeoutError:
             logger.warning('Lifecycle response deadline reached; worker retains interlock (%s)', function.__name__)

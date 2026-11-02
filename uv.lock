@@ -17,7 +17,7 @@ wheels = [
 
 [[package]]
 name = "amnezia-web-panel"
-version = "1.9.0"
+version = "1.10.0"
 source = { virtual = "." }
 dependencies = [
     { name = "annotated-types" },
