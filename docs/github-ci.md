@@ -182,8 +182,8 @@ chmod +x Amnezia-Web-Panel-Linux
 
 On Windows PowerShell, use `Get-FileHash -Algorithm SHA256 FILE` for each
 file and compare with `SHA256SUMS`, then run the executable. Download all four
-files together when verifying a release. These commands are examples for an
-agreed future version, not evidence that v1.9.0 has been published.
+files together when verifying a release. These commands download the published v1.9.0 stable release; actual
+qualification and checksums are recorded below.
 
 Use **Re-run failed jobs**, retaining the successful jobs' original artifacts.
 The helper resumes only its own draft for the same tag/SHA. A complete,
@@ -227,7 +227,7 @@ The implementation commit tested by the final manual run is
 - [PR verification 41434072391](https://github.com/akaUNik/Amnezia-Web-Panel/actions/runs/41434072391): full Linux/Python 3.11 unittest and Chromium coverage passed, followed by all 112 isolated root regressions.
 - Full local Python 3.11/Chromium run: **1286 tests, 0 failures, 0 errors**. The one skipped import is the pre-existing pytest-only live-server module, outside required unittest coverage. No required group was skipped. The host was macOS; only synthetic clients-table SSH shell scripts were executed in isolated Linux containers to preserve the target server's GNU chmod semantics. Original assertions and other shell fixtures were retained. This is a local hybrid run, not a claim of a full native Linux run.
 - Final local Linux arm64/Python 3.14 runtime image: all **112 root regressions** and six focused clients-table/SSH tests passed without skips. Login/static HTTP smoke, clean shutdown, resource presence, ignored local directories, and runtime-only dependency groups were verified.
-- `actionlint`, translation completeness, Node syntax/SemVer/API doubles, release/promotion doubles, lock consistency, and all three Compose configurations passed. `sha256sum -c SHA256SUMS` passed against a complete synthetic four-asset set; release download options were checked against GitHub CLI help. Real version-release qualification remains pending.
+- `actionlint`, translation completeness, Node syntax/SemVer/API doubles, release/promotion doubles, lock consistency, and all three Compose configurations passed. `sha256sum -c SHA256SUMS` passed against a complete synthetic four-asset set; release download options were checked against GitHub CLI help. Real version-release qualification is recorded below.
 
 | Native artifact | Artifact ID | ZIP bytes | Expires (UTC) |
 | --- | --- | --- | --- |
@@ -245,16 +245,15 @@ The final manual run produced exactly those two artifacts. `prepare`,
 `promote`, and `release` were skipped. The Releases API returned an empty list
 both before and after manual qualification; no draft or published release was
 created. The GHCR package endpoint returned 404 both before and after with the
-available credentials. Public package visibility, anonymous pulls, and a real
-main pipeline are therefore still **unverified**, tracked in task 7.3; the
-manual run's login/push guards and skipped publishing jobs confirm it did not
-promote production tags.
+available credentials. At manual-run time, public visibility, anonymous pulls, and a real main
+pipeline were still unverified. The later publishing qualification is recorded
+below. The manual run's login/push guards and skipped publishing jobs confirm
+it did not promote production tags.
 
 Actions settings were checked: enabled, all actions allowed, default token
 permissions read-only. Artifact API timestamps confirm the configured 30-day
-retention. Real prerelease/stable publication, complete release readback,
-latest-channel checks, and a live stable update lookup remain task 7.4 and
-require an agreed release version. No synthetic stable release was created.
+retention. The subsequent agreed prerelease/stable cycle is recorded below. No synthetic
+stable release was created.
 
 | Settings UI check | Result |
 | --- | --- |
@@ -269,3 +268,148 @@ Local QA evidence is stored outside the repository in
 `/private/tmp/amnezia-local-full-tests-verified.log`,
 `/private/tmp/amnezia-final-root.log`, and
 `/private/tmp/amnezia-native-{linux,windows}.log`.
+
+
+## Real release qualification, 2026-11-02
+
+The agreed release cycle completed as
+[v1.9.0-rc.1](https://github.com/akaUNik/Amnezia-Web-Panel/releases/tag/v1.9.0-rc.1)
+→ [v1.9.0](https://github.com/akaUNik/Amnezia-Web-Panel/releases/tag/v1.9.0).
+Versions match application literals, project metadata, and annotated tags.
+
+| Run | Source SHA | Result |
+| --- | --- | --- |
+| [RC 41438181423](https://github.com/akaUNik/Amnezia-Web-Panel/actions/runs/41438181423) | `93dc8c2256153689a583e7ef2830d862c53d4f0c` | All verification/build/promotion/release jobs passed; attempt 2 repeated only publication |
+| [Main 41441667006](https://github.com/akaUNik/Amnezia-Web-Panel/actions/runs/41441667006) | `335ac28683b1a8c1e6123d49ca5a8a95eb03781b` | All required jobs passed; Release skipped as intended |
+| [Stable 41443336844](https://github.com/akaUNik/Amnezia-Web-Panel/actions/runs/41443336844) | `335ac28683b1a8c1e6123d49ca5a8a95eb03781b` | All required jobs passed; attempt 2 resumed the owned draft using original artifacts |
+
+Each tag produced exactly four uploaded assets: Linux x86_64, Windows x86_64,
+`build-info.json`, and `SHA256SUMS`. GitHub's two automatic source archives
+are additional UI links, not uploaded release assets. Native jobs downloaded
+their uploaded binaries, checked identity/checksum, and repeated HTTP/static
+and shutdown smoke on the matching OS. The release job then downloaded all
+four release assets and recomputed/verified their checksums before publication.
+Locally downloaded metadata passed SHA256 verification; API binary digests
+match `SHA256SUMS`.
+
+| Release | Binary | SHA256 |
+| --- | --- | --- |
+| RC | Linux | `275a4700e173d50347096a43040d54101e477931a723a2a1d0fa6b6c97aa6d0e` |
+| RC | Windows | `c4586f100856aaf41917e03858b7a4fc6e654a4ea50db7963b27ab847e65ce98` |
+| Stable | Linux | `cf691193412f16d65ee59c3bc0d522047d2b515a7b8243fed87aba12054b7cb0` |
+| Stable | Windows | `5304eba3ddafc287bcf68fd093d484ab7eaa6feebaf40ce853ca32d6a70719f3` |
+
+RC publication retry reported `already matches; no changes`. Release ID,
+publication timestamp, all asset IDs/digests/update timestamps were identical
+before and after. At both points the latest stable Release API returned 404
+and `latest`/`latest-warp` were absent, proving the RC did not create or modify
+the stable channel. Its container tags were only the exact prerelease pair.
+
+Stable attempt 1 created its correctly marked empty draft, then stopped at
+the immediate repeated draft lookup. Inspection confirmed the intended tag,
+source SHA, owner marker, and no assets. Re-running only the release job
+resumed this draft and passed upload, full readback, and publication with
+`make_latest=True`; no rebuild, tag movement, or verification bypass occurred.
+The initial lookup failure is recorded rather than presented as a first-try
+success.
+
+Stable container tags `1.9.0`, `1`, `1.9`, `latest` and all four `-warp`
+counterparts were inspected after publication. Every alias matched the exact
+release digest and expected source/version labels: default amd64/arm64, WARP
+amd64. Attestation manifests have unknown/unknown platforms and are excluded
+from runtime platform comparisons.
+
+| Publication | Variant | OCI index digest |
+| --- | --- | --- |
+| RC | Default | `sha256:54e0a91306f638f015f99ac1b38d85f86c7c167b8dc7a79bbb7214d700f40a47` |
+| RC | WARP | `sha256:444b9473c59d582954cb7a268de6d896ffcc7319f9b5ee168667ff4a00493230` |
+| Main | Default | `sha256:9671261458dc4519ac8cfd178e592eee091dab4499a69de3284ca3211fc4c394` |
+| Main | WARP | `sha256:49636a9b0f3b896c2a1b24b8fa732a70762829a90777696d33c35cbba06826e4` |
+| Stable | Default | `sha256:280a351a1037d09825ca1b766904d5848afc40e5b784c187a7090a2cf456a8ff` |
+| Stable | WARP | `sha256:9a0fd2fd3d21a39a5764ae178880818f1ef2ece2d89da0ea13a61aa31b52c1ae` |
+
+Live update qualification used Safari, a separate localhost-only app with
+disposable empty state, and the real anonymous GitHub API. Before stable
+publication it displayed “No stable release has been published yet.” With
+only the fixture's installed version set to 1.8.4, it then displayed
+“New version available: v1.9.0”. Restarting that fixture as 1.9.0 displayed
+“No newer stable version was found.” Controls recovered after each request.
+The permanent Releases link opened this repository's page in Safari, where
+v1.9.0 is Latest and v1.9.0-rc.1 remains Pre-release. No API response was
+intercepted for these live checks. This used synthetic local panel state;
+no production VPN panel or server was changed.
+
+Release preparation merged through [#8](https://github.com/akaUNik/Amnezia-Web-Panel/pull/8).
+The reviewed main history was back-merged into develop through
+[#11](https://github.com/akaUNik/Amnezia-Web-Panel/pull/11), whose full
+[verification](https://github.com/akaUNik/Amnezia-Web-Panel/actions/runs/41443922627)
+passed. Both protected branches were retained.
+
+
+## Optional published Compose qualification
+
+`Tests` offers a separate `published-compose` job only for an explicit manual
+run in this repository. Default, PR, reusable, and publishing runs skip it.
+It has read-only repository permission, uses an empty Docker auth config,
+pins both images by digest, and never builds or publishes images/releases.
+Use a full expected source SHA when qualifying a specific main publication:
+
+```sh
+gh workflow run test.yml --repo akaUNik/Amnezia-Web-Panel --ref develop \
+  -f qualify_published=true \
+  -f qualification_tag=sha-335ac28683b1a8c1e6123d49ca5a8a95eb03781b \
+  -f qualification_sha=335ac28683b1a8c1e6123d49ca5a8a95eb03781b
+```
+
+`qualification_tag` defaults to `latest`; the WARP selector adds `-warp`.
+Both variants must have the same source identity and expected platforms.
+The Linux runner uses the published Compose configurations with unique
+project/volume names and localhost ports, preserving WARP's device/capability
+requirements. It checks login/static HTTP and compares synthetic persistent
+state hashes across container recreation, including WARP's separate volume.
+Cleanup removes only those generated fixture projects/volumes. JSON evidence
+is retained as `published-compose-qualification` for 30 days. No credentials
+or panel data are uploaded. This opt-in run performs only qualification;
+ordinary manual, PR, and reusable runs retain the full unittest job.
+
+
+### Completed public main image qualification
+
+[Linux run 41451019415](https://github.com/akaUNik/Amnezia-Web-Panel/actions/runs/41451019415)
+passed on ubuntu-24.04 using qualifier source
+`adacaae233cbbdb3a3fafdf7b34656adbabbdda6`. It selected the immutable
+`sha-335ac28683b1a8c1e6123d49ca5a8a95eb03781b` pair from the real main
+pipeline, with that full expected source SHA. This validates main publication
+independently of the later stable alias promotion.
+
+The [public package](https://github.com/akaUNik/Amnezia-Web-Panel/pkgs/container/amnezia-panel)
+was visibly associated with this repository and marked Public in Safari.
+Both image variants were pulled successfully on Linux with an empty Docker
+auth config. Their exact main digests match the table above. Registry
+inspection verified source/revision/version labels for every runtime
+platform: default linux/amd64 and linux/arm64, WARP linux/amd64. The actual
+Compose execution on the Linux x86_64 runner used native amd64 images.
+
+| Check | Default | WARP |
+| --- | --- | --- |
+| Anonymous digest pull and expected source identity | Pass | Pass |
+| Login and bundled updates.js HTTP | Pass | Pass |
+| New container ID after force recreation | Pass | Pass |
+| Identical data.json and two synthetic state-file SHA256 values | Pass | Pass |
+| Persistent WARP volume marker, TUN character device, warp-cli | N/A | Pass |
+| Original WARP NET_ADMIN/SYS_MODULE and /dev/net/tun mapping | N/A | Pass |
+| Generated fixture containers/volumes removed in finally | Pass | Pass |
+
+[Evidence artifact 13144153455](https://github.com/akaUNik/Amnezia-Web-Panel/actions/runs/41451019415/artifacts/13144153455)
+contains `published-compose.json` with the two exact digests, source SHA,
+platforms, state hashes, and temporary mount/device/capability metadata. Its
+ZIP is 941 bytes and expires at 2026-12-02 13:13:39 UTC. It was downloaded and
+checked locally against the recorded main publication identities. No private
+panel state is included. Success records are written only after each fixture's
+cleanup completes.
+
+Local default-image qualification also passed recreation/state preservation.
+The local WARP download was deliberately stopped after repeated slow registry
+transfers; it is not claimed as a successful local WARP test. The separately
+agreed Linux qualification above supplies that required end-to-end evidence.
+The temporary local Safari QA server was shut down after verification.

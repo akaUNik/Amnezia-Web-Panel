@@ -4,12 +4,58 @@ on:
   workflow_call:
   pull_request:
   workflow_dispatch:
+    inputs:
+      qualify_published:
+        description: Check public GHCR images with disposable Linux Compose state
+        type: boolean
+        default: false
+      qualification_tag:
+        description: Base container tag (the WARP tag adds -warp)
+        type: string
+        default: latest
+      qualification_sha:
+        description: Expected full source SHA (optional)
+        type: string
+        default: ''
 
 permissions:
   contents: read
 
 jobs:
+  published-compose:
+    if: github.repository == 'akaUNik/Amnezia-Web-Panel' && github.event_name == 'workflow_dispatch' && inputs.qualify_published
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      with:
+        python-version: '3.11'
+    - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v4
+    - name: Verify Linux TUN support
+      run: |
+        sudo modprobe tun
+        test -c /dev/net/tun
+    - name: Qualify public images without registry credentials
+      env:
+        QUALIFICATION_TAG: ${{ inputs.qualification_tag }}
+        QUALIFICATION_SHA: ${{ inputs.qualification_sha }}
+      run: >-
+        python -m scripts.ci.qualify --tag "$QUALIFICATION_TAG" --sha "$QUALIFICATION_SHA"
+        --output "$RUNNER_TEMP/published-compose.json"
+    - name: Retain qualification evidence
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: published-compose-qualification
+        path: ${{ runner.temp }}/published-compose.json
+        if-no-files-found: warn
+        retention-days: 30
+
   unittest:
+    if: github.event_name != 'workflow_dispatch' || !inputs.qualify_published
     runs-on: ubuntu-latest
 
     steps:

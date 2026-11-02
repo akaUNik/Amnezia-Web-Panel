@@ -77,6 +77,12 @@ Registry и Releases не дают общей транзакции: после �
 
 Сузить `.dockerignore`/`.gitignore` для локальных credentials, `.git`, virtualenv, временного состояния и результатов сборки, поскольку Dockerfile использует `COPY . .`. Не исключать ресурсы приложения и необходимые runtime-модули. Проверять содержимое сборочного контекста без вывода секретов.
 
+### 7. Opt-in проверка опубликованного Compose на Linux
+
+По отдельному согласию пользователя от 2026-11-02 `test.yml` получает manual-only job `published-compose`: он включается лишь через `workflow_dispatch` с `qualify_published=true` в основном репозитории. Обычные PR, reusable/main/tag проверки и default manual unit-тесты не выполняют эту дополнительную проверку. Job имеет только `contents: read`, не входит в registry и не выполняет build/push/release.
+
+Helper принимает base container tag и необязательный полный expected SHA, сверяет оба варианта, source/version/platforms и закрепляет digests перед анонимным pull. Оба published Compose запускаются на ubuntu-24.04 с уникальными временными project/volume names и localhost-портами. Проверяются login/static, пересоздание контейнера, сохранение data/fixture-файлов, а у WARP — TUN, CLI и отдельное состояние WARP. В `finally` удаляются только созданные им временные ресурсы; JSON с public metadata/checksums сохраняется как artifact на 30 дней. Это воспроизводимая альтернатива медленной загрузке WARP на локальную машину, без ослабления требований задачи 7.3.
+
 ## Risks / Trade-offs
 
 ### Уточнение: uv-проект
