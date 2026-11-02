@@ -8,37 +8,69 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: distribution-${{ github.repository }}
+  cancel-in-progress: false
 
 env:
-  IMAGE_NAME: amnezia-panel
+  IMAGE_NAME: ghcr.io/akaunik/amnezia-panel
+  DOCKER_BUILD_RECORD_UPLOAD: 'false'
 
 jobs:
+  tests:
+    uses: ./.github/workflows/test.yml
+
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+    - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+    - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      with:
+        python-version: '3.11'
+    - id: version
+      run: python scripts/ci/version.py
+
   build:
+    needs: [tests, version]
     runs-on: ${{ matrix.os }}
 
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-24.04
+            system: Linux
+            arch: x86_64
+            binary: Amnezia-Web-Panel-Linux
+          - os: windows-2022
+            system: Windows
+            arch: x86_64
+            binary: Amnezia-Web-Panel-Windows.exe
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
 
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
       with:
         python-version: '3.11'
 
+    - name: Set up uv
+      uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+      with:
+        version: '0.10.5'
+        enable-cache: true
+
     - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install pyinstaller
-        pip install -r requirements.txt
+      run: uv sync --locked --no-dev --group build
 
     - name: Build Linux
       if: runner.os == 'Linux'
       run: |
-        pyinstaller --name Amnezia-Web-Panel-Linux \
+        uv run --locked --no-dev --group build pyinstaller --name Amnezia-Web-Panel-Linux \
           --add-data "static:static" \
           --add-data "templates:templates" \
           --add-data "translations:translations" \
@@ -50,8 +82,9 @@ jobs:
 
     - name: Build Windows
       if: runner.os == 'Windows'
+      shell: pwsh
       run: |
-        pyinstaller --name Amnezia-Web-Panel-Windows `
+        uv run --locked --no-dev --group build pyinstaller --name Amnezia-Web-Panel-Windows `
           --add-data "static;static" `
           --add-data "templates;templates" `
           --add-data "translations;translations" `
@@ -61,26 +94,23 @@ jobs:
           -y `
           -F app.py
 
-    - name: Build macOS
-      if: runner.os == 'macOS'
-      run: |
-        pyinstaller --name Amnezia-Web-Panel-macOS \
-          --add-data "static:static" \
-          --add-data "templates:templates" \
-          --add-data "translations:translations" \
-          --hidden-import uvicorn \
-          --hidden-import fastapi \
-          --clean \
-          -y \
-          -F app.py
+    - name: Smoke binary with isolated state
+      run: python scripts/ci/smoke.py "dist/${{ matrix.binary }}"
+
+    - name: Write binary identity
+      run: python -m scripts.ci.artifacts binary --system "${{ matrix.system }}" --sha "$GITHUB_SHA"
+      shell: bash
 
     - name: Upload artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
       with:
         name: binaries-${{ runner.os }}
         path: dist/*
+        retention-days: 30
+        if-no-files-found: error
 
   docker:
+    needs: [tests, version]
     runs-on: ubuntu-latest
 
     permissions:
@@ -104,102 +134,133 @@ jobs:
             platforms: linux/amd64
 
     steps:
-    - uses: actions/checkout@v4
-
-    - name: Resolve image name
-      id: image
-      run: |
-        owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-        echo "name=ghcr.io/${owner}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+    - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
 
     - name: Log in to GHCR
-      uses: docker/login-action@v3
+      if: github.repository == 'akaUNik/Amnezia-Web-Panel' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
       with:
         registry: ghcr.io
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Set up QEMU
-      uses: docker/setup-qemu-action@v3
+      uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
 
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-
-    - name: Docker metadata
-      id: meta
-      uses: docker/metadata-action@v5
-      with:
-        images: ${{ steps.image.outputs.name }}
-        flavor: |
-          latest=false
-          ${{ matrix.suffix != '' && format('suffix={0},onlatest=true', matrix.suffix) || '' }}
-        tags: |
-          type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
-          type=ref,event=branch
-          type=semver,pattern={{version}}
-          type=semver,pattern={{major}}.{{minor}}
-          type=semver,pattern={{major}}
-          type=sha,format=short
-        labels: |
-          org.opencontainers.image.title=Amnezia Web Panel${{ matrix.suffix }}
-          org.opencontainers.image.description=Web panel for managing Amnezia VPN servers
+      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
     - name: Build and push
-      uses: docker/build-push-action@v6
+      id: container
+      uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
       with:
         context: .
         file: ${{ matrix.dockerfile }}
         platforms: ${{ matrix.platforms }}
-        push: true
-        tags: ${{ steps.meta.outputs.tags }}
-        labels: ${{ steps.meta.outputs.labels }}
+        push: ${{ github.repository == 'akaUNik/Amnezia-Web-Panel' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+        tags: ${{ env.IMAGE_NAME }}:staging-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.variant }}
+        labels: |
+          org.opencontainers.image.source=https://github.com/akaUNik/Amnezia-Web-Panel
+          org.opencontainers.image.revision=${{ github.sha }}
+          org.opencontainers.image.version=${{ needs.version.outputs.version }}
+          org.opencontainers.image.title=Amnezia Web Panel${{ matrix.suffix }}
         cache-from: type=gha,scope=${{ matrix.variant }}
         cache-to: type=gha,mode=max,scope=${{ matrix.variant }}
 
-    - name: Job summary
-      run: |
-        {
-          echo "### Docker: ${{ matrix.variant }} (${{ matrix.dockerfile }})"
-          echo
-          echo "Platforms: \`${{ matrix.platforms }}\`"
-          echo
-          echo '```'
-          echo "${{ steps.meta.outputs.tags }}"
-          echo '```'
-        } >> "$GITHUB_STEP_SUMMARY"
+    - name: Write container digest identity
+      if: github.repository == 'akaUNik/Amnezia-Web-Panel' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+      env:
+        CONTAINER_DIGEST: ${{ steps.container.outputs.digest }}
+      run: python3 -m scripts.ci.artifacts digest --variant "${{ matrix.variant }}" --digest "$CONTAINER_DIGEST" --sha "$GITHUB_SHA" --directory digests
 
-  release:
-    needs: build
+    - name: Upload container digest
+      if: github.repository == 'akaUNik/Amnezia-Web-Panel' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: container-${{ matrix.variant }}
+        path: digests/digest-${{ matrix.variant }}.json
+        retention-days: 30
+        if-no-files-found: error
 
-    # Docker Buildx also uploads *.dockerbuild artifacts by default. Keep the
-    # release job scoped to the three binary artifacts produced by `build`.
-    if: startsWith(github.ref, 'refs/tags/')
-
-    runs-on: ubuntu-latest
-
+  prepare:
+    needs: [tests, version, build, docker]
+    if: github.repository == 'akaUNik/Amnezia-Web-Panel' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-24.04
     steps:
-    - name: Download artifacts
-      uses: actions/download-artifact@v5
+    - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+    - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      with:
+        python-version: '3.11'
+    - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
       with:
         pattern: binaries-*
-        path: artifacts
+        path: binaries
         merge-multiple: true
-
-    - name: Prepare release assets
-      run: |
-        test -f artifacts/Amnezia-Web-Panel-Linux
-        test -f artifacts/Amnezia-Web-Panel-macOS
-        test -f artifacts/Amnezia-Web-Panel-Windows.exe
-        chmod +x artifacts/Amnezia-Web-Panel-Linux artifacts/Amnezia-Web-Panel-macOS
-        ls -lh artifacts
-
-    - name: Publish Release
-      uses: softprops/action-gh-release@v2
+    - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
       with:
-        generate_release_notes: true
-        fail_on_unmatched_files: true
-        files: |
-          artifacts/Amnezia-Web-Panel-Linux
-          artifacts/Amnezia-Web-Panel-macOS
-          artifacts/Amnezia-Web-Panel-Windows.exe
+        pattern: container-*
+        path: digests
+        merge-multiple: true
+    - name: Verify and prepare complete assets
+      run: >-
+        python -m scripts.ci.artifacts prepare --directory binaries --digests digests
+        --sha "$GITHUB_SHA" --ref "$GITHUB_REF"
+        --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: release-assets
+        path: release-assets/*
+        retention-days: 30
+        if-no-files-found: error
 
+  promote:
+    needs: [tests, version, build, docker, prepare]
+    if: github.repository == 'akaUNik/Amnezia-Web-Panel' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+    - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+    - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      with:
+        python-version: '3.11'
+    - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+    - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+      with:
+        pattern: container-*
+        path: digests
+        merge-multiple: true
+    - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+      with:
+        name: release-assets
+        path: release-assets
+    - name: Promote verified digests
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python -m scripts.ci.promote
+
+  release:
+    needs: [tests, version, build, docker, prepare, promote]
+    if: github.repository == 'akaUNik/Amnezia-Web-Panel' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+    - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      with:
+        python-version: '3.11'
+    - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+      with:
+        name: release-assets
+        path: release-assets
+    - name: Publish verified release draft
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python -m scripts.ci.release
