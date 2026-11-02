@@ -8,7 +8,16 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from scripts.ci.smoke import smoke
+from scripts.ci.smoke import expected_exit, smoke
+
+
+class ShutdownStatusTests(unittest.TestCase):
+    def test_windows_break_requires_graceful_shutdown_evidence(self):
+        output='Application shutdown complete.\nFinished server process [123]'
+        self.assertTrue(expected_exit(3,True,True,True,output))
+        for windows,requested,ready,text in ((False,True,True,output),(True,False,True,output),
+                                            (True,True,False,output),(True,True,True,'')):
+            self.assertFalse(expected_exit(3,windows,requested,ready,text))
 
 
 @unittest.skipIf(os.name == 'nt', 'fixture uses a Unix executable shebang')
