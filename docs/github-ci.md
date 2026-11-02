@@ -371,3 +371,45 @@ Cleanup removes only those generated fixture projects/volumes. JSON evidence
 is retained as `published-compose-qualification` for 30 days. No credentials
 or panel data are uploaded. This opt-in run performs only qualification;
 ordinary manual, PR, and reusable runs retain the full unittest job.
+
+
+### Completed public main image qualification
+
+[Linux run 41451019415](https://github.com/akaUNik/Amnezia-Web-Panel/actions/runs/41451019415)
+passed on ubuntu-24.04 using qualifier source
+`adacaae233cbbdb3a3fafdf7b34656adbabbdda6`. It selected the immutable
+`sha-335ac28683b1a8c1e6123d49ca5a8a95eb03781b` pair from the real main
+pipeline, with that full expected source SHA. This validates main publication
+independently of the later stable alias promotion.
+
+The [public package](https://github.com/akaUNik/Amnezia-Web-Panel/pkgs/container/amnezia-panel)
+was visibly associated with this repository and marked Public in Safari.
+Both image variants were pulled successfully on Linux with an empty Docker
+auth config. Their exact main digests match the table above. Registry
+inspection verified source/revision/version labels for every runtime
+platform: default linux/amd64 and linux/arm64, WARP linux/amd64. The actual
+Compose execution on the Linux x86_64 runner used native amd64 images.
+
+| Check | Default | WARP |
+| --- | --- | --- |
+| Anonymous digest pull and expected source identity | Pass | Pass |
+| Login and bundled updates.js HTTP | Pass | Pass |
+| New container ID after force recreation | Pass | Pass |
+| Identical data.json and two synthetic state-file SHA256 values | Pass | Pass |
+| Persistent WARP volume marker, TUN character device, warp-cli | N/A | Pass |
+| Original WARP NET_ADMIN/SYS_MODULE and /dev/net/tun mapping | N/A | Pass |
+| Generated fixture containers/volumes removed in finally | Pass | Pass |
+
+[Evidence artifact 13144153455](https://github.com/akaUNik/Amnezia-Web-Panel/actions/runs/41451019415/artifacts/13144153455)
+contains `published-compose.json` with the two exact digests, source SHA,
+platforms, state hashes, and temporary mount/device/capability metadata. Its
+ZIP is 941 bytes and expires at 2026-12-02 13:13:39 UTC. It was downloaded and
+checked locally against the recorded main publication identities. No private
+panel state is included. Success records are written only after each fixture's
+cleanup completes.
+
+Local default-image qualification also passed recreation/state preservation.
+The local WARP download was deliberately stopped after repeated slow registry
+transfers; it is not claimed as a successful local WARP test. The separately
+agreed Linux qualification above supplies that required end-to-end evidence.
+The temporary local Safari QA server was shut down after verification.
