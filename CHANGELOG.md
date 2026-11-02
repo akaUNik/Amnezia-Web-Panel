@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [1.10.1] - 2026-11-02
+
+### Fixed
+- Run Smart Route own-subnet copies and instance-marker writes inside one sudo shell for non-root SSH accounts (#19).
+
 ## [1.10.0] - 2026-11-02
 
 ### Added
