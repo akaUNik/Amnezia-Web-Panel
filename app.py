@@ -47,6 +47,15 @@ except ImportError:
 from managers.ssh_manager import SSHManager
 from managers import ssh_trust
 from managers.awg_manager import AWGManager, normalize_special_junk
+from managers.awg_plugin_updater import (
+    COMPONENTS as AWG_PLUGIN_COMPONENTS,
+    KERNEL_MODULE as AWG_PLUGIN_KERNEL,
+    USERSPACE as AWG_PLUGIN_USERSPACE,
+    TOTAL_STEPS as AWG_PLUGIN_TOTAL_STEPS,
+    AwgPluginUpdater,
+    PluginUpdateError,
+    stage_step as awg_plugin_stage_step,
+)
 from managers.xray_manager import XrayManager
 from managers.wireguard_manager import WireGuardManager
 from managers.backup_manager import BackupManager
@@ -265,7 +274,7 @@ load_translations()
 # Global lock for data.json access to prevent race conditions during async operations
 from peer_lifecycle_lock import serialize_peer_lifecycle
 import peer_lifecycle_lock
-from peer_accounting import guard_user_deletions
+from peer_accounting import guard_user_deletions, ownership_rows
 from peer_recovery import (RecoveryStore, RecoveryError, PanelLease, STATE_FILE_LOCK,
                            GENERATION, digest as recovery_digest, orphan_scope, validate_backup)
 from peer_recovery import verify_awg_peer_absent, check_create_journal, require_repair_target, DISASTER_HOLD
@@ -283,6 +292,8 @@ peer_lifecycle_lock.configure(DATA_FILE)
 _panel_lease = None
 
 DATA_LOCK = asyncio.Lock()
+# One in-flight access propagation task per user id (perform_toggle_user).
+_USER_STATE_TASKS = {}
 # Serialize overlapping traffic collection/commit cycles.
 _TRAFFIC_SYNC_LOCK = asyncio.Lock()
 # Inventory/identity operations may await SSH; unrelated JSON updates stay free.
@@ -1868,12 +1879,24 @@ def verify_password(password: str, password_hash: str) -> bool:
         return False
 
 
+def _blocking_row_public(conn):
+    """Non-secret description of a leftover accounting row (admin-only API)."""
+    return {'connection_id': conn.get('id'), 'user_id': conn.get('user_id'),
+            'protocol': conn.get('protocol'), 'client_id': conn.get('client_id')}
+
+
 def _traffic_removal_guard(data, **scope):
     from peer_accounting import TrafficFinalizationRequired, require_unowned
     try:
         require_unowned(data, **scope)
     except TrafficFinalizationRequired as error:
-        return JSONResponse({'error': str(error), 'code': error.code}, status_code=409)
+        payload = {'error': str(error), 'code': error.code}
+        if scope.get('server_id') is not None:
+            # A generic message gives an admin no way to find the leftover row
+            # in the UI, so name the exact ownership records that block us.
+            payload['blocking'] = [_blocking_row_public(c)
+                                   for c in ownership_rows(data, **scope)]
+        return JSONResponse(payload, status_code=409)
     return None
 
 
@@ -1988,6 +2011,19 @@ async def _propagate_user_state(user_id):
 
 async def perform_toggle_user(data: dict, user_id: str, enable: bool) -> bool:
     # The old snapshot/enable arguments are deliberately not authoritative.
+    try:
+        return await _apply_user_state_locked(user_id)
+    except (peer_lifecycle_lock.PeerLifecycleBusy, peer_lifecycle_lock.PeerLifecycleUncertain):
+        # Keep the already-committed intent pending for the next sync. Only
+        # remote propagation waits; callers may still save a newer revocation.
+        return False
+
+
+@serialize_peer_lifecycle(wait_for_completion=True)
+async def _apply_user_state_locked(user_id):
+    # Acquire admission before consulting/creating the per-user task. Otherwise
+    # a mass operation holding the interlock could await a cached worker that
+    # is itself waiting to acquire that same interlock.
     task = _USER_STATE_TASKS.get(user_id)
     if task is None or task.done():
         task = asyncio.create_task(_propagate_user_state(user_id))
@@ -3362,6 +3398,31 @@ def _check_admin(request):
     return None
 
 
+def _request_user(request):
+    """Resolve the caller for handlers that apply their own role checks.
+
+    Admin/support sessions and Bearer tokens resolve exactly as in
+    _check_admin; otherwise the plain session user is returned so owner-only
+    access keeps working. A token carries its owner's role, so admin-only
+    handlers still reject support tokens.
+    """
+    actor = _check_admin(request)
+    if isinstance(actor, dict):
+        return actor
+    return get_current_user(request)
+
+
+def _actor_id(request, actor):
+    """Audit id for a caller authorized by _check_admin.
+
+    Bearer requests have no session: the token owner is the actor.
+    """
+    if isinstance(actor, dict) and actor.get('id'):
+        return str(actor['id'])
+    user = get_current_user(request)
+    return str(user['id']) if user and user.get('id') else 'admin'
+
+
 class SSHTrustConfirmation(BaseModel):
     token: constr(min_length=1, max_length=4096)
     confirmed: StrictBool
@@ -3892,8 +3953,18 @@ async def api_reorder_servers(request: Request, req: ReorderServersRequest):
 
 @app.post('/api/servers/{server_id}/delete', tags=["Servers"])
 @serialize_peer_lifecycle
-async def api_delete_server(request: Request, server_id: int, server_uid: Optional[str] = None):
-    if not _check_admin(request):
+async def api_delete_server(request: Request, server_id: int, server_uid: Optional[str] = None,
+                            archive_blocking: bool = False):
+    """Remove a server from the panel inventory.
+
+    A leftover ``user_connections`` row is accounting ownership and normally
+    blocks deletion (possibly forever, when its peer no longer exists). With
+    ``archive_blocking=true`` an admin may archive those rows as unverified
+    tombstones, but only after each peer is verified stopped or absent on the
+    live server. Rows are never dropped without that explicit evidence.
+    """
+    authorized = _check_admin(request)
+    if not authorized:
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     selected, error = _server_identity(server_id, server_uid)
     if error is not None:
@@ -3901,7 +3972,7 @@ async def api_delete_server(request: Request, server_id: int, server_uid: Option
     uid = selected['uid']
     data = load_data()
     guard = _traffic_removal_guard(data, server_id=server_id)
-    if guard is not None:
+    if guard is not None and not archive_blocking:
         return guard
 
     async def delete():
@@ -3910,7 +3981,7 @@ async def api_delete_server(request: Request, server_id: int, server_uid: Option
             deletion_committed = False
             try:
                 async with DATA_LOCK:
-                    _, server = find_server_by_uid(load_data(), uid)
+                    index, server = find_server_by_uid(load_data(), uid)
                     if server is None:
                         return {'status': 'success', 'already_deleted': True}
                 results = []
@@ -3921,21 +3992,76 @@ async def api_delete_server(request: Request, server_id: int, server_uid: Option
                     return JSONResponse({'error': 'Exit-link cleanup incomplete; server retained',
                                          'cleanup_results': results, 'deletion_committed': False}, status_code=409)
                 cleanup_completed = True
+
+                blocked = []
+                archive_states = {}
+                if archive_blocking:
+                    async with DATA_LOCK:
+                        blocked = ownership_rows(load_data(), server_id=index)
+                    for conn in blocked:
+                        observed, quiescent = await asyncio.to_thread(
+                            _probe_blocking_peer, server, conn)
+                        if not quiescent:
+                            return JSONResponse({
+                                'error': 'A peer linked to this server is still active; '
+                                         'stop or remove it before archiving its accounting.',
+                                'code': 'blocked_peer_still_active',
+                                'blocking': [_blocking_row_public(conn)],
+                            }, status_code=409)
+                        archive_states[conn.get('id')] = observed
+
                 async with DATA_LOCK:
                     data = load_data()
                     index, current = find_server_by_uid(data, uid)
                     if current is None:
                         return {'status': 'success', 'already_deleted': True}
-                    data['servers'].pop(index)
-                    data['user_connections'] = [c for c in data.get('user_connections', [])
-                                                if c.get('server_id') != index]
-                    for c in data['user_connections']:
-                        if c.get('server_id', 0) > index:
-                            c['server_id'] -= 1
-                    save_data(data)
+                    current_blocked = ownership_rows(data, server_id=index)
+                    if current_blocked and not archive_blocking:
+                        # A connection row appeared after the outer guard; never
+                        # drop accounting ownership without the archive opt-in.
+                        return JSONResponse({
+                            'error': 'Connection accounting changed; refresh the server page and retry.',
+                            'code': 'traffic_finalization_required',
+                            'blocking': [_blocking_row_public(c) for c in current_blocked],
+                        }, status_code=409)
+                    if archive_blocking and [c.get('id') for c in current_blocked] != [c.get('id') for c in blocked]:
+                        return JSONResponse({
+                            'error': 'Connection accounting changed; refresh the server page and retry.',
+                            'code': 'traffic_finalization_required',
+                            'blocking': [_blocking_row_public(c) for c in current_blocked],
+                        }, status_code=409)
+                    if current_blocked:
+                        before = pathlib_read_data_bytes()
+                        operation_id = uuid.uuid4().hex
+                        actor = _actor_id(request, authorized)
+                        for conn in current_blocked:
+                            finalize_connection_record(
+                                data, conn, current, archive_states.get(conn.get('id')),
+                                time.time(), 'archive_blocking_absent', operation_id, True)
+                        data['servers'].pop(index)
+                        data['user_connections'] = [c for c in data.get('user_connections', [])
+                                                    if c.get('server_id') != index]
+                        for c in data['user_connections']:
+                            if c.get('server_id', 0) > index:
+                                c['server_id'] -= 1
+                        commit_finalize(DATA_FILE, operation_id, actor, 'server_archive_delete',
+                                        recovery_digest({'server_uid': uid,
+                                                         'mode': 'archive_blocking_absent'}),
+                                        before, data)
+                    else:
+                        data['servers'].pop(index)
+                        data['user_connections'] = [c for c in data.get('user_connections', [])
+                                                    if c.get('server_id') != index]
+                        for c in data['user_connections']:
+                            if c.get('server_id', 0) > index:
+                                c['server_id'] -= 1
+                        save_data(data)
                     deletion_committed = True
                 await _finish_locked_worker(lambda: drop_ssh(server))
-                return {'status': 'success'}
+                response = {'status': 'success'}
+                if blocked:
+                    response['archived'] = len(blocked)
+                return response
             except Exception as e:
                 # Remote cleanup is not transactional. Keep the server on a failed
                 # local commit, report the partial result, and allow a safe retry.
@@ -4138,8 +4264,10 @@ RKN_RAW_BASE = ('https://raw.githubusercontent.com/PRVTPRO/Amnezia-Web-Panel/'
                 'main/scripts/rknblock')
 
 RKN_INSTALL_CMD = (
+    'tmp_dir=$(mktemp -d /tmp/amnezia-rkn.XXXXXXXXXX) || exit $?; '
+    'trap \'rm -rf -- "$tmp_dir"\' EXIT; '
     f'curl -fsSL {RKN_RAW_BASE}/install-rkn-extra.sh '
-    '-o /tmp/rkn-install.sh && bash /tmp/rkn-install.sh'
+    '-o "$tmp_dir/rkn-install.sh" && bash "$tmp_dir/rkn-install.sh"'
 )
 
 RKN_SCRIPT_URL = f'{RKN_RAW_BASE}/rkn-extra-block.sh'
@@ -4152,10 +4280,12 @@ def _rkn_run_cmd(subcommand):
     always driving a fresh copy keeps every server able to run every
     subcommand regardless of the version it was installed with.
     """
-    return (f'curl -fsSL {RKN_SCRIPT_URL} -o /tmp/rkn-extra-block-run.sh '
-            f'&& install -m 0755 /tmp/rkn-extra-block-run.sh /usr/local/sbin/rkn-extra-block '
-            f'&& bash /tmp/rkn-extra-block-run.sh {subcommand}; '
-            f'rc=$?; rm -f /tmp/rkn-extra-block-run.sh; exit $rc')
+    return ('tmp_dir=$(mktemp -d /tmp/amnezia-rkn.XXXXXXXXXX) || exit $?; '
+            'trap \'rm -rf -- "$tmp_dir"\' EXIT; '
+            f'curl -fsSL {RKN_SCRIPT_URL} -o "$tmp_dir/rkn-extra-block-run.sh" '
+            '&& install -m 0755 "$tmp_dir/rkn-extra-block-run.sh" /usr/local/sbin/rkn-extra-block '
+            f'&& bash "$tmp_dir/rkn-extra-block-run.sh" {subcommand}; '
+            'rc=$?; exit $rc')
 
 
 def _rkn_record(server):
@@ -4216,7 +4346,7 @@ async def _rkn_ssh_run(server, cmd, timeout):
         await asyncio.to_thread(ssh.connect)
         if _rkn_server_index(load_data(), None, server.get('uid'), server) is None:
             return JSONResponse({'error': 'Server identity changed; refresh the inventory'}, status_code=409)
-        out, err, code = await asyncio.to_thread(ssh.run_sudo_command, cmd, timeout)
+        out, err, code = await asyncio.to_thread(ssh.run_sudo_script, cmd, timeout)
     finally:
         try:
             ssh.disconnect()
@@ -5492,6 +5622,326 @@ async def api_smartroute_status(request: Request, server_id: int):
     except Exception as e:
         logger.exception("Error reading Smart Route status")
         return JSONResponse({'error': str(e)}, status_code=500)
+
+
+# ===== AmneziaWG plugin (kernel module / userspace) updates =====
+#
+# A plugin update is a long SSH operation (DKMS builds take minutes), so it
+# runs as a background task and the page polls a journal. The registry is
+# process-local on purpose: an update must never be resumed by another worker
+# that does not own the SSH session.
+
+AWG_PLUGIN_OP_TTL = 60 * 60
+AWG_PLUGIN_OP_KEEP = 20
+_awg_plugin_ops = {}
+_awg_plugin_active = {}
+_awg_plugin_loaded = {'done': False}
+
+
+def _awg_plugin_store_path():
+    """Journal file next to data.json; an update outlives a panel restart."""
+    return os.path.join(os.path.dirname(DATA_FILE), 'awg_plugin_ops.json')
+
+
+def _awg_plugin_save():
+    path = _awg_plugin_store_path()
+    tmp = path + '.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as handle:
+            json.dump(list(_awg_plugin_ops.values()), handle, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:
+        # Persistence is a convenience: never fail the update because the
+        # journal file cannot be written.
+        logger.warning("Cannot persist AWG plugin operations", exc_info=True)
+
+
+def _awg_plugin_load():
+    if _awg_plugin_loaded['done']:
+        return
+    _awg_plugin_loaded['done'] = True
+    path = _awg_plugin_store_path()
+    try:
+        with open(path, encoding='utf-8') as handle:
+            stored = json.load(handle)
+    except Exception:
+        return
+    if not isinstance(stored, list):
+        return
+    for op in stored:
+        if not isinstance(op, dict) or not op.get('id'):
+            continue
+        if op.get('state') == 'running':
+            # The process that owned the SSH session is gone. Never report a
+            # killed update as success; the admin must verify the version.
+            op['state'] = 'failed'
+            op['error'] = {
+                'code': 'interrupted',
+                'message': 'the panel restarted during the update; check the installed version',
+            }
+            op.setdefault('lines', []).append({
+                'ts': datetime.now().isoformat(timespec='seconds'),
+                'stage': 'error',
+                'text': 'panel restarted before the operation finished',
+            })
+            op['finished_at'] = datetime.now().isoformat(timespec='seconds')
+            op['finished_ts'] = datetime.now().timestamp()
+        _awg_plugin_ops[op['id']] = op
+    _awg_plugin_prune()
+
+
+class AwgPluginUpdateRequest(BaseModel):
+    server_uid: str | None = None
+    component: str
+    target: str | None = None
+    allow_interrupt: bool = False
+
+
+def _awg_plugin_server(server_id, expected_uid=None):
+    data = load_data()
+    if not 0 <= server_id < len(data.get('servers', [])):
+        raise PluginUpdateError('server_not_found', 'Server not found')
+    server = data['servers'][server_id]
+    if expected_uid is not None and server.get('uid') != expected_uid:
+        raise PluginUpdateError('server_identity_changed', 'Server identity changed; reload the page')
+    return server
+
+
+def _awg_plugin_updater(server_id, expected_uid=None):
+    return AwgPluginUpdater(get_ssh(_awg_plugin_server(server_id, expected_uid)))
+
+
+def _awg_plugin_error(exc, status_code=400):
+    return JSONResponse({'error': exc.message, 'code': exc.code}, status_code=status_code)
+
+
+def _awg_plugin_prune():
+    now = datetime.now().timestamp()
+    for op_id, op in list(_awg_plugin_ops.items()):
+        if op.get('finished_ts') and now - op['finished_ts'] > AWG_PLUGIN_OP_TTL:
+            _awg_plugin_ops.pop(op_id, None)
+    if len(_awg_plugin_ops) > AWG_PLUGIN_OP_KEEP:
+        finished = sorted(
+            (op for op in _awg_plugin_ops.values() if op.get('finished_ts')),
+            key=lambda op: op['finished_ts'],
+        )
+        for op in finished[:len(_awg_plugin_ops) - AWG_PLUGIN_OP_KEEP]:
+            _awg_plugin_ops.pop(op['id'], None)
+
+
+@app.get('/api/servers/{server_id}/awg-plugin/status', tags=["Protocols"])
+async def api_awg_plugin_status(request: Request, server_id: int):
+    """Installed and published versions of the AWG components of this server."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    _awg_plugin_load()
+    try:
+        updater = await asyncio.to_thread(_awg_plugin_updater, server_id)
+        result = await asyncio.to_thread(updater.status)
+        return result
+    except PluginUpdateError as e:
+        return _awg_plugin_error(e, 502)
+    except Exception as e:
+        logger.exception("Error reading AWG plugin status")
+        return JSONResponse({'error': str(e), 'code': 'internal_error'}, status_code=500)
+
+
+@app.get('/api/servers/{server_id}/awg-plugin/changelog', tags=["Protocols"])
+async def api_awg_plugin_changelog(request: Request, server_id: int, component: str, version: str):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if component not in AWG_PLUGIN_COMPONENTS:
+        return JSONResponse({'error': 'Unknown component', 'code': 'unsupported'}, status_code=400)
+    try:
+        updater = await asyncio.to_thread(_awg_plugin_updater, server_id)
+        entries = await asyncio.to_thread(updater.changelog, component, version)
+        return {'component': component, 'version': version, 'entries': entries}
+    except PluginUpdateError as e:
+        return _awg_plugin_error(e, 502)
+
+
+@app.post('/api/servers/{server_id}/awg-plugin/update', tags=["Protocols"])
+async def api_awg_plugin_update(request: Request, server_id: int, req: AwgPluginUpdateRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if req.component not in AWG_PLUGIN_COMPONENTS:
+        return JSONResponse({'error': 'Unknown component', 'code': 'unsupported'}, status_code=400)
+    _awg_plugin_load()
+    _awg_plugin_prune()
+    if not req.server_uid:
+        return _awg_plugin_error(PluginUpdateError('server_uid_required', 'Server UID is required'), 409)
+    try:
+        _awg_plugin_server(server_id, req.server_uid)
+    except PluginUpdateError as exc:
+        return _awg_plugin_error(exc, 409)
+    key = req.server_uid
+    if key in _awg_plugin_active:
+        return JSONResponse(
+            {'error': 'An update on this server is already running',
+             'code': 'update_in_progress'},
+            status_code=409,
+        )
+
+    op_id = uuid.uuid4().hex
+    op = {
+        'id': op_id,
+        'server_uid': req.server_uid,
+        'server_id': server_id,
+        'component': req.component,
+        'target': req.target,
+        'state': 'running',
+        'lines': [],
+        'result': None,
+        'error': None,
+        'cancel_requested': False,
+        'step': 0,
+        'total': AWG_PLUGIN_TOTAL_STEPS,
+        'percent': 0,
+        'started_at': datetime.now().isoformat(timespec='seconds'),
+    }
+    _awg_plugin_ops[op_id] = op
+    _awg_plugin_save()
+    _awg_plugin_active[key] = op_id
+    asyncio.create_task(_run_awg_plugin_update(
+        op_id, server_id, req.component, req.target, bool(req.allow_interrupt),
+    ))
+    return {'operation_id': op_id}
+
+
+async def _run_awg_plugin_update(op_id, server_id, component, target, allow_interrupt):
+    started = asyncio.Event()
+
+    def reject(code, message, state='failed'):
+        op = _awg_plugin_ops[op_id]
+        op['state'] = state
+        op['error'] = {'code': code, 'message': message}
+        op['finished_at'] = datetime.now().isoformat(timespec='seconds')
+        op['finished_ts'] = datetime.now().timestamp()
+        if _awg_plugin_active.get(op['server_uid']) == op_id:
+            _awg_plugin_active.pop(op['server_uid'])
+        _awg_plugin_save()
+
+    try:
+        await _run_awg_plugin_update_locked(op_id, server_id, component, target, allow_interrupt, started)
+    except (peer_lifecycle_lock.PeerLifecycleBusy, peer_lifecycle_lock.PeerLifecycleUncertain) as exc:
+        # Admission can fail before the worker starts. Do not leave a queued
+        # operation running forever. Cancellation, on the other hand, leaves
+        # an admitted worker owning its interlock and operation until it ends.
+        reject(exc.code, str(exc))
+    except asyncio.CancelledError:
+        if not started.is_set():
+            reject('cancelled', 'update cancelled before admission', 'cancelled')
+        raise
+
+
+@serialize_peer_lifecycle(wait_for_completion=True)
+async def _run_awg_plugin_update_locked(op_id, server_id, component, target, allow_interrupt, started):
+    started.set()
+    op = _awg_plugin_ops[op_id]
+
+    def log(stage, message):
+        op['lines'].append({
+            'ts': datetime.now().isoformat(timespec='seconds'),
+            'stage': stage,
+            'text': str(message)[-2000:],
+        })
+        mapped = awg_plugin_stage_step(op['component'], stage)
+        if mapped:
+            step, total = mapped
+            if step > op.get('step', 0):
+                op['step'] = step
+                op['total'] = total
+                op['percent'] = int(round(step * 100.0 / total))
+        _awg_plugin_save()
+
+    try:
+        updater = await asyncio.to_thread(_awg_plugin_updater, server_id, op['server_uid'])
+        if not target:
+            latest = await asyncio.to_thread(updater.latest_versions)
+            target = latest.get(component)
+        op['target'] = target
+        if not target:
+            raise PluginUpdateError('unsupported', 'no published version to update to')
+        log('start', 'updating %s to %s' % (component, target))
+        result = await asyncio.to_thread(
+            updater.update, component, target,
+            allow_interrupt=allow_interrupt, log=log,
+            should_cancel=lambda: bool(op.get('cancel_requested')),
+        )
+        op['result'] = result
+        op['state'] = 'manual_step_required' if result.get('state') == 'manual_step_required' else 'success'
+        log('done', 'state: %s' % op['state'])
+    except PluginUpdateError as e:
+        op['state'] = 'cancelled' if e.code == 'cancelled' else 'failed'
+        op['error'] = {'code': e.code, 'message': e.message}
+        log('error', '%s: %s' % (e.code, e.message))
+    except Exception as e:
+        logger.exception("AWG plugin update failed")
+        op['state'] = 'failed'
+        op['error'] = {'code': 'internal_error', 'message': str(e)}
+        log('error', str(e))
+    finally:
+        op['finished_at'] = datetime.now().isoformat(timespec='seconds')
+        op['finished_ts'] = datetime.now().timestamp()
+        _awg_plugin_active.pop(op['server_uid'], None)
+        _awg_plugin_save()
+
+
+@app.post('/api/servers/{server_id}/awg-plugin/update/{op_id}/cancel', tags=["Protocols"])
+def api_awg_plugin_update_cancel(request: Request, server_id: int, op_id: str):
+    """Ask a running update to stop at the next safe boundary.
+
+    The DKMS build itself cannot be interrupted; the operation aborts before
+    the module switch or between containers, leaving the installed version in
+    place.
+    """
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    _awg_plugin_load()
+    op = _awg_plugin_ops.get(op_id)
+    if not op or op['server_id'] != server_id:
+        return JSONResponse({'error': 'Operation not found', 'code': 'not_found'}, status_code=404)
+    if op['state'] != 'running':
+        return JSONResponse({'error': 'Operation is not running', 'code': 'not_running'}, status_code=409)
+    op['cancel_requested'] = True
+    op['lines'].append({
+        'ts': datetime.now().isoformat(timespec='seconds'),
+        'stage': 'cancel',
+        'text': 'cancellation requested; stopping at the next safe boundary',
+    })
+    _awg_plugin_save()
+    return {'status': 'cancelling'}
+
+
+@app.get('/api/servers/{server_id}/awg-plugin/update/{op_id}', tags=["Protocols"])
+def api_awg_plugin_update_status(request: Request, server_id: int, op_id: str):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    _awg_plugin_load()
+    op = _awg_plugin_ops.get(op_id)
+    if not op or op['server_id'] != server_id:
+        return JSONResponse({'error': 'Operation not found', 'code': 'not_found'}, status_code=404)
+    try:
+        offset = max(0, int(request.query_params.get('offset', 0)))
+    except (TypeError, ValueError):
+        offset = 0
+    lines = op['lines']
+    return {
+        'operation_id': op_id,
+        'component': op['component'],
+        'target': op['target'],
+        'state': op['state'],
+        'step': op.get('step', 0),
+        'total': op.get('total', AWG_PLUGIN_TOTAL_STEPS),
+        'percent': op.get('percent', 0),
+        'result': op['result'],
+        'error': op['error'],
+        'started_at': op['started_at'],
+        'finished_at': op.get('finished_at'),
+        'lines': lines[offset:],
+        'next_offset': len(lines),
+    }
+
 
 
 @app.post('/api/servers/{server_id}/awg/settings', tags=["Protocols"])
@@ -6825,7 +7275,8 @@ def api_add_connection(request: Request, server_id: int, req: AddConnectionReque
 @app.post('/api/servers/{server_id}/connections/remove', tags=["Connections"])
 @serialize_peer_lifecycle
 async def api_remove_connection(request: Request, server_id: int, req: ConnectionActionRequest):
-    if not _check_admin(request):
+    admin = _check_admin(request)
+    if not admin:
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
         data = load_data()
@@ -6835,10 +7286,7 @@ async def api_remove_connection(request: Request, server_id: int, req: Connectio
         if not req.client_id:
             return JSONResponse({'error': 'Client ID is required'}, status_code=400)
 
-        try:
-            actor = str(get_current_user(request)['id'])
-        except Exception:
-            actor = 'admin'
+        actor = _actor_id(request, admin)
         operation_id = uuid.uuid4().hex
 
         # An owned peer must be finalized; an unowned peer can be removed raw.
@@ -7101,7 +7549,7 @@ def api_save_connection_config(request: Request, server_id: int, req: SaveConnec
 
 @app.post('/api/servers/{server_id}/connections/config', tags=["Connections"])
 def api_get_connection_config(request: Request, server_id: int, req: ConnectionActionRequest):
-    user = get_current_user(request)
+    user = _request_user(request)
     if not user:
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
@@ -7226,7 +7674,7 @@ def api_list_users(request: Request, search: str = '', page: int = 1, size: int 
 @app.post('/api/users/add', tags=["Users"])
 @serialize_peer_lifecycle
 def api_add_user(request: Request, req: AddUserRequest):
-    cur = get_current_user(request)
+    cur = _request_user(request)
     if not cur or cur['role'] != 'admin':
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
@@ -7378,7 +7826,7 @@ async def api_update_user(request: Request, user_id: str, req: UpdateUserRequest
 @app.post('/api/users/{user_id}/delete', tags=["Users"])
 @serialize_peer_lifecycle
 async def api_delete_user(request: Request, user_id: str):
-    cur = get_current_user(request)
+    cur = _request_user(request)
     if not cur or cur['role'] != 'admin':
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     lang = request.cookies.get('lang', 'ru')
@@ -7404,7 +7852,7 @@ async def api_delete_user(request: Request, user_id: str):
 
 @app.post('/api/users/{user_id}/toggle', tags=["Users"])
 async def api_toggle_user(request: Request, user_id: str, req: ToggleUserRequest):
-    cur = get_current_user(request)
+    cur = _request_user(request)
     if not cur or cur['role'] != 'admin':
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
@@ -7572,13 +8020,11 @@ async def api_unlink_user_connection(request: Request, user_id: str, req: Unlink
     * A failed final counter read returns 409 with ``can_force=True`` so the
       UI can ask for explicit confirmation before ``allow_unverified=True``.
     """
-    if not _check_admin(request):
+    admin = _check_admin(request)
+    if not admin:
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
 
-    try:
-        actor = str(get_current_user(request)['id'])
-    except Exception:
-        actor = 'admin'
+    actor = _actor_id(request, admin)
     operation_id = uuid.uuid4().hex
 
     async with DATA_LOCK:
@@ -7663,7 +8109,7 @@ async def api_unlink_user_connection(request: Request, user_id: str, req: Unlink
 
 @app.get('/api/users/{user_id}/connections', tags=["Users"])
 def api_get_user_connections(request: Request, user_id: str):
-    user = get_current_user(request)
+    user = _request_user(request)
     if not user:
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     # Users can only see their own, admin/support can see all
@@ -8673,6 +9119,38 @@ def api_recovery_status(request: Request):
     return peer_lifecycle_lock.diagnostics()
 
 
+def _probe_blocking_peer(server, conn):
+    """Return (observed_bytes, quiescent) for a leftover accounting row.
+
+    ``quiescent`` is True only when the peer is absent from the live protocol
+    instance or is explicitly disabled there.  Unknown state is NOT quiescent.
+    """
+    ssh = get_ssh(server)
+    try:
+        ssh.connect()
+        manager = get_protocol_manager(ssh, conn['protocol'])
+        clients = _manager_call(manager, 'get_clients', conn['protocol'])
+        if not isinstance(clients, list):
+            raise RecoveryError('incomplete_peer_state')
+        peers = [c for c in clients
+                 if isinstance(c, dict) and c.get('clientId') == conn.get('client_id')]
+        if len(peers) > 1:
+            raise RecoveryError('peer_identity_ambiguous')
+        if not peers:
+            verify_awg_peer_absent(ssh, conn['protocol'], conn['client_id'])
+            return None, True
+        ud = peers[0].get('userData') or {}
+        rx, tx = ud.get('dataReceivedBytes'), ud.get('dataSentBytes')
+        observed = (rx + tx if type(rx) is int and type(tx) is int
+                    and rx >= 0 and tx >= 0 else None)
+        if ud.get('enabled') is not False:
+            return observed, False
+        verify_awg_peer_absent(ssh, conn['protocol'], conn['client_id'], allow_disabled=True)
+        return observed, True
+    finally:
+        ssh.disconnect()
+
+
 def _read_orphan_peers(server, conn, strict_absence=False):
     ssh = get_ssh(server)
     try:
@@ -8712,14 +9190,15 @@ def api_orphan_recovery_preview(request: Request, connection_id: str):
 @app.post('/api/recovery/orphans', tags=['Settings'])
 @serialize_peer_lifecycle
 async def api_orphan_recovery(request: Request, req: OrphanRecoveryRequest):
-    if not _check_admin(request):
+    admin = _check_admin(request)
+    if not admin:
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     # A cross-origin browser must not turn confirmation strings into a CSRF bypass.
     origin = request.headers.get('origin')
     if origin and origin.rstrip('/') != str(request.base_url).rstrip('/'):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
-        actor = str(get_current_user(request)['id'])
+        actor = _actor_id(request, admin)
         phrases = {'repair': 'RESTORE OWNERSHIP; USAGE IS UNVERIFIED',
                    'archive_absent': 'ARCHIVE ABSENT PEER; FINAL USAGE IS UNKNOWN'}
         if req.mode not in phrases or req.confirmation != phrases[req.mode]:

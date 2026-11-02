@@ -408,12 +408,14 @@ def require_repair_target(data, user_id):
         raise RecoveryError('target_access_blocked_or_unknown') from None
 
 
-def verify_awg_peer_absent(ssh, protocol, client_id):
+def verify_awg_peer_absent(ssh, protocol, client_id, *, allow_disabled=False):
     """Strict read-only absence evidence, NOT final accounting/quiescence.
 
     Ordinary get_clients() may swallow SSH errors. Require successful reads of
     persistent metadata, every supported config candidate and native peers.
-    This deliberately excludes unverified protocol backends.
+    This deliberately excludes unverified protocol backends. With
+    allow_disabled, a disabled metadata row may remain, but the peer must
+    still be absent from every configuration and the live interface.
     """
     from managers.awg_manager import AWGManager
     from peer_accounting import _protocol_scope
@@ -434,7 +436,11 @@ def verify_awg_peer_absent(ssh, protocol, client_id):
     table = json.loads(command('cat ' + shlex.quote(manager._clients_table_path())))
     if not isinstance(table, list) or any(not isinstance(c, dict) or not isinstance(c.get('clientId'), str) for c in table):
         raise RecoveryError('incomplete_peer_state')
-    if any(c['clientId'] == client_id for c in table):
+    matches = [c for c in table if c['clientId'] == client_id]
+    if len(matches) > 1:
+        raise RecoveryError('peer_identity_ambiguous')
+    if matches and not (allow_disabled and
+                        (matches[0].get('userData') or {}).get('enabled') is False):
         raise RecoveryError('peer_still_present_restore_ownership_instead')
     found_config = False
     for path in manager._config_path_candidates(canonical):
