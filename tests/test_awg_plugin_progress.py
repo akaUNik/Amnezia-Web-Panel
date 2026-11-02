@@ -92,7 +92,7 @@ class AwgPluginProgressTests(unittest.TestCase):
             ('preflight', 'kernel 6.1.0, blockers: none'),
             ('build', 'dkms build in progress'),
         ])
-        patcher = patch.object(panel, '_awg_plugin_updater', lambda server_id: self.updater)
+        patcher = patch.object(panel, '_awg_plugin_updater', lambda server_id, expected_uid=None: self.updater)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -110,7 +110,7 @@ class AwgPluginProgressTests(unittest.TestCase):
     def _start_update(self, component=KERNEL_MODULE):
         response = self.client.post(
             '/api/servers/0/awg-plugin/update',
-            json={'component': component},
+            json={'server_uid': 'u0', 'component': component},
         )
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()['operation_id']
@@ -229,13 +229,13 @@ class AwgPluginProgressTests(unittest.TestCase):
         ])
         op_id = 'op-monotonic'
         panel._awg_plugin_ops[op_id] = {
-            'id': op_id, 'server_id': 0, 'component': KERNEL_MODULE,
+            'id': op_id, 'server_id': 0, 'server_uid': 'u0', 'component': KERNEL_MODULE,
             'target': '3.1.20260906', 'state': 'running', 'lines': [],
             'result': None, 'error': None, 'cancel_requested': False,
             'step': 7, 'total': TOTAL_STEPS, 'percent': 58,
             'started_at': 't',
         }
-        with patch.object(panel, '_awg_plugin_updater', lambda server_id: out_of_order):
+        with patch.object(panel, '_awg_plugin_updater', lambda server_id, expected_uid=None: out_of_order):
             asyncio.run(panel._run_awg_plugin_update(
                 op_id, 0, KERNEL_MODULE, '3.1.20260906', False,
             ))

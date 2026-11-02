@@ -1,5 +1,6 @@
 import json
 import unittest
+from tests.awg_plugin_fixtures import source_build_response
 from unittest.mock import patch
 
 from managers.awg_plugin_updater import (
@@ -26,11 +27,11 @@ class FakeSSH:
 
     def run_command(self, command, timeout=60, _retried=False, stdin_input=None):
         self.commands.append(command)
-        return self.handler(command)
+        return source_build_response(command) or self.handler(command)
 
     def run_sudo_script(self, script, timeout=120):
         self.commands.append(script)
-        return self.handler(script)
+        return source_build_response(script) or self.handler(script)
 
     def find(self, needle):
         return [command for command in self.commands if needle in command]
@@ -174,11 +175,10 @@ class StatusTests(unittest.TestCase):
         return FakeSSH(handler)
 
     def test_update_available(self):
-        """Userspace is listed but status() never offers it as an update.
+        """Source builds make userspace Git releases actionable.
 
-        The daemon reports 0.0.YYYYMMDD, which cannot be compared with the
-        repository's 3.1.YYYYMMDD tags, so no "available" version is fetched
-        and the component is never marked updatable.
+        Legacy daemon versions are informational. The requested release can
+        now be built from its pinned source commit.
         """
         from managers.awg_plugin_updater import _tag_cache
         _tag_cache.clear()
@@ -194,8 +194,8 @@ class StatusTests(unittest.TestCase):
         self.assertTrue(kernel['update_available'])
         self.assertTrue(userspace['applicable'])
         self.assertEqual(userspace['installed'], '0.0.20250522')
-        self.assertIsNone(userspace['available'])
-        self.assertFalse(userspace['update_available'])
+        self.assertEqual(userspace['available'], GO_NEW)
+        self.assertTrue(userspace['update_available'])
 
     def test_up_to_date(self):
         status = AwgPluginUpdater(self._ssh_with_userspace()).status(
@@ -426,12 +426,11 @@ class UserspaceUpdateTests(unittest.TestCase):
         self.assertFalse(ssh.find('docker stop'))
         self.assertFalse(ssh.find('docker rename'))
 
-    def test_registry_older_than_target_stops_before_restart(self):
+    def test_registry_label_does_not_override_source_build(self):
         ssh = FakeSSH(self._handler(version=OLD))
-        with self.assertRaises(PluginUpdateError) as ctx:
-            AwgPluginUpdater(ssh).update(USERSPACE, GO_NEW, allow_interrupt=True)
-        self.assertEqual(ctx.exception.code, 'unsupported')
-        self.assertFalse(ssh.find('docker stop'))
+        result = AwgPluginUpdater(ssh).update(USERSPACE, GO_NEW, allow_interrupt=True)
+        self.assertEqual(result['installed'], GO_NEW)
+        self.assertTrue(ssh.find('https://github.com/amnezia-vpn/amneziawg-go.git#'))
 
     def test_requires_confirmation_without_flag(self):
         ssh = FakeSSH(self._handler())
@@ -447,7 +446,7 @@ class UserspaceUpdateTests(unittest.TestCase):
         order = [
             next(i for i, c in enumerate(ssh.commands) if c.startswith('docker build')),
             next(i for i, c in enumerate(ssh.commands) if c.startswith('docker stop')),
-            next(i for i, c in enumerate(ssh.commands) if c.startswith('docker run')),
+            next(i for i, c in enumerate(ssh.commands) if c.startswith('docker run -d')),
             next(i for i, c in enumerate(ssh.commands) if c.startswith('docker cp /tmp/awg-plugin-backup')),
             next(i for i, c in enumerate(ssh.commands) if c.startswith('docker restart')),
         ]
@@ -548,3 +547,15 @@ class TagSourceTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+_release_commit_patch = None
+
+def setUpModule():
+    global _release_commit_patch
+    from unittest.mock import patch
+    _release_commit_patch = patch('managers.awg_plugin_updater._github_commit', return_value='a' * 40)
+    _release_commit_patch.start()
+
+def tearDownModule():
+    _release_commit_patch.stop()

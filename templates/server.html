@@ -371,12 +371,18 @@
         openModal('awgPluginModal');
         renderAwgPluginModal();
         if (!awgPluginStatus) loadAwgPluginStatus().then(renderAwgPluginModal);
+        Object.keys(awgPluginOps).forEach(component => {
+            const op = awgPluginOps[component];
+            if (!op.timer && !op.polling) {
+                pollAwgPluginUpdate(component);
+            }
+        });
     }
 
     function closeAwgPluginModal() {
         Object.values(awgPluginOps).forEach(op => {
-            if (op.timer) clearTimeout(op.timer);
-            if (op.creep) clearInterval(op.creep);
+            if (op.timer) { clearTimeout(op.timer); op.timer = null; }
+            if (op.creep) { clearInterval(op.creep); op.creep = null; }
         });
         closeModal('awgPluginModal');
     }
@@ -481,6 +487,7 @@
         button.disabled = true;
         try {
             const data = await apiCall('/api/servers/{{ server_id }}/awg-plugin/update', 'POST', {
+                server_uid: {{ server.uid | tojson }},
                 component: component,
                 allow_interrupt: true
             });
@@ -530,6 +537,7 @@
         logBox.appendChild(awgPluginElement('summary', '', labels.log));
         const log = awgPluginElement('div', 'awg-plugin-log');
         log.id = 'awgPluginLog-' + component;
+        log.textContent = (awgPluginOps[component] || {}).logText || '';
         log.setAttribute('aria-live', 'polite');
         logBox.appendChild(log);
         host.appendChild(logBox);
@@ -606,17 +614,22 @@
 
     async function pollAwgPluginUpdate(component) {
         const op = awgPluginOps[component];
-        if (!op) return;
-        const log = document.getElementById('awgPluginLog-' + component);
+        if (!op || op.polling) return;
+        op.timer = null;
+        op.polling = true;
         try {
             const data = await apiCall('/api/servers/{{ server_id }}/awg-plugin/update/' +
                 encodeURIComponent(op.opId) + '?offset=' + op.offset);
+            const log = document.getElementById('awgPluginLog-' + component);
             op.offset = data.next_offset;
             setAwgProgress(component, data.step, data.total, data.percent, data.state === 'running');
             (data.lines || []).forEach(line => {
-                if (log) log.textContent += '[' + line.ts + '] ' + line.stage + ': ' + line.text + '\n';
-                if (log) log.scrollTop = log.scrollHeight;
+                op.logText = (op.logText || '') + '[' + line.ts + '] ' + line.stage + ': ' + line.text + '\n';
             });
+            if (log) {
+                log.textContent = op.logText || '';
+                log.scrollTop = log.scrollHeight;
+            }
             if (data.state === 'running') {
                 op.timer = setTimeout(() => pollAwgPluginUpdate(component), 1000);
                 return;
@@ -664,12 +677,16 @@
                 if (logBox) logBox.open = true;
             }
             if (data.state === 'success' || data.state === 'manual_step_required') {
-                await loadAwgPluginStatus();
+                loadAwgPluginStatus();
             }
             delete awgPluginOps[component];
         } catch (error) {
-            if (log) log.textContent += error.message + '\n';
+            const log = document.getElementById('awgPluginLog-' + component);
+            op.logText = (op.logText || '') + error.message + '\n';
+            if (log) log.textContent = op.logText;
             op.timer = setTimeout(() => pollAwgPluginUpdate(component), 3000);
+        } finally {
+            op.polling = false;
         }
     }
 

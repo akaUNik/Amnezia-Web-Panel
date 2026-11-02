@@ -70,8 +70,9 @@ class AwgPluginApiTests(unittest.TestCase):
                 'users': [], 'user_connections': []}
         Path(panel.DATA_FILE).write_text(json.dumps(seed), encoding='utf-8')
 
+        self.real_updater = panel._awg_plugin_updater
         self.updater = FakeUpdater()
-        patcher = patch.object(panel, '_awg_plugin_updater', lambda server_id: self.updater)
+        patcher = patch.object(panel, '_awg_plugin_updater', lambda server_id, expected_uid=None: self.updater)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -102,22 +103,53 @@ class AwgPluginApiTests(unittest.TestCase):
 
     def test_update_rejects_unknown_component(self):
         response = self.client.post('/api/servers/0/awg-plugin/update',
-                                    json={'component': 'nope'})
+                                    json={'server_uid': 'u0', 'component': 'nope'})
         self.assertEqual(response.status_code, 400)
 
     def test_second_update_is_rejected_while_running(self):
-        panel._awg_plugin_active[(0, 'kernel_module')] = 'other-op'
+        panel._awg_plugin_active['u0'] = 'other-op'
         response = self.client.post('/api/servers/0/awg-plugin/update',
-                                    json={'component': 'kernel_module'})
+                                    json={'server_uid': 'u0', 'component': 'kernel_module'})
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.json()['code'], 'update_in_progress')
 
-    def test_update_creates_operation_and_journal(self):
+    def test_missing_uid_is_rejected(self):
         response = self.client.post('/api/servers/0/awg-plugin/update',
                                     json={'component': 'kernel_module'})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(self.updater.calls, [])
+
+    def test_stale_page_cannot_update_replacement_server(self):
+        response = self.client.post('/api/servers/0/awg-plugin/update',
+                                    json={'server_uid': 'deleted-server', 'component': 'kernel_module'})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()['code'], 'server_identity_changed')
+        self.assertEqual(self.updater.calls, [])
+
+    def test_other_component_is_blocked_even_after_reindexing(self):
+        data = json.loads(Path(panel.DATA_FILE).read_text())
+        data['servers'].insert(0, dict(data['servers'][0], uid='another'))
+        Path(panel.DATA_FILE).write_text(json.dumps(data))
+        panel._awg_plugin_active['u0'] = 'kernel-operation'
+        response = self.client.post('/api/servers/1/awg-plugin/update',
+                                    json={'server_uid': 'u0', 'component': 'userspace'})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()['code'], 'update_in_progress')
+        self.assertEqual(self.updater.calls, [])
+
+    def test_updater_checks_uid_before_obtaining_ssh(self):
+        with patch.object(panel, 'get_ssh') as ssh:
+            with self.assertRaises(panel.PluginUpdateError):
+                self.real_updater(0, 'replaced')
+            ssh.assert_not_called()
+
+    def test_update_creates_operation_and_journal(self):
+        response = self.client.post('/api/servers/0/awg-plugin/update',
+                                    json={'server_uid': 'u0', 'component': 'kernel_module'})
         self.assertEqual(response.status_code, 200, response.text)
         op_id = response.json()['operation_id']
         self.assertIn(op_id, panel._awg_plugin_ops)
+        self.assertEqual(panel._awg_plugin_ops[op_id]['server_uid'], 'u0')
 
         status = self.client.get('/api/servers/0/awg-plugin/update/%s' % op_id)
         self.assertEqual(status.status_code, 200, status.text)

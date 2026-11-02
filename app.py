@@ -5678,16 +5678,24 @@ def _awg_plugin_load():
 
 
 class AwgPluginUpdateRequest(BaseModel):
+    server_uid: str | None = None
     component: str
     target: str | None = None
     allow_interrupt: bool = False
 
 
-def _awg_plugin_updater(server_id):
+def _awg_plugin_server(server_id, expected_uid=None):
     data = load_data()
     if not 0 <= server_id < len(data.get('servers', [])):
         raise PluginUpdateError('server_not_found', 'Server not found')
-    return AwgPluginUpdater(get_ssh(data['servers'][server_id]))
+    server = data['servers'][server_id]
+    if expected_uid is not None and server.get('uid') != expected_uid:
+        raise PluginUpdateError('server_identity_changed', 'Server identity changed; reload the page')
+    return server
+
+
+def _awg_plugin_updater(server_id, expected_uid=None):
+    return AwgPluginUpdater(get_ssh(_awg_plugin_server(server_id, expected_uid)))
 
 
 def _awg_plugin_error(exc, status_code=400):
@@ -5747,10 +5755,16 @@ async def api_awg_plugin_update(request: Request, server_id: int, req: AwgPlugin
         return JSONResponse({'error': 'Unknown component', 'code': 'unsupported'}, status_code=400)
     _awg_plugin_load()
     _awg_plugin_prune()
-    key = (server_id, req.component)
+    if not req.server_uid:
+        return _awg_plugin_error(PluginUpdateError('server_uid_required', 'Server UID is required'), 409)
+    try:
+        _awg_plugin_server(server_id, req.server_uid)
+    except PluginUpdateError as exc:
+        return _awg_plugin_error(exc, 409)
+    key = req.server_uid
     if key in _awg_plugin_active:
         return JSONResponse(
-            {'error': 'An update of this component is already running',
+            {'error': 'An update on this server is already running',
              'code': 'update_in_progress'},
             status_code=409,
         )
@@ -5758,6 +5772,7 @@ async def api_awg_plugin_update(request: Request, server_id: int, req: AwgPlugin
     op_id = uuid.uuid4().hex
     op = {
         'id': op_id,
+        'server_uid': req.server_uid,
         'server_id': server_id,
         'component': req.component,
         'target': req.target,
@@ -5799,7 +5814,7 @@ async def _run_awg_plugin_update(op_id, server_id, component, target, allow_inte
         _awg_plugin_save()
 
     try:
-        updater = await asyncio.to_thread(_awg_plugin_updater, server_id)
+        updater = await asyncio.to_thread(_awg_plugin_updater, server_id, op['server_uid'])
         if not target:
             latest = await asyncio.to_thread(updater.latest_versions)
             target = latest.get(component)
@@ -5827,7 +5842,7 @@ async def _run_awg_plugin_update(op_id, server_id, component, target, allow_inte
     finally:
         op['finished_at'] = datetime.now().isoformat(timespec='seconds')
         op['finished_ts'] = datetime.now().timestamp()
-        _awg_plugin_active.pop((server_id, component), None)
+        _awg_plugin_active.pop(op['server_uid'], None)
         _awg_plugin_save()
 
 
@@ -9081,12 +9096,16 @@ def _probe_blocking_peer(server, conn):
         if len(peers) > 1:
             raise RecoveryError('peer_identity_ambiguous')
         if not peers:
+            verify_awg_peer_absent(ssh, conn['protocol'], conn['client_id'])
             return None, True
         ud = peers[0].get('userData') or {}
         rx, tx = ud.get('dataReceivedBytes'), ud.get('dataSentBytes')
         observed = (rx + tx if type(rx) is int and type(tx) is int
                     and rx >= 0 and tx >= 0 else None)
-        return observed, not bool(ud.get('enabled', True))
+        if ud.get('enabled') is not False:
+            return observed, False
+        verify_awg_peer_absent(ssh, conn['protocol'], conn['client_id'], allow_disabled=True)
+        return observed, True
     finally:
         ssh.disconnect()
 

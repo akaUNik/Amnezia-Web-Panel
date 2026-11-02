@@ -215,7 +215,7 @@ class SecondContainerFailureTests(_UserspaceAdversarialTest):
         ])
         self.assertFalse([
             command for command in ssh.commands
-            if command.startswith('docker rmi ')
+            if command.startswith('docker rmi ') and not command.startswith('docker rmi amnezia-awg-build-')
         ])
 
 
@@ -365,3 +365,15 @@ class PortTests(_UserspaceAdversarialTest):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+_release_commit_patch = None
+
+def setUpModule():
+    global _release_commit_patch
+    from unittest.mock import patch
+    _release_commit_patch = patch('managers.awg_plugin_updater._github_commit', return_value='a' * 40)
+    _release_commit_patch.start()
+
+def tearDownModule():
+    _release_commit_patch.stop()

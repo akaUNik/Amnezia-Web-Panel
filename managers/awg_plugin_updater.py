@@ -34,11 +34,14 @@ import re
 import shlex
 import time
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 
 MODULE_REPO = 'https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git'
 GO_REPO = 'https://github.com/amnezia-vpn/amneziawg-go'
 GO_IMAGE = 'amneziavpn/amneziawg-go'
+SOURCE_LABEL = 'io.amnezia-web-panel.userspace-build'
+HASH_LABEL = 'io.amnezia-web-panel.userspace-sha256'
 
 KERNEL_MODULE = 'kernel_module'
 USERSPACE = 'userspace'
@@ -171,6 +174,30 @@ def _github_compare(repo, base, head):
     return commits
 
 
+def _github_commit(version):
+    """Resolve a release (including an annotated tag) to its full commit."""
+    if parse_tag(version) != version:
+        raise ValueError('invalid release version')
+    request = urllib.request.Request(
+        'https://api.github.com/repos/%s/commits/v%s' % (_repo_slug(GO_REPO), version),
+        headers=_headers(),
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        sha = json.loads(response.read().decode('utf-8')).get('sha', '')
+    if not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{40}', sha):
+        raise ValueError('release has no valid commit')
+    return sha
+
+
+def _release_dockerfile(text, base):
+    """Substitute only the panel's single official FROM, keeping its context."""
+    pattern = (r'(?im)^FROM[ \t]+(?:--platform=[\w/]+[ \t]+)?'
+               r'amneziavpn/amneziawg-go(?::[\w.-]+|@sha256:[0-9a-f]{64})?[ \t]*$')
+    if len(re.findall(r'(?im)^\s*FROM\s', text)) != 1 or len(re.findall(pattern, text)) != 1:
+        raise PluginUpdateError('unsupported', 'userspace Dockerfile must have one official AWG base')
+    return re.sub(pattern, 'FROM ' + base, text, count=1)
+
+
 def _iteration(text):
     # The binary prints "amneziawg-go v3.1.20260828" and `wg --version` prints
     # a whole sentence, so the version must be found anywhere in the line.
@@ -291,7 +318,7 @@ class AwgPluginUpdater:
     def _image_version(self, tag):
         """Version of an image: label first, then the binary inside it."""
         out, _, _ = self._exec(
-            "docker inspect --format '{{index .Config.Labels "
+            "docker image inspect --format '{{index .Config.Labels "
             "\"org.opencontainers.image.version\"}}' %s 2>/dev/null || true" % tag
         )
         found = _VERSION_RE.search(out or '')
@@ -310,6 +337,16 @@ class AwgPluginUpdater:
         containers = containers if containers is not None else self._go_containers()
         versions = set()
         for name, image in containers:
+            labels = self._userspace_labels(name)
+            release = self._verified_userspace_version(name, labels=labels)
+            if release:
+                versions.add(release)
+                continue
+            # A damaged source receipt must not be downgraded to an unverified
+            # OCI label or static daemon version and displayed as up to date.
+            if labels.get(SOURCE_LABEL):
+                return None
+            detected = set()
             # The userspace daemon has its own version line (0.0.YYYYMMDD),
             # unrelated to the git tags of the repository, so the binary is
             # the only honest source.
@@ -320,22 +357,25 @@ class AwgPluginUpdater:
                 timeout=120,
             )
             for found in _iteration(out or ''):
-                versions.add(found)
-            if not versions:
+                detected.add(found)
+            if not detected:
                 out, _, _ = self._exec(
                     "docker inspect --format "
                     "'{{index .Config.Labels \"org.opencontainers.image.version\"}}' "
                     "%s 2>/dev/null || true" % name
                 )
                 for found in _iteration(out or ''):
-                    versions.add(found)
-            if not versions:
+                    detected.add(found)
+            if not detected:
                 tag = image.split(':', 1)[-1]
                 for found in _iteration(tag):
-                    versions.add(found)
+                    detected.add(found)
+            versions.update(detected)
+            if not detected:
+                return None
         if not versions:
             return None
-        return sorted(versions, key=version_tuple)[-1]
+        return min(versions, key=version_tuple)
 
     def status(self, latest=None, installed=None):
         containers = self._go_containers()
@@ -349,13 +389,6 @@ class AwgPluginUpdater:
         if latest is None:
             latest = {}
             for component in COMPONENTS:
-                # The userspace daemon reports 0.0.YYYYMMDD, which cannot be
-                # compared with the repository's 3.1.YYYYMMDD tags. It is shown
-                # for information only and never offered as an update; it is
-                # replaced by rebuilding the protocol image.
-                if component == USERSPACE:
-                    latest[component] = None
-                    continue
                 if applicable[component]:
                     latest.update(self.latest_versions(component))
         components = {}
@@ -461,7 +494,9 @@ class AwgPluginUpdater:
                 'component': component,
                 'kernel': values.get('KVER'),
                 'package_manager': manager,
-                'requires_interruption': refs > 0,
+                # Native AWG links can exist with a zero module refcount.
+                # Their managed containers must still be stopped/restored.
+                'requires_interruption': refs > 0 or bool(self._awg_container_names()),
                 'ready': not blockers,
                 'installable': installable,
                 'blockers': blockers,
@@ -657,12 +692,16 @@ class AwgPluginUpdater:
         # removed by an earlier install) and the DKMS version itself.
         previous = self.installed_versions().get(KERNEL_MODULE)
         backup = self._backup_kernel_module(previous, log)
-        stopped = self._stop_awg_containers(log) if allow_interrupt else []
+        stopped = []
+        install_attempted = False
+        switch_attempted = False
 
         def cancelled():
             return bool(should_cancel and should_cancel())
 
         try:
+            if allow_interrupt:
+                self._stop_awg_containers(log, stopped)
             self._run('rm -rf /tmp/awg-plugin-update', log, 'prepare')
             # A previous attempt may have left this exact version registered.
             # Never remove the version that is currently installed and loaded.
@@ -715,11 +754,11 @@ class AwgPluginUpdater:
                 self._dkms_remove(version, log, 'cleanup')
                 raise PluginUpdateError('cancelled', 'update cancelled; previously installed module kept')
 
+            install_attempted = True
             out, err, code = self._run(
                 'dkms install amneziawg/%s --force' % version, log, 'install', timeout=600,
             )
             if code != 0:
-                self._dkms_remove(version, log, 'cleanup')
                 raise PluginUpdateError(
                     'update_failed',
                     'dkms install failed; previously installed module kept',
@@ -735,7 +774,6 @@ class AwgPluginUpdater:
             )
             vermagic = (out or '').strip()
             if kver and vermagic and not vermagic.startswith(kver):
-                self._dkms_remove(version, log, 'cleanup')
                 raise PluginUpdateError(
                     'update_failed',
                     'the built module targets %s, not the running kernel %s; nothing was switched'
@@ -752,14 +790,12 @@ class AwgPluginUpdater:
 
             out, err, code = self._run('modprobe -n amneziawg', log, 'verify', timeout=120)
             if code != 0:
-                self._dkms_remove(version, log, 'cleanup')
                 raise PluginUpdateError(
                     'update_failed',
                     'the built module cannot be loaded; previously installed module kept',
                 )
 
             if cancelled():
-                self._dkms_remove(version, log, 'cleanup')
                 raise PluginUpdateError('cancelled', 'update cancelled before the module switch')
 
             log('activate', 'unloading the current module')
@@ -768,14 +804,13 @@ class AwgPluginUpdater:
                 # The module was grabbed by a new tunnel between the preflight
                 # and now. dkms install of the new version overwrote its .ko on
                 # disk, so put the saved copy of the old one back.
-                self._restore_kernel_files(version, previous, backup, log)
                 raise PluginUpdateError(
                     'update_failed',
                     'the module is in use by running tunnels; nothing was switched',
                 )
+            switch_attempted = True
             out, err, code = self._run('modprobe amneziawg', log, 'activate', timeout=120, sudo=True)
             if code != 0:
-                self._rollback_kernel(version, previous, backup, log)
                 raise PluginUpdateError('update_failed', 'module built but could not be loaded; rolled back')
 
             # Identity check. Prefer srcversion (a hash of the built code) so a
@@ -794,7 +829,6 @@ class AwgPluginUpdater:
             same_code = bool(new_srcversion) and loaded_srcversion == new_srcversion
             same_version = bool(loaded) and loaded.group(1) == version
             if not (same_code or same_version):
-                self._rollback_kernel(version, previous, backup, log)
                 raise PluginUpdateError(
                     'update_failed',
                     'the loaded module is still the previous build; rolled back',
@@ -803,8 +837,8 @@ class AwgPluginUpdater:
                 log('verify', 'note: the module reports %s but was built from %s'
                     % (loaded.group(1) if loaded else 'unknown', version))
 
-            self._record_applied(version, new_srcversion or loaded_srcversion, log)
             self._start_awg_containers(stopped, log)
+            self._record_applied(version, new_srcversion or loaded_srcversion, log)
             self._cleanup_tmp(log)
             return {
                 'component': KERNEL_MODULE,
@@ -813,15 +847,35 @@ class AwgPluginUpdater:
                 'state': 'updated',
                 'rolled_back': False,
             }
-        except PluginUpdateError as exc:
-            self._start_awg_containers(stopped, log)
-            if exc.code != 'rollback_failed':
-                self._cleanup_tmp(log)
-            raise
         except Exception as exc:
-            self._start_awg_containers(stopped, log)
+            recovery_errors = []
+            try:
+                if install_attempted:
+                    if switch_attempted:
+                        # A partially restored tunnel may hold the new module.
+                        for name in stopped:
+                            try:
+                                _, _, code = self._exec('docker stop %s' % name, timeout=120)
+                                if code:
+                                    log('rollback', 'cannot stop %s; attempting module recovery' % name)
+                            except Exception as stop_error:
+                                log('rollback', 'cannot stop %s: %s' % (name, stop_error))
+                        self._rollback_kernel(version, previous, backup, log)
+                    else:
+                        self._restore_kernel_files(version, previous, backup, log)
+            except Exception as recovery_error:
+                recovery_errors.append(str(recovery_error))
+            try:
+                self._start_awg_containers(stopped, log)
+            except Exception as recovery_error:
+                recovery_errors.append(str(recovery_error))
+            if recovery_errors:
+                raise PluginUpdateError('rollback_failed', '%s; recovery failed: %s' %
+                                        (exc, '; '.join(recovery_errors))) from exc
             self._cleanup_tmp(log)
-            raise PluginUpdateError('update_failed', str(exc))
+            if isinstance(exc, PluginUpdateError):
+                raise
+            raise PluginUpdateError('update_failed', str(exc)) from exc
 
     def _backup_kernel_module(self, previous, log):
         """Copy the loaded .ko before anything can overwrite it.
@@ -836,8 +890,8 @@ class AwgPluginUpdater:
         out, _, _ = self._run(
             'mkdir -p %s; MODPATH=$(modinfo -n amneziawg 2>/dev/null || true); '
             'if [ -n "$MODPATH" ] && [ -f "$MODPATH" ]; then '
-            'cp -a "$MODPATH" %s/amneziawg-%s.ko; '
-            'echo "ORIG=$MODPATH"; echo "BACKUP=%s/amneziawg-%s.ko"; fi'
+            'cp -a "$MODPATH" %s/amneziawg-%s.ko && '
+            'echo "ORIG=$MODPATH" && echo "BACKUP=%s/amneziawg-%s.ko"; fi'
             % (KERNEL_BACKUP_DIR, KERNEL_BACKUP_DIR, previous, KERNEL_BACKUP_DIR, previous),
             log, 'backup',
         )
@@ -848,7 +902,7 @@ class AwgPluginUpdater:
                 original = line.split('=', 1)[1].strip()
             elif line.startswith('BACKUP='):
                 backup = line.split('=', 1)[1].strip()
-        if not backup:
+        if not backup or not original:
             log('backup', 'WARNING: could not copy the current module file')
             return None
         log('backup', 'saved %s -> %s' % (original, backup))
@@ -869,7 +923,9 @@ class AwgPluginUpdater:
                     'cannot put the saved module back at %s; restore it by hand before rebooting'
                     % backup['original'],
                 )
-            self._run('depmod -a', log, 'rollback', timeout=120, sudo=True)
+            _, _, code = self._run('depmod -a', log, 'rollback', timeout=120, sudo=True)
+            if code:
+                raise PluginUpdateError('rollback_failed', 'depmod failed after restoring the module')
             return
         if previous:
             # No file copy (older deployments): rebuild from the DKMS source.
@@ -889,12 +945,17 @@ class AwgPluginUpdater:
                     'rollback_failed',
                     'cannot reinstall module %s; reload the host before relying on AWG' % previous,
                 )
-            self._run('depmod -a', log, 'rollback', timeout=120, sudo=True)
+            _, _, code = self._run('depmod -a', log, 'rollback', timeout=120, sudo=True)
+            if code:
+                raise PluginUpdateError('rollback_failed', 'depmod failed after restoring the module')
 
     def _rollback_kernel(self, version, previous, backup, log):
         """Restore the previously loaded module after a failed activation."""
         log('rollback', 'restoring previous module %s' % (previous or 'unknown'))
+        out, err, code = self._run('modprobe -r amneziawg', log, 'rollback', timeout=120, sudo=True)
         self._restore_kernel_files(version, previous, backup, log)
+        if code != 0:
+            raise PluginUpdateError('rollback_failed', 'cannot unload the replacement module')
         out, err, code = self._run('modprobe amneziawg', log, 'rollback', timeout=120, sudo=True)
         if code != 0:
             raise PluginUpdateError(
@@ -915,21 +976,29 @@ class AwgPluginUpdater:
 
     def _awg_container_names(self):
         out, _, _ = self._exec(
-            "docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^amnezia-awg' || true"
+            "docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^(amnezia-awg|amnezia-exit($|-))' || true"
         )
         return [line.strip() for line in (out or '').splitlines() if line.strip()]
 
-    def _stop_awg_containers(self, log):
+    def _stop_awg_containers(self, log, stopped=None):
         names = self._awg_container_names()
+        stopped = stopped if stopped is not None else []
         for name in names:
             log('stop', 'stopping %s to release the kernel module' % name)
-            self._exec('docker stop %s' % name, timeout=120)
-        return names
+            stopped.append(name)
+            _, _, code = self._exec('docker stop %s' % name, timeout=120)
+            if code:
+                raise PluginUpdateError('update_failed', 'cannot stop %s' % name)
+        return stopped
 
     def _start_awg_containers(self, names, log):
+        failed = []
         for name in names or ():
             log('tunnel', 'starting %s' % name)
-            self._exec('docker start %s' % name, timeout=120)
+            _, _, code = self._exec('docker start %s' % name, timeout=120)
+            if code:
+                failed.append(name)
+                continue
             # The tunnel comes back through start.sh, which needs a few seconds;
             # a single immediate check produces false warnings on slow hosts.
             up = False
@@ -943,9 +1012,134 @@ class AwgPluginUpdater:
                     break
                 time.sleep(2)
             if not up:
-                log('tunnel', 'WARNING: %s started but its tunnel is not up yet' % name)
+                failed.append(name)
+        if failed:
+            raise PluginUpdateError('update_failed', 'cannot restore tunnels: %s' % ', '.join(failed))
 
     # -- userspace ------------------------------------------------------------
+
+    def _userspace_hash(self, reference, *, container=False):
+        command = ('docker exec %s sha256sum /usr/bin/amneziawg-go' if container else
+                   'docker run --rm --network none --entrypoint sha256sum %s /usr/bin/amneziawg-go')
+        out, _, code = self._exec(command % shlex.quote(reference), timeout=120)
+        match = re.fullmatch(r'([0-9a-f]{64})\s+/usr/bin/amneziawg-go\s*', out or '')
+        if code or not match:
+            raise PluginUpdateError('update_failed', 'cannot verify userspace binary hash')
+        return match.group(1)
+
+    def _verify_userspace_binary(self, reference, expected, *, container=False):
+        if self._userspace_hash(reference, container=container) != expected:
+            raise PluginUpdateError('update_failed', 'userspace binary differs from the release build')
+
+    def _userspace_labels(self, name):
+        out, _, code = self._exec(
+            "docker inspect --format '{{json .Config.Labels}}' %s" % shlex.quote(name),
+        )
+        try:
+            labels = json.loads(out or 'null')
+        except ValueError:
+            return {}
+        return labels if not code and isinstance(labels, dict) else {}
+
+    def _verified_userspace_version(self, name, *, labels=None):
+        """Only our source-build receipt plus matching bytes identifies a release."""
+        if labels is None:
+            labels = self._userspace_labels(name)
+        if labels.get(SOURCE_LABEL) != 'source-v1':
+            return None
+        version = labels.get('org.opencontainers.image.version')
+        revision = labels.get('org.opencontainers.image.revision')
+        digest = labels.get(HASH_LABEL)
+        if (not isinstance(version, str) or parse_tag(version) != version or
+                not isinstance(revision, str) or not re.fullmatch(r'[0-9a-f]{40}', revision) or
+                not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest) or
+                labels.get('org.opencontainers.image.source') != GO_REPO):
+            return None
+        try:
+            self._verify_userspace_binary(name, digest, container=True)
+        except PluginUpdateError:
+            return None
+        return version
+
+    def _read_image_id(self, path):
+        out, _, code = self._exec('cat %s' % shlex.quote(path))
+        image_id = (out or '').strip()
+        if code or not re.fullmatch(r'sha256:[0-9a-f]{64}', image_id):
+            raise PluginUpdateError('update_failed', 'build did not produce a valid image ID')
+        return image_id
+
+    def _build_userspace_image(self, item, version, log, should_cancel):
+        """Build the selected commit, then apply the panel's container setup.
+
+        Neither mutable registry tags nor the daemon's static --version string
+        identify a Git release. The full commit pins Docker's source context;
+        the resulting binary hash binds the derived and running containers to it.
+        """
+        def cancelled():
+            if should_cancel and should_cancel():
+                raise PluginUpdateError('cancelled', 'update cancelled before containers were replaced')
+
+        cancelled()
+        out, _, code = self._exec('cat %s/Dockerfile' % shlex.quote(item['dockerfile_dir']))
+        if code:
+            raise PluginUpdateError('unsupported', 'cannot read userspace Dockerfile')
+        # Reject custom/multistage bases before spending time on a source build.
+        _release_dockerfile(out, 'validation-only')
+        original_dockerfile = out
+        if self._userspace_release is None:
+            try:
+                revision = _github_commit(version)
+            except Exception as exc:
+                raise PluginUpdateError('version_check_failed', 'cannot resolve userspace release: %s' % exc)
+            if not re.fullmatch(r'[0-9a-f]{40}', revision):
+                raise PluginUpdateError('version_check_failed', 'invalid userspace release commit')
+            self._userspace_build_tag = 'amnezia-awg-build-' + uuid.uuid4().hex
+            iid = '/tmp/awg-plugin-update/userspace-source.iid'
+            _, _, code = self._run('mkdir -p /tmp/awg-plugin-update', log, 'prepare')
+            if code:
+                raise PluginUpdateError('update_failed', 'cannot prepare source build directory')
+            log('build', 'building userspace %s from commit %s' % (version, revision))
+            _, _, code = self._run(
+                'docker build --pull --no-cache --iidfile %s -t %s %s'
+                % (iid, self._userspace_build_tag, shlex.quote(GO_REPO + '.git#' + revision)),
+                log, 'build', timeout=1800,
+            )
+            if code:
+                raise PluginUpdateError('update_failed', 'userspace source build failed')
+            cancelled()
+            image_id = self._read_image_id(iid)
+            self._userspace_release = {
+                'version': version, 'revision': revision,
+                'binary_sha256': self._userspace_hash(image_id),
+            }
+
+        release = self._userspace_release
+        dockerfile = _release_dockerfile(original_dockerfile, self._userspace_build_tag)
+        labels = {
+            SOURCE_LABEL: 'source-v1', HASH_LABEL: release['binary_sha256'],
+            'org.opencontainers.image.version': version,
+            'org.opencontainers.image.revision': release['revision'],
+            'org.opencontainers.image.source': GO_REPO,
+        }
+        iid = '/tmp/awg-plugin-update/userspace-derived.iid'
+        # Keep the original file unchanged. Do not journal its contents: custom
+        # Dockerfiles can contain credentials. Quote the replacement as data.
+        path = '/tmp/awg-plugin-update/Dockerfile.' + item['name']
+        _, _, code = self._exec("umask 077; printf '%s' " + shlex.quote(dockerfile) +
+                                ' > ' + shlex.quote(path))
+        if code:
+            raise PluginUpdateError('update_failed', 'cannot prepare derived Dockerfile')
+        command = 'docker build --no-cache'
+        command += ' --iidfile %s -t %s' % (iid, shlex.quote(item['name']))
+        command += ''.join(' --label ' + shlex.quote(k + '=' + v) for k, v in labels.items())
+        command += ' -f ' + shlex.quote(path) + ' ' + shlex.quote(item['dockerfile_dir'])
+        _, _, code = self._run(command, log, 'build', timeout=1800)
+        if code:
+            raise PluginUpdateError('update_failed', 'derived userspace image build failed')
+        cancelled()
+        image_id = self._read_image_id(iid)
+        self._verify_userspace_binary(image_id, release['binary_sha256'])
+        return dict(release, image_id=image_id)
 
     def _inspect_container(self, name):
         out, err, code = self._exec('docker inspect %s 2>/dev/null' % name)
@@ -966,14 +1160,18 @@ class AwgPluginUpdater:
         unsupported = []
         if not host.get('Privileged'):
             unsupported.append('privileged')
-        caps = set(host.get('CapAdd') or [])
+        # Docker inspect may use canonical CAP_* names even when docker run
+        # received NET_ADMIN/SYS_MODULE. Keep the same allowlist for both.
+        caps = {cap.removeprefix('CAP_') for cap in (host.get('CapAdd') or [])}
         if not caps or not caps <= {'NET_ADMIN', 'SYS_MODULE'}:
             unsupported.append('capabilities')
         if not any(bind.startswith('/lib/modules:') for bind in (host.get('Binds') or [])):
             unsupported.append('module mount')
-        for key in ('Devices', 'Tmpfs', 'ExtraHosts', 'PidMode', 'IpcMode'):
+        for key in ('Devices', 'Tmpfs', 'ExtraHosts', 'PidMode'):
             if host.get(key):
                 unsupported.append(key)
+        if host.get('IpcMode') not in (None, '', 'private'):
+            unsupported.append('IpcMode')
         network = host.get('NetworkMode') or 'default'
         if network not in ('default', 'bridge'):
             unsupported.append('network mode %s' % network)
@@ -992,6 +1190,8 @@ class AwgPluginUpdater:
             raise PluginUpdateError('not_installed', 'no userspace AWG containers found')
 
         before = self._userspace_version()
+        self._userspace_release = None
+        self._userspace_build_tag = None
         prepared = []
         try:
             for name, _image in containers:
@@ -1036,7 +1236,8 @@ class AwgPluginUpdater:
         return {
             'component': USERSPACE,
             'previous': before,
-            'installed': self._userspace_version(),
+            'installed': version,
+            'source_revision': (self._userspace_release or {}).get('revision'),
             'state': 'updated',
             'rolled_back': False,
         }
@@ -1065,6 +1266,10 @@ class AwgPluginUpdater:
 
     def _cleanup_tmp(self, log):
         """Remove build/backup artefacts; keep them only after a failed rollback."""
+        build_tag = getattr(self, '_userspace_build_tag', None)
+        if build_tag:
+            self._run('docker rmi %s' % build_tag, log, 'cleanup')
+            self._userspace_build_tag = None
         self._run('rm -rf /tmp/awg-plugin-update /tmp/awg-plugin-backup-*', log, 'cleanup')
 
     def _prepare_container_update(self, name, log):
@@ -1119,42 +1324,14 @@ class AwgPluginUpdater:
         item['old_name'] = old_name
         item['switched'] = False
 
-        # Rebuild the panel image from its own Dockerfile, exactly like the
-        # protocol installer does.  A failed build leaves the old tag intact
-        # and the running container untouched.
-        out, err, code = self._run(
-            'docker build --no-cache --pull -t %s %s' % (name, item['dockerfile_dir']),
-            log, 'build', timeout=1800,
-        )
-        if code != 0:
-            raise PluginUpdateError('update_failed', 'image build failed for %s' % name)
-
-        out, _, _ = self._run(
-            "docker inspect --format '{{index .Config.Labels "
-            "\"org.opencontainers.image.version\"}}' %s" % name,
-            log, 'verify',
-        )
-        found = _VERSION_RE.search(out or '')
-        built_version = found.group(1) if found else None
-        if not built_version:
-            # Some upstream images ship without the OCI version label; ask the
-            # binary itself instead of declaring the update impossible.
-            log('verify', 'image has no version label, asking the binary')
-            built_version = self._image_version(name)
-        if built_version != version:
-            raise PluginUpdateError(
-                'unsupported',
-                'the published image does not contain %s yet (found %s); nothing was restarted'
-                % (version, built_version or 'unknown'),
-            )
-
+        built = self._build_userspace_image(item, version, log, should_cancel)
         # The service is still untouched at this point: a late cancellation
         # during a long image build must not restart anything.
         if should_cancel and should_cancel():
             raise PluginUpdateError('cancelled', 'update cancelled before %s was replaced' % name)
 
         host = item['host']
-        run_cmd = self._docker_run_from_inspect(name, host)
+        run_cmd = self._docker_run_from_inspect(name, host, built['image_id'])
         out, err, code = self._run('docker stop %s' % name, log, 'switch')
         if code != 0:
             raise PluginUpdateError('update_failed', 'cannot stop %s' % name)
@@ -1203,6 +1380,7 @@ class AwgPluginUpdater:
                 'update_failed',
                 'peer count dropped from %s to %s; rolling back' % (item['peers'], peers),
             )
+        self._verify_userspace_binary(name, built['binary_sha256'], container=True)
         # A restored config file does not mean the tunnel is up: start.sh runs
         # at container start and can fail. The old container is still around,
         # so failing here still allows a rollback.
@@ -1224,7 +1402,7 @@ class AwgPluginUpdater:
         log('done', '%s is running %s with %s peers' % (name, version, peers))
 
     @staticmethod
-    def _docker_run_from_inspect(name, host):
+    def _docker_run_from_inspect(name, host, image_id=None):
         """Rebuild the panel's ``docker run`` command from container metadata."""
         bindings = host.get('PortBindings') or {}
         ports = []
@@ -1263,7 +1441,7 @@ class AwgPluginUpdater:
             hard = (ulimit or {}).get('Hard')
             if name_ and soft and hard:
                 parts.append('--ulimit %s=%s:%s' % (name_, soft, hard))
-        parts.append(name)
+        parts.append(image_id or name)
         return ' \\\n'.join(parts)
 
     def _rollback_containers(self, prepared, log):

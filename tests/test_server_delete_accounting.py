@@ -181,17 +181,44 @@ class ServerDeleteAccountingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class BlockingPeerProbeTests(unittest.TestCase):
-    def probe(self, clients):
+    def probe(self, clients, read_failure=False, protocol="awg3", native=""):
+        def authoritative(command, **kwargs):
+            if read_failure:
+                return "", "read failed", 1
+            if "clientsTable" in command:
+                return json.dumps(clients), "", 0
+            if "show all peers" in command:
+                return native, "", 0
+            return "[Interface]\n", "", 0
         ssh = Mock()
+        ssh.run_sudo_command.side_effect = authoritative
         manager = Mock()
         with patch.object(panel, 'get_ssh', return_value=ssh), \
              patch.object(panel, 'get_protocol_manager', return_value=manager), \
              patch.object(panel, '_manager_call', return_value=clients):
-            return panel._probe_blocking_peer({'uid': 'node-a'}, {'protocol': 'awg3',
+            return panel._probe_blocking_peer({'uid': 'node-a'}, {'protocol': protocol,
                                                                  'client_id': 'peer'})
 
     def test_absent_peer_is_quiescent(self):
         self.assertEqual(self.probe([]), (None, True))
+
+    def test_empty_clients_does_not_hide_authoritative_read_failure(self):
+        with self.assertRaises(RecoveryError):
+            self.probe([], read_failure=True)
+
+    def test_xray_empty_clients_cannot_authorize_archival(self):
+        with self.assertRaises(RecoveryError):
+            self.probe([], protocol='xray')
+
+    def test_disabled_metadata_cannot_hide_live_peer(self):
+        with self.assertRaises(RecoveryError):
+            self.probe([{'clientId': 'peer', 'userData': {'enabled': False}}],
+                       native='awg0 peer')
+
+    def test_disabled_metadata_cannot_hide_read_failure(self):
+        with self.assertRaises(RecoveryError):
+            self.probe([{'clientId': 'peer', 'userData': {'enabled': False}}],
+                       read_failure=True)
 
     def test_enabled_peer_is_not_quiescent(self):
         clients = [{'clientId': 'peer', 'userData': {'enabled': True,

@@ -64,7 +64,7 @@ def userspace_handler(*, containers=None, inspect_options=None, peers_before='5'
     containers = list(containers or ['amnezia-awg3'])
     inspect_options = inspect_options or {}
     peers_after = peers_before if peers_after is None else peers_after
-    state = {'built': False, 'peer_calls': 0}
+    state = {'built': False, 'recreated': False, 'peer_calls': 0}
 
     def handler(command):
         if command.startswith('docker ps -a'):
@@ -75,7 +75,7 @@ def userspace_handler(*, containers=None, inspect_options=None, peers_before='5'
         if 'Config.Labels' in command:
             for name in containers:
                 if name in command:
-                    return ((post_build_label if state['built'] else OLD), '', 0)
+                    return ((post_build_label if state['built'] and (command.startswith('docker image inspect ') or state['recreated']) else OLD), '', 0)
             return ('', '', 0)
 
         if command.startswith('docker inspect ') and '.old-' in command:
@@ -124,6 +124,7 @@ def userspace_handler(*, containers=None, inspect_options=None, peers_before='5'
         if command.startswith(PROBE_PREFIX):
             return (probe_output or '', '', 0)
         if command.startswith('docker run '):
+            state['recreated'] = True
             return ('container-id', '', 0)
         if command.startswith('docker network connect '):
             return ('', '', 0)
@@ -137,8 +138,17 @@ def userspace_handler(*, containers=None, inspect_options=None, peers_before='5'
 
 
 class VersionSourceTests(unittest.TestCase):
-    def test_version_label_is_preferred_without_a_binary_probe(self):
-        """A trusting label must short-circuit the expensive image probe."""
+    def test_image_version_ignores_same_named_container_label(self):
+        def handler(command):
+            if command.startswith('docker image inspect '):
+                return GO_NEW, '', 0
+            if command.startswith('docker inspect '):
+                return OLD, '', 0
+            raise AssertionError(command)
+        self.assertEqual(AwgPluginUpdater(FakeSSH(handler))._image_version('amnezia-awg3'), GO_NEW)
+
+    def test_source_build_does_not_use_daemon_version_as_release(self):
+        """The daemon version is informational; source and hashes identify the release."""
         ssh = FakeSSH(userspace_handler())
         result = AwgPluginUpdater(ssh).update(USERSPACE, GO_NEW, allow_interrupt=True)
 
@@ -146,11 +156,11 @@ class VersionSourceTests(unittest.TestCase):
         self.assertEqual(result['installed'], GO_NEW)
         self.assertFalse(
             [c for c in ssh.commands if c.startswith(PROBE_PREFIX)],
-            'docker run probe ran even though the OCI version label answered',
+            'daemon version was used to identify a source release',
         )
 
-    def test_binary_probe_verifies_build_when_label_is_missing(self):
-        """No OCI label: the binary inside the freshly built image decides."""
+    def test_unlabelled_registry_image_is_replaced_by_a_verified_source_build(self):
+        """No OCI label is required from the published registry image."""
         ssh = FakeSSH(userspace_handler(
             post_build_label='',
             probe_output='amneziawg-go v3.1.20260828',
@@ -158,9 +168,9 @@ class VersionSourceTests(unittest.TestCase):
         result = AwgPluginUpdater(ssh).update(USERSPACE, GO_NEW, allow_interrupt=True)
 
         self.assertEqual(result['state'], 'updated')
-        probes = [c for c in ssh.commands if c.startswith(PROBE_PREFIX)]
-        self.assertEqual(len(probes), 1)
-        self.assertIn('amneziawg-go --version', probes[0])
+        self.assertTrue(ssh.find('https://github.com/amnezia-vpn/amneziawg-go.git#'))
+        self.assertEqual(len(ssh.find('--entrypoint sha256sum')), 2)
+        self.assertTrue(ssh.find('docker exec amnezia-awg3 sha256sum'))
 
     def test_running_container_binary_is_preferred_then_label_then_tag(self):
         """Binary first, then the OCI label, and the image tag as last resort."""
@@ -186,7 +196,7 @@ class VersionSourceTests(unittest.TestCase):
             )
             self.assertTrue(ssh.find('amneziawg-go --version'))
             self.assertFalse(
-                [c for c in ssh.commands if 'Config.Labels' in c],
+                [c for c in ssh.commands if 'index .Config.Labels' in c],
                 'OCI label was queried even though the running binary answered',
             )
 
@@ -197,7 +207,7 @@ class VersionSourceTests(unittest.TestCase):
             )
             self.assertLess(
                 _index(ssh.commands, 'amneziawg-go --version'),
-                _index(ssh.commands, 'Config.Labels'),
+                _index(ssh.commands, 'index .Config.Labels'),
                 'the label must only be asked after the binary stayed silent',
             )
 
@@ -322,6 +332,28 @@ class CancelTests(unittest.TestCase):
 
 
 class UnsupportedShapeTests(unittest.TestCase):
+    def test_docker_cap_prefix_is_accepted_during_update(self):
+        for caps in (['CAP_NET_ADMIN', 'CAP_SYS_MODULE'], ['NET_ADMIN', 'CAP_SYS_MODULE']):
+            with self.subTest(caps=caps):
+                ssh = FakeSSH(userspace_handler(inspect_options={
+                    'amnezia-awg3': {'cap_add': caps},
+                }))
+                result = AwgPluginUpdater(ssh).update(USERSPACE, GO_NEW, allow_interrupt=True)
+                self.assertEqual(result['state'], 'updated')
+                run = next(c for c in ssh.commands if c.startswith('docker run -d'))
+                for cap in caps:
+                    self.assertIn('--cap-add=' + cap, run)
+
+    def test_unexpected_prefixed_capability_is_still_rejected(self):
+        ssh = FakeSSH(userspace_handler(inspect_options={
+            'amnezia-awg3': {'cap_add': ['CAP_NET_ADMIN', 'CAP_SYS_ADMIN']},
+        }))
+        with self.assertRaises(PluginUpdateError) as caught:
+            AwgPluginUpdater(ssh).update(USERSPACE, GO_NEW, allow_interrupt=True)
+        self.assertEqual(caught.exception.code, 'unsupported')
+        self.assertIn('capabilities', caught.exception.message)
+        self.assertFalse(ssh.find('docker stop'))
+
     def test_host_network_container_fails_closed(self):
         ssh = FakeSSH(userspace_handler(
             inspect_options={'amnezia-awg3': {'shape': 'bad'}},
@@ -337,3 +369,15 @@ class UnsupportedShapeTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+_release_commit_patch = None
+
+def setUpModule():
+    global _release_commit_patch
+    from unittest.mock import patch
+    _release_commit_patch = patch('managers.awg_plugin_updater._github_commit', return_value='a' * 40)
+    _release_commit_patch.start()
+
+def tearDownModule():
+    _release_commit_patch.stop()

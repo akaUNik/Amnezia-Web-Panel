@@ -237,6 +237,78 @@ class KernelCancelTests(unittest.TestCase):
         self.assertFalse(ssh.find('modprobe amneziawg'))
 
 
+class KernelRecoveryRegressionTests(unittest.TestCase):
+    def test_running_tunnel_requires_confirmation_even_with_zero_module_refs(self):
+        base = kernel_handler()
+        def handler(command):
+            if command.startswith('docker ps --format'):
+                return 'amnezia-exit', '', 0
+            return base(command)
+        ssh = FakeSSH(handler)
+        with self.assertRaises(PluginUpdateError) as ctx:
+            AwgPluginUpdater(ssh).update(KERNEL_MODULE, NEW)
+        self.assertEqual(ctx.exception.code, 'requires_confirmation')
+        self.assertFalse(ssh.find('docker stop'))
+        self.assertFalse(ssh.find('dkms install'))
+        self.assertFalse(ssh.find('modprobe -r'))
+
+    def test_every_post_install_abort_restores_disk_before_cleanup(self):
+        for scenario in ('cancel', 'vermagic', 'dry_run', 'install', 'exception'):
+            with self.subTest(scenario=scenario):
+                options = {'vermagic': 'wrong SMP'} if scenario == 'vermagic' else {}
+                if scenario in ('dry_run', 'install'):
+                    options[scenario] = 1
+                base = kernel_handler(**options)
+                def handler(command):
+                    if scenario == 'exception' and 'modinfo -F vermagic' in command:
+                        raise RuntimeError('SSH interrupted')
+                    return base(command)
+                ssh = FakeSSH(handler)
+                cancel = lambda: scenario == 'cancel' and bool(ssh.find('dkms install'))
+                with self.assertRaises(PluginUpdateError):
+                    AwgPluginUpdater(ssh).update(KERNEL_MODULE, NEW, should_cancel=cancel)
+                installed = _index(ssh.commands, 'dkms install')
+                restored = _index(ssh.commands, 'cp -a', installed)
+                depmod = _index(ssh.commands, 'depmod -a', restored)
+                cleanup = _index(ssh.commands, CLEANUP, depmod)
+                self.assertLess(installed, restored)
+                self.assertLess(restored, depmod)
+                self.assertLess(depmod, cleanup)
+                self.assertFalse(ssh.find('modprobe -r'))
+
+    def test_failed_tunnel_activation_rolls_back_and_restores_all_containers(self):
+        from unittest.mock import patch
+        for failure in ('start', 'tunnel'):
+            with self.subTest(failure=failure):
+                base = kernel_handler()
+                state = {'rollback': False}
+                def handler(command):
+                    if command.startswith('docker ps --format'):
+                        # Simulate Docker's name filter rather than ignoring it.
+                        import re
+                        selector = command.split("grep -E '")[1].split("'")[0]
+                        names = ['amnezia-awg3', 'amnezia-exit', 'unrelated']
+                        return '\n'.join(n for n in names if re.search(selector, n)), '', 0
+                    if command.startswith('mkdir -p "$(dirname'):
+                        state['rollback'] = True
+                    if command.startswith('cat /sys/module/amneziawg/version'):
+                        return (OLD if state['rollback'] else NEW), '', 0
+                    if command == 'docker start amnezia-exit' and failure == 'start' and not state['rollback']:
+                        return '', 'start failed', 1
+                    if command.startswith('docker exec amnezia-exit') and failure == 'tunnel' and not state['rollback']:
+                        return '', '', 0
+                    return base(command)
+                ssh = FakeSSH(handler)
+                with patch('managers.awg_plugin_updater.time.sleep'), self.assertRaises(PluginUpdateError) as ctx:
+                    AwgPluginUpdater(ssh).update(KERNEL_MODULE, NEW, allow_interrupt=True)
+                self.assertEqual(ctx.exception.code, 'update_failed')
+                self.assertTrue(state['rollback'])
+                restore = _index(ssh.commands, 'mkdir -p "$(dirname')
+                self.assertGreater(_index(ssh.commands, 'docker start amnezia-exit', restore), restore)
+                self.assertEqual(len(ssh.find('docker stop amnezia-exit')), 2)
+                self.assertFalse(ssh.find('docker stop unrelated'))
+
+
 class KernelHappyPathTests(unittest.TestCase):
     def test_success_verifies_sys_and_keeps_the_old_dkms_version(self):
         ssh = FakeSSH(kernel_handler())
