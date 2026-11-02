@@ -132,6 +132,47 @@ class SourceIdentityTests(unittest.TestCase):
                                                (digest + '  /usr/bin/amneziawg-go\n', '', 0)]
                 self.assertEqual(updater._verified_userspace_version('amnezia-awg3'), expected)
 
+    def test_invalid_receipt_cannot_fall_back_to_version_label(self):
+        ssh = MagicMock()
+        ssh._is_root = True
+        labels = {SOURCE_LABEL: 'source-v1', HASH_LABEL: BINARY_HASH,
+                  'org.opencontainers.image.version': GO_NEW,
+                  'org.opencontainers.image.revision': SOURCE_COMMIT,
+                  'org.opencontainers.image.source': GO_REPO}
+        ssh.run_command.side_effect = [
+            (json.dumps(labels), '', 0),
+            ('d' * 64 + '  /usr/bin/amneziawg-go\n', '', 0),
+        ]
+        updater = AwgPluginUpdater(ssh)
+        self.assertIsNone(updater._userspace_version([('amnezia-awg3', 'image:' + GO_NEW)]))
+        self.assertEqual(ssh.run_command.call_count, 2)
+
+    def test_mixed_containers_report_oldest_and_unknown_is_not_masked(self):
+        updater = AwgPluginUpdater(MagicMock())
+        containers = [('amnezia-awg', 'legacy:latest'), ('amnezia-awg3', 'current:latest')]
+        with patch.object(updater, '_userspace_labels', return_value={}), \
+                patch.object(updater, '_verified_userspace_version', side_effect=['0.0.20250522', GO_NEW]):
+            self.assertEqual(updater._userspace_version(containers), '0.0.20250522')
+        with patch.object(updater, '_userspace_labels', return_value={}), \
+                patch.object(updater, '_verified_userspace_version', side_effect=[GO_NEW, None]), \
+                patch.object(updater, '_exec', return_value=('', '', 1)):
+            self.assertIsNone(updater._userspace_version(containers))
+
+    def test_invalid_image_id_prevents_activation(self):
+        ssh = IdentitySSH()
+        updater = AwgPluginUpdater(ssh)
+        original = ssh.run_command
+
+        def corrupt_id(command, **kwargs):
+            if command.startswith('cat ') and command.endswith('userspace-derived.iid'):
+                return 'mutable:latest', '', 0
+            return original(command, **kwargs)
+
+        ssh.run_command = corrupt_id
+        with self.assertRaises(PluginUpdateError):
+            updater.update(USERSPACE, GO_NEW, allow_interrupt=True)
+        self.assertFalse(any(c.startswith('docker stop') for c in ssh.commands))
+
 
 class ResolveCommitTests(unittest.TestCase):
     def test_resolver_uses_tag_and_validates_full_commit(self):
