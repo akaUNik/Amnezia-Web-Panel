@@ -79,7 +79,7 @@ def main():
     args = parser.parse_args()
     version = read_version(args.source)
     ref = os.environ.get('GITHUB_REF', '')
-    if ref.startswith('refs/tags/'):
+    if os.environ.get('GITHUB_EVENT_NAME') == 'push' and ref.startswith('refs/tags/'):
         validate_tag(version, ref.removeprefix('refs/tags/'))
     print(version)
     if os.environ.get('GITHUB_OUTPUT'):

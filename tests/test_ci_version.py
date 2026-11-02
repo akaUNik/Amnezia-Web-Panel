@@ -1,5 +1,8 @@
 """Version validation must not execute application initialization."""
 from pathlib import Path
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -7,6 +10,24 @@ from scripts.ci.version import parse_version, read_version, validate_tag
 
 
 class ReleaseVersionTests(unittest.TestCase):
+    def test_manual_tag_runs_only_validate_source_version(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source=Path(tmp)/'app.py'
+            source.write_text('CURRENT_VERSION="v1.8.4"\n')
+            for event,ref,success in (
+                ('push','refs/tags/v1.9.0',False),
+                ('push','refs/tags/vnext',False),
+                ('push','refs/heads/main',True),
+                ('workflow_dispatch','refs/tags/v1.9.0',True),
+                ('workflow_dispatch','refs/tags/vnext',True),
+            ):
+                env={**os.environ,'GITHUB_EVENT_NAME':event,'GITHUB_REF':ref}
+                env.pop('GITHUB_OUTPUT',None)
+                result=subprocess.run([sys.executable,'-m','scripts.ci.version','--source',str(source)],
+                                      cwd=Path(__file__).resolve().parents[1],env=env,capture_output=True)
+                with self.subTest(event=event,ref=ref):
+                    self.assertEqual(result.returncode==0,success,result.stderr)
+
     def test_static_read_and_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / 'app.py'

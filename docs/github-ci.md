@@ -9,7 +9,7 @@ The distribution repository is `akaUNik/Amnezia-Web-Panel`.
 | Pull request | `test.yml` | — | — | None |
 | Push to main | Called `test.yml` | Both | Both variants | GHCR |
 | Push of `v*` tag | Called `test.yml`, version identity | Both | Both variants | GHCR and Releases |
-| Manual build, any ref | Called `test.yml`, version identity | Both | Build only | Actions artifacts only |
+| Manual build, any ref | Called `test.yml`, source version | Both | Build only | Actions artifacts only |
 | Manual tests | `test.yml` | — | — | None |
 
 `build.yml` calls the local reusable workflow through `tests`. `version`
