@@ -317,6 +317,24 @@ class TestUserSelfServiceCreation(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('secret host path', text)
         self.assertIn('error', text.lower())
 
+    async def test_creation_transport_errors_have_safe_actionable_messages(self):
+        from managers.ssh_errors import SSHConnectionUnavailable
+        from peer_lifecycle_lock import PeerLifecycleUncertain
+        for error, key in (
+            (SSHConnectionUnavailable, 'self_service_server_unreachable'),
+            (PeerLifecycleUncertain, 'self_service_recovery_required'),
+        ):
+            for lang in ('en', 'ru'):
+                with self.subTest(error=error, lang=lang):
+                    self.mock_service.create_user_connection.side_effect = error('secret host path')
+                    with self.assertLogs(tg_bot.logger):
+                        await tg_bot._user_create_connection(
+                            self.api, 111, self.data['users'][0], 0, 'awg', 'Phone',
+                            self.load_data, MagicMock(), self.mock_service, lang)
+                    text = self.api.send_message.call_args[0][1]
+                    self.assertEqual(text, '❌ ' + tg_bot._tt(lang, key))
+                    self.assertNotIn('secret host path', text)
+
 
 class TestUserAddClientNameInputState(unittest.IsolatedAsyncioTestCase):
     """Test user_add_client_name pending input resolves user fresh."""

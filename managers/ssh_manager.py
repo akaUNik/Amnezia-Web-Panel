@@ -12,6 +12,7 @@ import shlex
 import os
 from contextlib import nullcontext
 from managers import ssh_trust
+from managers.ssh_errors import SSHConnectionUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +112,7 @@ class SSHManager:
                         raise
                 if last_exc is not None:
                     self._record_connect_failure()
-                    raise last_exc
+                    raise SSHConnectionUnavailable('SSH connection could not be established') from last_exc
                 self._reset_connect_failures()
         return True
 
@@ -259,7 +260,7 @@ class SSHManager:
         # Cooldown after a recent failed attempt: fail fast instead of
         # blocking the worker on another 15s connect to a dead server.
         if time.time() - self._last_connect_fail < self._connect_cooldown:
-            raise ConnectionError(
+            raise SSHConnectionUnavailable(
                 f"SSH to {self.host} recently failed, backing off "
                 f"{int(self._connect_cooldown)}s")
         # connect() itself feeds the breaker on failure and resets it on
