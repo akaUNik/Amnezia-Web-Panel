@@ -3282,7 +3282,11 @@ async def server_detail(request: Request, server_id: int):
             save_data(data)
     server = data['servers'][server_id]
     users_list = data.get('users', [])
-    return tpl(request, 'server.html', server=server, server_id=server_id, users=users_list)
+    saved_protocols = [proto for proto, record in server.get('protocols', {}).items()
+                       if record.get('installed') and protocol_base(proto) in
+                       ('awg', 'awg2', 'awg3', 'awg_legacy', 'wireguard', 'xray', 'telemt')]
+    return tpl(request, 'server.html', server=server, server_id=server_id, users=users_list,
+               saved_protocols=saved_protocols)
 
 
 @app.get('/users', response_class=HTMLResponse, tags=["System Templates"])

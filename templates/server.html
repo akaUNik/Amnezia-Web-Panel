@@ -2168,6 +2168,8 @@
     let currentConfigClientId = null;
     let installedProtocols = {};
     let currentProtocolStatus = {};
+    let connGeneration = 0;
+    const SAVED_PROTOCOLS = {{ saved_protocols | default([]) | tojson }};
     let installedAppsLoading = true;
     let currentSocks5Proto = 'socks5';
     let currentAwgProto = 'awg2';
@@ -2656,11 +2658,8 @@
         btn.disabled = true;
         text.textContent = _('server_checking');
         spinner.classList.remove('hidden');
-        // Smart Route is host-level: its status is a separate probe, not part
-        // of the /check payload. Start it in parallel with the check and
-        // settle it before updateStatusCounts() reveals the grid, otherwise
-        // the card pops in one round-trip after every other badge.
-        const smartRouteProbe = loadSmartRouteStatus().catch(() => null);
+        // Host-level status updates its card independently of protocol checks.
+        loadSmartRouteStatus().then(() => applyInstalledAppsVisibility()).catch(() => {});
         try {
             const data = await apiCall(`/api/servers/${SERVER_ID}/check`, 'POST');
             const statusDiv = document.getElementById('serverStatus');
@@ -2706,13 +2705,11 @@
                     } else if (firstVal) {
                         protoSelect.value = firstVal;
                     }
-                    loadConnections();
+                    if (currentVal !== protoSelect.value || window.connRequestedProto !== protoSelect.value) {
+                        loadConnections();
+                    }
                 }
             }
-            // Settle the parallel probe before the grid is revealed, so the
-            // Smart Route card is painted with its final badge together with
-            // the protocol cards instead of appearing later.
-            smartRouteStatus = await smartRouteProbe;
             updateStatusCounts(data.protocols || {});
             showToast(_('server_check_complete'), 'success');
         } catch (err) {
@@ -3533,12 +3530,18 @@
     }
 
     function hideConnectionsSection() {
+        connGeneration++;
+        window.connPending = false;
+        window.connRequestedProto = null;
+        clearTimeout(window.connPollTimer);
+        document.getElementById('connectionsListInner').innerHTML = '';
         const section = document.getElementById('connectionsSection');
         if (section) section.style.display = 'none';
         const select = document.getElementById('connProtoSelect');
         if (select) {
             select.innerHTML = '';
             const opt = document.createElement('option');
+            opt.value = '';
             opt.textContent = _('no_protocols');
             opt.disabled = true;
             select.appendChild(opt);
@@ -4836,6 +4839,8 @@
     }
 
     async function loadConnections(isPoll, force) {
+        if (!isPoll) connGeneration++;
+        const generation = connGeneration;
         const proto = document.getElementById('connProtoSelect').value;
         markActiveProtocolCard();
         const loading = document.getElementById('connectionsLoading');
@@ -4864,17 +4869,18 @@
         // grid already labelled with the newly selected protocol — the
         // "peers of the neighboring instance" race on laggy links.
         if (window.connLoading) {
-            window.connPending = true;
+            if (!isPoll) window.connPending = true;
             return;
         }
         window.connLoading = true;
+        window.connRequestedProto = proto;
         if (!isPoll) loading.style.display = ''; // silent refresh on polls
         emptyEl.classList.add('hidden');
         try {
             const data = await apiCall(`/api/servers/${SERVER_ID}/connections?protocol=${proto}`);
             // Stale response: the user switched protocol while we awaited —
             // drop it, the pending re-run below will fetch the right one.
-            if (proto !== document.getElementById('connProtoSelect').value) return;
+            if (generation !== connGeneration || proto !== document.getElementById('connProtoSelect').value) return;
             // The rename editor may have opened while this poll was in flight —
             // re-rendering now would destroy it mid-typing.
             if (isPoll && !force && listEl.querySelector('.rename-editor')) return;
@@ -4983,6 +4989,8 @@
                 `;
             });
         } catch (err) {
+            if (generation !== connGeneration) return;
+            window.connRequestedProto = null;
             loading.style.display = 'none';
             showToast(_('connections_load_error') + ': ' + err.message, 'error');
         } finally {
@@ -6010,6 +6018,15 @@
 
     // ========== Init ==========
     applyInstalledAppsVisibility();
+    const initialSelect = document.getElementById('connProtoSelect');
+    initialSelect.innerHTML = '';
+    SAVED_PROTOCOLS.forEach(proto => initialSelect.add(new Option(getProtoTitle(proto), proto)));
+    const requestedProto = new URLSearchParams(location.search).get('protocol');
+    if (SAVED_PROTOCOLS.includes(requestedProto)) initialSelect.value = requestedProto;
+    if (initialSelect.value) {
+        showConnectionsSection();
+        loadConnections();
+    }
     checkServer();
     loadServerStats();
 </script>
