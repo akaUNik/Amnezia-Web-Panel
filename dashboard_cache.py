@@ -74,6 +74,7 @@ class DisplayCache:
         self._entries = OrderedDict()
         self._lock = threading.RLock()
         self._tasks = set()
+        self._mutations = {}
 
     def _view(self, kind, entry):
         age = max(0, self.monotonic() - entry.monotonic_at)
@@ -86,8 +87,37 @@ class DisplayCache:
 
     def peek(self, kind, key):
         with self._lock:
+            if self._mutations.get(key[:2]):
+                return None
             entry = self._entries.get((kind, *key))
             return self._view(kind, entry) if entry else None
+
+    def begin_mutation(self, namespace, uid):
+        with self._lock:
+            key = (str(namespace), uid)
+            self._mutations[key] = self._mutations.get(key, 0) + 1
+            self.invalidate(namespace, uid)
+
+    def end_mutation(self, namespace, uid):
+        with self._lock:
+            key = (str(namespace), uid)
+            count = self._mutations.get(key, 0) - 1
+            if count > 0:
+                self._mutations[key] = count
+            else:
+                self._mutations.pop(key, None)
+            self.invalidate(namespace, uid)
+
+    def state_changed(self, namespace, before, after):
+        if before.get(GENERATION) != after.get(GENERATION):
+            self.invalidate(namespace)
+            return
+        old = {s.get('uid'): s for s in before.get('servers', [])}
+        new = {s.get('uid'): s for s in after.get('servers', [])}
+        fields = (*TARGET_FIELDS, 'protocols')
+        for uid in old.keys() | new.keys():
+            if uid not in old or uid not in new or any(old[uid].get(k) != new[uid].get(k) for k in fields):
+                self.invalidate(namespace, uid)
 
     def invalidate(self, namespace=None, uid=None):
         with self._lock:
@@ -98,6 +128,8 @@ class DisplayCache:
     async def observe(self, kind, key, collector, force=False):
         cache_key = (kind, *key)
         with self._lock:
+            if self._mutations.get(key[:2]):
+                raise ObservationInvalidated('Server change in progress')
             # Discard expired idle entries and previous target identities.
             for old_key, old_entry in list(self._entries.items()):
                 if ((old_key[1:3] == cache_key[1:3] and old_key[3] != cache_key[3]) or
@@ -116,6 +148,8 @@ class DisplayCache:
             if view and not view['metadata']['stale'] and not force:
                 return view['data'], view['metadata']
             if entry.future is None:
+                if len(self._tasks) >= self.max_entries:
+                    raise RuntimeError('Dashboard refresh capacity reached')
                 entry.future = Future()
                 task = asyncio.create_task(self._refresh(kind, cache_key, entry, collector))
                 self._tasks.add(task)

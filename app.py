@@ -28,7 +28,7 @@ import zlib
 import ipaddress
 from datetime import datetime, timedelta, timezone
 import io
-from fastapi.responses import (JSONResponse, RedirectResponse, HTMLResponse, StreamingResponse,
+from fastapi.responses import (Response, JSONResponse, RedirectResponse, HTMLResponse, StreamingResponse,
                                FileResponse, PlainTextResponse)
 from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
@@ -45,6 +45,7 @@ try:
 except ImportError:
     CaptchaGenerator = None
 
+from dashboard_cache import display_cache, observation_key, ObservationInvalidated
 from managers.ssh_manager import SSHManager
 from managers import ssh_trust
 from managers.awg_manager import AWGManager, normalize_special_junk
@@ -181,6 +182,25 @@ async def docs_auth_middleware(request, call_next):
             return JSONResponse({'error': 'Forbidden'}, status_code=403)
         return RedirectResponse('/login')
     return await call_next(request)
+
+@app.middleware("http")
+async def dashboard_mutation_middleware(request, call_next):
+    match = re.fullmatch(r'/api/servers/(\d+)/(.*)', request.url.path)
+    mutations = {'install', 'uninstall', 'container/toggle', 'backups/restore',
+                 'awg/settings/save', 'server_config/save', 'nginx/site/save'}
+    if request.method != 'POST' or not match or match[2] not in mutations or not _check_admin(request):
+        return await call_next(request)
+    servers = load_data()['servers']
+    index = int(match[1])
+    if index >= len(servers) or not servers[index].get('uid'):
+        return await call_next(request)
+    uid, namespace = servers[index]['uid'], DATA_FILE
+    display_cache.begin_mutation(namespace, uid)
+    try:
+        return await call_next(request)
+    finally:
+        display_cache.end_mutation(namespace, uid)
+
 
 # Sessions must wrap every other middleware: docs_auth_middleware above
 # reads request.session, so SessionMiddleware has to sit outside it.
@@ -379,17 +399,22 @@ def load_data():
     return data
 
 
-def save_data(data):
+def save_data(data, _dashboard_observation=False):
     # Keep this writer self-contained for isolated handler/AST tests as well.
     from peer_recovery import STATE_FILE_LOCK, GENERATION, RecoveryError, atomic_json
     with STATE_FILE_LOCK:
+        previous = {}
         if os.path.exists(DATA_FILE):
             with open(DATA_FILE, 'r', encoding='utf-8') as source:
-                generation = json.load(source).get(GENERATION)
+                previous = json.load(source)
+                generation = previous.get(GENERATION)
             if generation and data.get(GENERATION) != generation:
                 raise RecoveryError('stale_snapshot_after_recovery')
         os.makedirs(os.path.dirname(DATA_FILE) or '.', exist_ok=True)
         atomic_json(DATA_FILE, data)
+        if not _dashboard_observation:
+            from dashboard_cache import display_cache
+            display_cache.state_changed(DATA_FILE, previous, data)
 
 
 async def save_data_async(data):
@@ -429,6 +454,7 @@ def get_ssh(server):
 
 def drop_ssh(server):
     """Remove a server's pooled connection (on edit/delete) and close it."""
+    display_cache.invalidate(DATA_FILE, server.get('uid'))
     key = (server['host'], int(server.get('ssh_port', 22)), server['username'])
     with _SSH_POOL_LOCK:
         ssh = _SSH_POOL.pop(key, None)
@@ -3287,7 +3313,8 @@ async def server_detail(request: Request, server_id: int):
                        if record.get('installed') and protocol_base(proto) in
                        ('awg', 'awg2', 'awg3', 'awg_legacy', 'wireguard', 'xray', 'telemt')]
     return tpl(request, 'server.html', server=server, server_id=server_id, users=users_list,
-               saved_protocols=saved_protocols)
+               saved_protocols=saved_protocols,
+               dashboard_status=display_cache.peek('status', observation_key(DATA_FILE, data, server)))
 
 
 @app.get('/users', response_class=HTMLResponse, tags=["System Templates"])
@@ -4202,19 +4229,53 @@ rm -rf /opt/amnezia
     return worker.result()
 
 
+def _dashboard_headers(metadata):
+    return {f'X-Dashboard-{key.replace("_", "-")}':
+            str(int(value)) if isinstance(value, bool) else str(value)
+            for key, value in metadata.items()}
+
+
 @app.post('/api/servers/{server_id}/stats', tags=["Servers"])
-def api_server_stats(request: Request, server_id: int):
+async def api_server_stats(request: Request, server_id: int, response: Response = None,
+                           server_uid: Optional[str] = None):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    key = None
     try:
-        data = load_data()
-        if server_id >= len(data['servers']):
-            return JSONResponse({'error': 'Server not found'}, status_code=404)
-        server = data['servers'][server_id]
-        from dashboard_stats import collect_stats
-        return collect_stats(get_ssh(server))
+        async with DATA_LOCK:
+            with STATE_FILE_LOCK:
+                data = load_data()
+                if server_id < 0 or server_id >= len(data['servers']):
+                    return JSONResponse({'error': 'Server not found'}, status_code=404)
+                if backfill_server_uids(data['servers']):
+                    save_data(data)
+                server = copy.deepcopy(data['servers'][server_id])
+                if server_uid is not None and server['uid'] != server_uid:
+                    return JSONResponse({'error': 'Inventory changed; refresh and retry'}, status_code=409)
+                key = observation_key(DATA_FILE, data, server)
+
+        async def collect():
+            from dashboard_stats import collect_stats
+            stats = await asyncio.to_thread(lambda: collect_stats(get_ssh(server)))
+            with STATE_FILE_LOCK:
+                current = load_data()
+                matches = [s for s in current['servers'] if s.get('uid') == server['uid']]
+                if len(matches) != 1 or observation_key(DATA_FILE, current, matches[0]) != key:
+                    raise ObservationInvalidated('Server changed during observation')
+            return stats
+
+        stats, metadata = await display_cache.observe('stats', key, collect)
+        if response is not None:
+            response.headers.update(_dashboard_headers(metadata))
+        return stats
+    except ObservationInvalidated as e:
+        return JSONResponse({'error': str(e)}, status_code=409)
     except Exception as e:
         logger.exception("Error getting server stats")
+        previous = display_cache.peek('stats', key) if key else None
+        if previous:
+            metadata = previous['metadata'] | {'error': True}
+            return JSONResponse(previous['data'], headers=_dashboard_headers(metadata))
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
@@ -4862,8 +4923,30 @@ def _collect_dashboard_status(data, server):
             ssh.disconnect()
 
 
+class _DashboardPartial(RuntimeError):
+    def __init__(self, status):
+        self.status = status
+        super().__init__('Incomplete server observation')
+
+
+async def _refresh_dashboard_status(data, original):
+    status, candidate = await asyncio.to_thread(
+        _collect_dashboard_status, copy.deepcopy(data), copy.deepcopy(original))
+    async with DATA_LOCK:
+        with STATE_FILE_LOCK:
+            current = load_data()
+            from dashboard_observation import reconcile_status
+            if not reconcile_status(current, data, original, candidate, status):
+                raise ObservationInvalidated('Server changed during observation')
+            save_data(current, _dashboard_observation=True)
+    if status.get('observation_conflict') or any(p.get('error') for p in status['protocols'].values()):
+        raise _DashboardPartial(status)
+    return status
+
+
 @app.post('/api/servers/{server_id}/check', tags=["Servers"])
-async def api_check_server(request: Request, server_id: int):
+async def api_check_server(request: Request, server_id: int, response: Response = None,
+                           server_uid: Optional[str] = None):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
@@ -4875,17 +4958,20 @@ async def api_check_server(request: Request, server_id: int):
                 if backfill_server_uids(data['servers']):
                     save_data(data)
                 original = copy.deepcopy(data['servers'][server_id])
-        status, candidate = await asyncio.to_thread(
-            _collect_dashboard_status, copy.deepcopy(data), copy.deepcopy(original))
-        async with DATA_LOCK:
-            with STATE_FILE_LOCK:
-                current = load_data()
-                from dashboard_observation import reconcile_status
-                if not reconcile_status(current, data, original, candidate, status):
-                    return JSONResponse({'error': 'Server changed during observation',
-                                         'connection': 'changed'}, status_code=409)
-                save_data(current)
+                if server_uid is not None and original['uid'] != server_uid:
+                    return JSONResponse({'error': 'Inventory changed; refresh and retry'}, status_code=409)
+                key = observation_key(DATA_FILE, data, original)
+        status, metadata = await display_cache.observe('status', key,
+            lambda: _refresh_dashboard_status(data, original), force=True)
+        if response is not None:
+            response.headers.update(_dashboard_headers(metadata))
         return status
+    except _DashboardPartial as e:
+        if response is not None:
+            response.headers.update(_dashboard_headers({'error': True}))
+        return e.status
+    except ObservationInvalidated as e:
+        return JSONResponse({'error': str(e), 'connection': 'changed'}, status_code=409)
     except Exception as e:
         logger.exception("Error checking server")
         return JSONResponse({'error': str(e), 'connection': 'failed'}, status_code=500)
@@ -5817,6 +5903,7 @@ async def _run_awg_plugin_update(op_id, server_id, component, target, allow_inte
 async def _run_awg_plugin_update_locked(op_id, server_id, component, target, allow_interrupt, started):
     started.set()
     op = _awg_plugin_ops[op_id]
+    display_cache.begin_mutation(DATA_FILE, op['server_uid'])
 
     def log(stage, message):
         op['lines'].append({
@@ -5860,6 +5947,7 @@ async def _run_awg_plugin_update_locked(op_id, server_id, component, target, all
         op['error'] = {'code': 'internal_error', 'message': str(e)}
         log('error', str(e))
     finally:
+        display_cache.end_mutation(DATA_FILE, op['server_uid'])
         op['finished_at'] = datetime.now().isoformat(timespec='seconds')
         op['finished_ts'] = datetime.now().timestamp()
         _awg_plugin_active.pop(op['server_uid'], None)
@@ -9072,6 +9160,7 @@ async def api_backup_restore(request: Request, file: UploadFile = File(...),
                 check_create_journal(DATA_FILE, replacement=backup_data)
                 before = pathlib_read_data_bytes() if os.path.exists(DATA_FILE) else b''
                 result = store.commit(op, actor, 'ordinary_restore', intent, before, backup_data)
+                display_cache.invalidate(DATA_FILE)
         
         # Full disaster recovery is deliberately separate and offline; see
         # scripts/panel_recovery.py. Never use a force flag on this endpoint.

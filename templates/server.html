@@ -709,6 +709,7 @@
         </div>
         <div class="page-header__actions">
             <div class="flex gap-sm items-center" id="serverStats" style="display:none;"></div>
+            <small id="statsFreshness" class="text-muted" aria-live="polite"></small>
             {% if current_user and current_user.role == 'admin' %}
             <button class="btn btn-sm ssh-trust-btn" type="button" id="sshTrustBtn" onclick="openSSHTrustModal()">
                 <span class="ssh-trust-dot" id="sshTrustDot"></span>
@@ -731,6 +732,7 @@
         <div class="divider"></div>
         <div class="server-status-row">
             <div class="flex gap-md" style="flex-wrap:wrap" id="statusBadges"></div>
+            <small id="statusFreshness" class="text-muted" aria-live="polite"></small>
             <div class="server-status-actions">
                 <button class="btn btn-primary btn-sm" onclick="openMarketplaceModal()" id="marketplaceBtn">
                     <span>🛒</span> {{ _('marketplace') }}
@@ -2169,6 +2171,59 @@
     let installedProtocols = {};
     let currentProtocolStatus = {};
     let connGeneration = 0;
+    let checkGeneration = 0;
+    const INITIAL_STATUS = {{ dashboard_status | default(none) | tojson }};
+    const dashboardFreshness = {};
+    const dashboardTimers = {};
+    const dashboardExpiryTimers = {};
+
+    function dashboardURL(kind) {
+        return `/api/servers/${SERVER_ID}/${kind}?server_uid=${encodeURIComponent(document.body.dataset.serverUid || '')}`;
+    }
+
+    function showDashboardFreshness(kind, metadata = {}) {
+        const state = dashboardFreshness[kind] = {...dashboardFreshness[kind], ...metadata};
+        if (metadata.observed_at) {
+            clearTimeout(dashboardExpiryTimers[kind]);
+            dashboardExpiryTimers[kind] = setTimeout(() => {
+                if (kind === 'stats') {
+                    document.getElementById('serverStats').innerHTML = '';
+                    document.getElementById('serverIpv6').style.display = 'none';
+                } else {
+                    currentProtocolStatus = {};
+                    applyInstalledAppsVisibility();
+                }
+                showDashboardFreshness(kind, {observed_at: null, stale: false});
+            }, Math.max(0, 300 - (metadata.age_seconds || 0)) * 1000);
+        }
+        const el = document.getElementById(kind === 'stats' ? 'statsFreshness' : 'statusFreshness');
+        const parts = [];
+        if (state.observed_at) {
+            parts.push(_('dashboard_observed') + ' ' + new Date(state.observed_at * 1000).toLocaleTimeString());
+            if (state.stale || Date.now() / 1000 - state.observed_at >= (state.ttl || 30)) parts.push(_('dashboard_stale'));
+        } else parts.push(_('dashboard_no_snapshot'));
+        if (state.refreshing) parts.push(_('dashboard_refreshing'));
+        if (state.error) parts.push(_('dashboard_refresh_error'));
+        el.textContent = parts.join(' · ');
+        el.dataset.state = state.error ? 'error' : state.refreshing ? 'refreshing' : state.stale ? 'stale' : 'fresh';
+    }
+
+    function receiveDashboardMetadata(kind, response) {
+        const h = response.headers;
+        const metadata = {refreshing: false, error: h.get('X-Dashboard-Error') === '1'};
+        if (h.has('X-Dashboard-Observed-At')) {
+            metadata.observed_at = Number(h.get('X-Dashboard-Observed-At'));
+            metadata.age_seconds = Number(h.get('X-Dashboard-Age-Seconds'));
+            metadata.ttl = Number(h.get('X-Dashboard-Ttl'));
+            metadata.stale = h.get('X-Dashboard-Stale') === '1';
+        }
+        showDashboardFreshness(kind, metadata);
+        clearTimeout(dashboardTimers[kind]);
+        if (metadata.ttl) {
+            const delay = metadata.error ? metadata.ttl : Math.max(1, metadata.ttl - metadata.age_seconds);
+            dashboardTimers[kind] = setTimeout(kind === 'stats' ? loadServerStats : checkServer, delay * 1000);
+        }
+    }
     const SAVED_PROTOCOLS = {{ saved_protocols | default([]) | tojson }};
     let installedAppsLoading = true;
     let currentSocks5Proto = 'socks5';
@@ -2625,8 +2680,10 @@
 
     // ========== Server Stats ==========
     async function loadServerStats() {
+        showDashboardFreshness('stats', {refreshing: true, error: false});
         try {
-            const stats = await apiCall(`/api/servers/${SERVER_ID}/stats`, 'POST');
+            const stats = await apiCall(dashboardURL('stats'), 'POST', null,
+                response => receiveDashboardMetadata('stats', response));
             const el = document.getElementById('serverStats');
             el.style.display = '';
             el.innerHTML = `
@@ -2644,14 +2701,70 @@
                 ipv6El.style.display = 'none';
             }
         } catch (err) {
+            showDashboardFreshness('stats', {refreshing: false, error: true});
             console.warn('Stats load failed:', err);
         }
     }
 
+    function renderDashboardStatus(data) {
+    const statusDiv = document.getElementById('serverStatus');
+    const badges = document.getElementById('statusBadges');
+    statusDiv.classList.remove('hidden');
+    let html = '';
+    if (data.connection === 'ok') {
+        html += `<span class="badge badge-success"><span class="badge-dot"></span> ${_('ssh_ok')}</span>`;
+    }
+    if (data.docker_installed) {
+        html += `<span class="badge badge-success"><span class="badge-dot"></span> ${_('docker_ok')}</span>`;
+    } else {
+        html += `<span class="badge badge-warn"><span class="badge-dot"></span> ${_('docker_not_installed')}</span>`;
+    }
+    badges.innerHTML = html;
+    if (data.protocols) {
+        const protoSelect = document.getElementById('connProtoSelect');
+        const currentVal = protoSelect.value;
+        protoSelect.innerHTML = '';
+        let firstVal = null;
+
+        for (const [proto, info] of orderedProtocolEntries(data.protocols)) {
+            updateProtocolCard(proto, info);
+            const isVPN = ['awg', 'awg2', 'awg3', 'awg_legacy', 'xray', 'telemt', 'wireguard'].includes(protoBase(proto));
+            if (info.container_running && isVPN) {
+                const opt = document.createElement('option');
+                opt.value = proto;
+                opt.textContent = getProtoTitle(proto);
+                protoSelect.appendChild(opt);
+                if (!firstVal) firstVal = proto;
+            }
+        }
+
+        if (protoSelect.innerHTML === '') {
+            const opt = document.createElement('option');
+            opt.textContent = _('no_protocols');
+            opt.disabled = true;
+            protoSelect.appendChild(opt);
+            hideConnectionsSection();
+        } else {
+            if (data.protocols[currentVal] && data.protocols[currentVal].container_running) {
+                protoSelect.value = currentVal;
+            } else if (firstVal) {
+                protoSelect.value = firstVal;
+            }
+            if (currentVal !== protoSelect.value || window.connRequestedProto !== protoSelect.value) {
+                loadConnections();
+            }
+        }
+    }
+    updateStatusCounts(data.protocols || {});
+    }
+
     // ========== Server Check ==========
     async function checkServer() {
+        const generation = ++checkGeneration;
+        clearTimeout(dashboardTimers.status);
+        showDashboardFreshness('status', {refreshing: true, error: false});
         loadRknBlock();
-        setInstalledAppsLoading(true);
+        setInstalledAppsLoading(!Object.keys(currentProtocolStatus).length);
         const btn = document.getElementById('checkBtn');
         const text = document.getElementById('checkBtnText');
         const spinner = document.getElementById('checkSpinner');
@@ -2661,64 +2774,21 @@
         // Host-level status updates its card independently of protocol checks.
         loadSmartRouteStatus().then(() => applyInstalledAppsVisibility()).catch(() => {});
         try {
-            const data = await apiCall(`/api/servers/${SERVER_ID}/check`, 'POST');
-            const statusDiv = document.getElementById('serverStatus');
-            const badges = document.getElementById('statusBadges');
-            statusDiv.classList.remove('hidden');
-            let html = '';
-            if (data.connection === 'ok') {
-                html += `<span class="badge badge-success"><span class="badge-dot"></span> ${_('ssh_ok')}</span>`;
-            }
-            if (data.docker_installed) {
-                html += `<span class="badge badge-success"><span class="badge-dot"></span> ${_('docker_ok')}</span>`;
-            } else {
-                html += `<span class="badge badge-warn"><span class="badge-dot"></span> ${_('docker_not_installed')}</span>`;
-            }
-            badges.innerHTML = html;
-            if (data.protocols) {
-                const protoSelect = document.getElementById('connProtoSelect');
-                const currentVal = protoSelect.value;
-                protoSelect.innerHTML = '';
-                let firstVal = null;
-
-                for (const [proto, info] of orderedProtocolEntries(data.protocols)) {
-                    updateProtocolCard(proto, info);
-                    const isVPN = ['awg', 'awg2', 'awg3', 'awg_legacy', 'xray', 'telemt', 'wireguard'].includes(protoBase(proto));
-                    if (info.container_running && isVPN) {
-                        const opt = document.createElement('option');
-                        opt.value = proto;
-                        opt.textContent = getProtoTitle(proto);
-                        protoSelect.appendChild(opt);
-                        if (!firstVal) firstVal = proto;
-                    }
-                }
-
-                if (protoSelect.innerHTML === '') {
-                    const opt = document.createElement('option');
-                    opt.textContent = _('no_protocols');
-                    opt.disabled = true;
-                    protoSelect.appendChild(opt);
-                    hideConnectionsSection();
-                } else {
-                    if (data.protocols[currentVal] && data.protocols[currentVal].container_running) {
-                        protoSelect.value = currentVal;
-                    } else if (firstVal) {
-                        protoSelect.value = firstVal;
-                    }
-                    if (currentVal !== protoSelect.value || window.connRequestedProto !== protoSelect.value) {
-                        loadConnections();
-                    }
-                }
-            }
-            updateStatusCounts(data.protocols || {});
+            const data = await apiCall(dashboardURL('check'), 'POST', null,
+                response => { if (generation === checkGeneration) receiveDashboardMetadata('status', response); });
+            if (generation !== checkGeneration) return;
+            renderDashboardStatus(data);
             showToast(_('server_check_complete'), 'success');
         } catch (err) {
+            if (generation !== checkGeneration) return;
+            showDashboardFreshness('status', {refreshing: false, error: true});
             showToast(_('error') + ': ' + err.message, 'error');
             const statusDiv = document.getElementById('serverStatus');
             const badges = document.getElementById('statusBadges');
             statusDiv.classList.remove('hidden');
             badges.innerHTML = `<span class="badge badge-danger"><span class="badge-dot"></span> ${_('server_connection_error')}</span>`;
         } finally {
+            if (generation !== checkGeneration) return;
             // Do not await the probe here: on the error path /check may have
             // thrown before the settle above, and a slow probe must not keep
             // the spinner and the retry button blocked.
@@ -3676,7 +3746,9 @@
         while (Date.now() < deadline) {
             await new Promise(r => setTimeout(r, intervalMs));
             try {
-                const data = await apiCall(`/api/servers/${SERVER_ID}/check`, 'POST');
+                const data = await apiCall(dashboardURL('check'), 'POST', null,
+                response => { if (generation === checkGeneration) receiveDashboardMetadata('status', response); });
+            if (generation !== checkGeneration) return;
                 const info = (data.protocols || {})[protocol];
                 if (info && (info.container_exists || info.installed)) return true;
             } catch (_) { /* panel or network not reachable yet — keep polling */ }
@@ -6027,7 +6099,17 @@
         showConnectionsSection();
         loadConnections();
     }
-    checkServer();
+    if (INITIAL_STATUS) {
+        renderDashboardStatus(INITIAL_STATUS.data);
+        showDashboardFreshness('status', INITIAL_STATUS.metadata);
+        setInstalledAppsLoading(false);
+        applyInstalledAppsVisibility();
+        loadRknBlock();
+        loadSmartRouteStatus().then(() => applyInstalledAppsVisibility()).catch(() => {});
+        if (INITIAL_STATUS.metadata.stale) checkServer();
+        else dashboardTimers.status = setTimeout(checkServer,
+            Math.max(1, INITIAL_STATUS.metadata.ttl - INITIAL_STATUS.metadata.age_seconds) * 1000);
+    } else checkServer();
     loadServerStats();
 </script>
 {% endblock %}

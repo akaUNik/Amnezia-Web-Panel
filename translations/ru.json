@@ -1029,5 +1029,10 @@
     "awg_plugin_cancel": "Отмена",
     "awg_plugin_cancelling": "Отмена…",
     "awg_plugin_cancelled": "Обновление отменено; продолжает работать прежняя версия",
-    "awg_plugin_step": "Этап {step} из {total}"
+    "awg_plugin_step": "Этап {step} из {total}",
+    "dashboard_observed": "Получено",
+    "dashboard_stale": "Устарело",
+    "dashboard_refreshing": "Обновление…",
+    "dashboard_refresh_error": "Ошибка обновления",
+    "dashboard_no_snapshot": "Снимка пока нет"
 }
