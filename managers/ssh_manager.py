@@ -326,7 +326,8 @@ class SSHManager:
             # remains safe. After dispatch we never blindly replay a command.
             for attempt in range(1 if _retried else 2):
                 try:
-                    channel = self.client.get_transport().open_session(timeout=remaining())
+                    transport = self.client.get_transport()
+                    channel = transport.open_session(timeout=remaining())
                     break
                 except Exception:
                     if attempt or _retried:
@@ -337,7 +338,14 @@ class SSHManager:
             channel.settimeout(remaining())
             # Paramiko's exec ACK wait ignores settimeout. Closing this exact
             # channel wakes it; no command worker is left behind on timeout.
-            watchdog = threading.Timer(remaining(), channel.close)
+            def expire():
+                # Channel.close itself can wait for rekey/transport output.
+                # Execution is serialized, so retiring this transport safely
+                # unblocks both the ACK wait and channel cleanup at the deadline.
+                transport.close()
+                channel.close()
+
+            watchdog = threading.Timer(remaining(), expire)
             watchdog.name = 'ssh-command-deadline'
             watchdog.daemon = True
             watchdog.start()
@@ -387,12 +395,13 @@ class SSHManager:
             logger.error('SSH command failed: %s', reason)
             return '', f'SSH connection lost while running the command ({reason})', -1
         finally:
-            if watchdog:
-                watchdog.cancel()
-            if channel is not None:
-                channel.close()
-            if watchdog:
-                watchdog.join()
+            try:
+                if channel is not None:
+                    channel.close()
+            finally:
+                if watchdog:
+                    watchdog.cancel()
+                    watchdog.join()
 
     def run_sudo_command(self, command, timeout=60):
         """

@@ -75,3 +75,18 @@ class CommandBudgetTests(unittest.TestCase):
             self.assertEqual(ssh.run_command('remote mutation')[2], -1)
         channel.exec_command.assert_called_once()
         connect.assert_not_called()
+
+    def test_deadline_also_bounds_channel_close_during_rekey(self):
+        channel = Channel()
+        ssh = manager(channel)
+        retired = threading.Event()
+        ssh.client.get_transport.return_value.close.side_effect = retired.set
+        def close():
+            if not retired.wait(.5):
+                raise AssertionError('channel cleanup was not interrupted')
+            channel.closed = True
+        channel.close = close
+        start = time.monotonic()
+        self.assertEqual(ssh.run_command('true', timeout=.05), ('ok', '', 0))
+        self.assertLess(time.monotonic() - start, .5)
+        self.assertTrue(retired.is_set())
