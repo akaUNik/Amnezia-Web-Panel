@@ -3748,8 +3748,7 @@
             await new Promise(r => setTimeout(r, intervalMs));
             try {
                 const data = await apiCall(dashboardURL('check'), 'POST', null,
-                response => { if (generation === checkGeneration) receiveDashboardMetadata('status', response); });
-            if (generation !== checkGeneration) return;
+                    response => receiveDashboardMetadata('status', response));
                 const info = (data.protocols || {})[protocol];
                 if (info && (info.container_exists || info.installed)) return true;
             } catch (_) { /* panel or network not reachable yet — keep polling */ }
@@ -4942,7 +4941,7 @@
         // grid already labelled with the newly selected protocol — the
         // "peers of the neighboring instance" race on laggy links.
         if (window.connLoading) {
-            if (!isPoll) window.connPending = true;
+            if (!isPoll || force) window.connPending = true;
             return;
         }
         window.connLoading = true;
@@ -5069,8 +5068,8 @@
         } finally {
             window.connLoading = false;
             highlightPeerFromQuery();
-            // A switch was requested mid-flight: load the currently selected
-            // protocol now (the stale response above was dropped).
+            // A switch or forced refresh was requested mid-flight: load the
+            // currently selected protocol now, including after a rename save.
             if (window.connPending) {
                 window.connPending = false;
                 loadConnections();
