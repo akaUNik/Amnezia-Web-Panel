@@ -99,6 +99,7 @@ class OnboardingTests(unittest.TestCase):
         for patch in [mock.patch.object(self.app, 'DATA_FILE', str(self.path)),
                       mock.patch.object(self.app, 'DATA_LOCK', asyncio.Lock()),
                       mock.patch.object(self.app, '_check_admin', lambda request: self.user),
+                      mock.patch.object(self.app, 'get_current_user', lambda request: self.user),
                       mock.patch.object(self.app, 'drop_ssh', self.drop),
                       mock.patch.object(ssh_trust, 'system_keys', return_value=paramiko.HostKeys()), self.probe]:
             patch.start()
@@ -182,8 +183,8 @@ class OnboardingTests(unittest.TestCase):
         candidate = self.candidate()
         for user in [None, {'role': 'support'}, {'role': 'user'}]:
             self.user = user
-            self.assertEqual(self.inspect().status_code, 403)
-            self.assertEqual(self.confirm(candidate).status_code, 403)
+            self.assertEqual(self.inspect().status_code, 401 if user is None else 403)
+            self.assertEqual(self.confirm(candidate).status_code, 401 if user is None else 403)
         self.user = {'role': 'admin'}
         for headers in [{'Origin': 'https://evil.example'}, {'Sec-Fetch-Site': 'cross-site'},
                         {'Origin': 'null'}, {'Sec-Fetch-Site': 'same-site'}]:

@@ -56,7 +56,7 @@ class CircuitBreakerTests(unittest.TestCase):
         ssh = make_manager()
         ssh.ensure_connected = lambda: True
         ssh.client = mock.Mock()
-        ssh.client.exec_command.side_effect = EOFError()  # dead transport
+        ssh.client.get_transport.return_value.open_session.side_effect = EOFError()  # before exec
         with mock.patch.object(SSHManager, '_connect_once',
                                side_effect=OSError('still down')):
             out, err, code = ssh._run_command_locked('whoami', 10, False)

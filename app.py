@@ -1,4 +1,5 @@
 import os
+import copy
 import sys
 import json
 import logging
@@ -27,7 +28,7 @@ import zlib
 import ipaddress
 from datetime import datetime, timedelta, timezone
 import io
-from fastapi.responses import (JSONResponse, RedirectResponse, HTMLResponse, StreamingResponse,
+from fastapi.responses import (Response, JSONResponse, RedirectResponse, HTMLResponse, StreamingResponse,
                                FileResponse, PlainTextResponse)
 from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
@@ -44,6 +45,7 @@ try:
 except ImportError:
     CaptchaGenerator = None
 
+from dashboard_cache import display_cache, observation_key, ObservationInvalidated
 from managers.ssh_manager import SSHManager
 from managers import ssh_trust
 from managers.awg_manager import AWGManager, normalize_special_junk
@@ -70,6 +72,7 @@ from mail_service import (
     MailService,
     merge_mail_settings,
 )
+from protocol_names import protocol_display_name, server_protocol_names
 from pwa import build_manifest
 from project_info import UPDATE_SOURCE
 from captcha_challenges import captcha_challenges
@@ -181,7 +184,45 @@ async def docs_auth_middleware(request, call_next):
         return RedirectResponse('/login')
     return await call_next(request)
 
-# Sessions must wrap every other middleware: docs_auth_middleware above
+@app.middleware("http")
+async def dashboard_mutation_middleware(request, call_next):
+    match = re.fullmatch(r'/api/servers/(\d+)/(.*)', request.url.path)
+    mutations = {'install', 'uninstall', 'container/toggle', 'backups/restore',
+                 'awg/settings/save', 'server_config/save', 'nginx/site/save'}
+    if request.method != 'POST' or not match or match[2] not in mutations or not _check_admin(request):
+        return await call_next(request)
+    servers = load_data()['servers']
+    index = int(match[1])
+    if index >= len(servers) or not servers[index].get('uid'):
+        return await call_next(request)
+    uid, namespace = servers[index]['uid'], DATA_FILE
+    display_cache.begin_mutation(namespace, uid)
+    try:
+        return await call_next(request)
+    finally:
+        display_cache.end_mutation(namespace, uid)
+
+
+@app.middleware("http")
+async def api_auth_status_middleware(request, call_next):
+    """Distinguish expired browser sessions from authenticated API denials.
+
+    Public login/share flows and Bearer integrations keep their own status
+    contracts. Only a denied panel API request with no valid browser user is
+    normalized; successful/public responses are never gated here.
+    """
+    response = await call_next(request)
+    path = request.url.path
+    if (response.status_code == 403 and path.startswith('/api/')
+            and not path.startswith(('/api/auth/', '/api/share/'))
+            and not request.headers.get('authorization', '').lower().startswith('bearer ')
+            and get_current_user(request) is None):
+        return JSONResponse({'error': 'Session expired'}, status_code=401,
+                            headers={'Cache-Control': 'no-store'})
+    return response
+
+
+# Sessions must wrap every other middleware: the auth middleware above
 # reads request.session, so SessionMiddleware has to sit outside it.
 app.add_middleware(SessionMiddleware, secret_key=os.environ.get('SECRET_KEY', secrets.token_hex(32)))
 
@@ -217,7 +258,7 @@ DATA_FILE = os.path.abspath(os.path.expanduser(
     os.environ.get('DATA_FILE') or os.path.join(application_path, 'data.json')
 ))
 ssh_trust.configure(DATA_FILE)
-CURRENT_VERSION = "v1.10.1"
+CURRENT_VERSION = "v1.11.0"
 
 # Custom protocol instance names: the rename modal caps input at 64 chars.
 CUSTOM_PROTOCOL_NAME_MAX = 64
@@ -378,17 +419,22 @@ def load_data():
     return data
 
 
-def save_data(data):
+def save_data(data, _dashboard_observation=False):
     # Keep this writer self-contained for isolated handler/AST tests as well.
     from peer_recovery import STATE_FILE_LOCK, GENERATION, RecoveryError, atomic_json
     with STATE_FILE_LOCK:
+        previous = {}
         if os.path.exists(DATA_FILE):
             with open(DATA_FILE, 'r', encoding='utf-8') as source:
-                generation = json.load(source).get(GENERATION)
+                previous = json.load(source)
+                generation = previous.get(GENERATION)
             if generation and data.get(GENERATION) != generation:
                 raise RecoveryError('stale_snapshot_after_recovery')
         os.makedirs(os.path.dirname(DATA_FILE) or '.', exist_ok=True)
         atomic_json(DATA_FILE, data)
+        if not _dashboard_observation:
+            from dashboard_cache import display_cache
+            display_cache.state_changed(DATA_FILE, previous, data)
 
 
 async def save_data_async(data):
@@ -428,6 +474,7 @@ def get_ssh(server):
 
 def drop_ssh(server):
     """Remove a server's pooled connection (on edit/delete) and close it."""
+    display_cache.invalidate(DATA_FILE, server.get('uid'))
     key = (server['host'], int(server.get('ssh_port', 22)), server['username'])
     with _SSH_POOL_LOCK:
         ssh = _SSH_POOL.pop(key, None)
@@ -1155,36 +1202,8 @@ def next_protocol_key(protocols: dict, base: str) -> str:
     return protocol_key(base, idx)
 
 
-# The official Amnezia client has no separate AWG 3 container: it installs
-# AWG 3.x into amnezia-awg2 and only the config (HeaderProtectionKey) differs.
-AWG3_IN_AWG2_NAME = 'AmneziaWG 3 (amnezia-awg2)'
-
-
 def is_awg3_in_awg2(protocol: str, header_protection=False) -> bool:
     return protocol_base(protocol) == 'awg2' and bool(header_protection)
-
-
-def protocol_display_name(protocol: str, header_protection=False) -> str:
-    base = protocol_base(protocol)
-    idx = protocol_instance(protocol)
-    if is_awg3_in_awg2(protocol, header_protection):
-        return AWG3_IN_AWG2_NAME if idx <= 1 else f'{AWG3_IN_AWG2_NAME} #{idx}'
-    names = {
-        'awg': 'AmneziaWG',
-        'awg2': 'AmneziaWG 2.0',
-        'awg3': 'AmneziaWG 3.1',
-        'awg_legacy': 'AmneziaWG Legacy',
-        'xray': 'Xray',
-        'telemt': 'Telemt',
-        'dns': 'AmneziaDNS',
-        'wireguard': 'WireGuard',
-        'socks5': 'SOCKS5',
-        'adguard': 'AdGuard Home',
-        'nginx': 'NGINX',
-        'exit': 'Exit Node',
-    }
-    name = names.get(base, base)
-    return name if idx <= 1 else f'{name} #{idx}'
 
 
 def protocol_container_name(protocol: str) -> Optional[str]:
@@ -1377,11 +1396,13 @@ AWG_CONFIG_KEYS = (
 )
 
 
-def protocol_short_name(protocol: str, header_protection=False) -> str:
+def protocol_short_name(protocol: str, header_protection=False, protocol_version=None) -> str:
     """Short protocol tag for the server name, e.g. `AWG3`."""
     base = protocol_base(protocol)
     idx = protocol_instance(protocol)
-    if is_awg3_in_awg2(protocol, header_protection):
+    if base == 'awg2' and protocol_version == '3.1':
+        return 'AWG3.1' if idx <= 1 else f'AWG3.1#{idx}'
+    if base == 'awg2' and (protocol_version == '3.x' or (protocol_version is None and header_protection)):
         base = 'awg3'
     names = {
         'awg': 'AWG',
@@ -1405,7 +1426,7 @@ def connection_display_name(server=None, protocol=None) -> str:
     """`<node> <container>`, e.g. `nl-01 AWG3` -- the name the client will show."""
     node = str((server or {}).get('name') or (server or {}).get('host') or '').strip()
     record = ((server or {}).get('protocols') or {}).get(protocol) or {} if protocol else {}
-    tag = protocol_short_name(protocol, record.get('header_protection')) if protocol else ''
+    tag = protocol_short_name(protocol, record.get('header_protection'), record.get('protocol_version')) if protocol else ''
     return ' '.join(part for part in (node, tag) if part)
 
 
@@ -2309,6 +2330,11 @@ def tpl(request, template, **kwargs):
         'request': request,
         'static_v': static_version(),
         'current_user': get_current_user(request),
+        'protocol_display_name': protocol_display_name,
+        'server_protocol_names': server_protocol_names,
+        'server_protocol_labels': [server_protocol_names(s) for s in kwargs.get('servers', [])],
+        'default_protocol_labels': {p: protocol_display_name(p) for p in BASE_PROTOCOLS},
+        'protocol_short_name': protocol_short_name,
         'site_settings': data.get('settings', {}).get('appearance', {}),
         'captcha_settings': data.get('settings', {}).get('captcha', {}),
         'telegram_settings': data.get('settings', {}).get('telegram', {}),
@@ -3282,7 +3308,12 @@ async def server_detail(request: Request, server_id: int):
             save_data(data)
     server = data['servers'][server_id]
     users_list = data.get('users', [])
-    return tpl(request, 'server.html', server=server, server_id=server_id, users=users_list)
+    saved_protocols = [proto for proto, record in server.get('protocols', {}).items()
+                       if record.get('installed') and protocol_base(proto) in
+                       ('awg', 'awg2', 'awg3', 'awg_legacy', 'wireguard', 'xray', 'telemt')]
+    return tpl(request, 'server.html', server=server, server_id=server_id, users=users_list,
+               saved_protocols=saved_protocols,
+               dashboard_status=display_cache.peek('status', observation_key(DATA_FILE, data, server)))
 
 
 @app.get('/users', response_class=HTMLResponse, tags=["System Templates"])
@@ -4197,66 +4228,53 @@ rm -rf /opt/amnezia
     return worker.result()
 
 
+def _dashboard_headers(metadata):
+    return {f'X-Dashboard-{key.replace("_", "-")}':
+            str(int(value)) if isinstance(value, bool) else str(value)
+            for key, value in metadata.items()}
+
+
 @app.post('/api/servers/{server_id}/stats', tags=["Servers"])
-def api_server_stats(request: Request, server_id: int):
+async def api_server_stats(request: Request, server_id: int, response: Response = None,
+                           server_uid: Optional[str] = None):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    key = None
     try:
-        data = load_data()
-        if server_id >= len(data['servers']):
-            return JSONResponse({'error': 'Server not found'}, status_code=404)
-        server = data['servers'][server_id]
-        ssh = get_ssh(server)
-        ssh.connect()
-        stats = {}
-        out, _, _ = ssh.run_command(
-            "top -bn1 | grep 'Cpu(s)' | awk '{print $2}' | cut -d'%' -f1 2>/dev/null || "
-            "awk '{u=$2+$4; t=$2+$4+$5; if(NR==1){pu=u;pt=t} else printf \"%.1f\", (u-pu)/(t-pt)*100}' "
-            "<(grep 'cpu ' /proc/stat) <(sleep 0.5 && grep 'cpu ' /proc/stat) 2>/dev/null"
-        )
-        try:
-            stats['cpu'] = round(float(out.strip().split('\n')[0]), 1)
-        except (ValueError, IndexError):
-            stats['cpu'] = 0
-        out, _, _ = ssh.run_command("free -b | awk 'NR==2{printf \"%d %d\", $3, $2}'")
-        try:
-            parts = out.strip().split()
-            used, total = int(parts[0]), int(parts[1])
-            stats.update(ram_used=used, ram_total=total, ram_percent=round(used / total * 100, 1) if total > 0 else 0)
-        except (ValueError, IndexError):
-            stats.update(ram_used=0, ram_total=0, ram_percent=0)
-        out, _, _ = ssh.run_command("df -B1 / | awk 'NR==2{printf \"%d %d\", $3, $2}'")
-        try:
-            parts = out.strip().split()
-            used, total = int(parts[0]), int(parts[1])
-            stats.update(disk_used=used, disk_total=total, disk_percent=round(used / total * 100, 1) if total > 0 else 0)
-        except (ValueError, IndexError):
-            stats.update(disk_used=0, disk_total=0, disk_percent=0)
-        out, _, _ = ssh.run_command(
-            "DEV=$(ip route | awk '/default/ {print $5}' | head -1); "
-            "cat /proc/net/dev | awk -v dev=\"$DEV:\" '$1==dev{printf \"%d %d\", $2, $10}'"
-        )
-        try:
-            parts = out.strip().split()
-            stats['net_rx'], stats['net_tx'] = int(parts[0]), int(parts[1])
-        except (ValueError, IndexError):
-            stats['net_rx'] = stats['net_tx'] = 0
-        out, _, _ = ssh.run_command("uptime -p 2>/dev/null || uptime")
-        stats['uptime'] = out.strip()
-        # Global IPv6 addresses for the page header. Some providers mark ULA
-        # (fd00::/8) addresses as scope global, so filter them out explicitly.
-        # Small point-to-point transit prefixes (/126 etc. between the box and
-        # the provider's router) are infrastructure, not a public address.
-        out, _, _ = ssh.run_command(
-            "ip -6 addr show scope global 2>/dev/null | "
-            "awk '/inet6/ && $2 !~ /^fd[0-9a-fA-F]{2}:/ {"
-            "split($2, a, \"/\"); if (a[2] <= 64) print a[1]}'"
-        )
-        stats['ipv6'] = [a for a in (line.strip() for line in out.splitlines()) if a]
-        ssh.disconnect()
+        async with DATA_LOCK:
+            with STATE_FILE_LOCK:
+                data = load_data()
+                if server_id < 0 or server_id >= len(data['servers']):
+                    return JSONResponse({'error': 'Server not found'}, status_code=404)
+                if backfill_server_uids(data['servers']):
+                    save_data(data)
+                server = copy.deepcopy(data['servers'][server_id])
+                if server_uid is not None and server['uid'] != server_uid:
+                    return JSONResponse({'error': 'Inventory changed; refresh and retry'}, status_code=409)
+                key = observation_key(DATA_FILE, data, server)
+
+        async def collect():
+            from dashboard_stats import collect_stats
+            stats = await asyncio.to_thread(lambda: collect_stats(get_ssh(server)))
+            with STATE_FILE_LOCK:
+                current = load_data()
+                matches = [s for s in current['servers'] if s.get('uid') == server['uid']]
+                if len(matches) != 1 or observation_key(DATA_FILE, current, matches[0]) != key:
+                    raise ObservationInvalidated('Server changed during observation')
+            return stats
+
+        stats, metadata = await display_cache.observe('stats', key, collect)
+        if response is not None:
+            response.headers.update(_dashboard_headers(metadata))
         return stats
+    except ObservationInvalidated as e:
+        return JSONResponse({'error': str(e)}, status_code=409)
     except Exception as e:
         logger.exception("Error getting server stats")
+        previous = display_cache.peek('stats', key) if key else None
+        if previous:
+            metadata = previous['metadata'] | {'error': True}
+            return JSONResponse(previous['data'], headers=_dashboard_headers(metadata))
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
@@ -4355,7 +4373,12 @@ async def _rkn_ssh_run(server, cmd, timeout):
     if _rkn_server_index(load_data(), None, server.get('uid'), server) is None:
         return JSONResponse({'error': 'Server identity changed; refresh the inventory'}, status_code=409)
     if code != 0:
-        return JSONResponse({'error': f'command failed: {(err or out or "").strip()[-500:]}'},
+        detail = (err or out or '').strip()
+        hint = ''
+        if ('dpkg is in an inconsistent state' in detail
+                or 'dpkg returned an error code' in detail):
+            hint = " Run 'sudo dpkg --configure -a' on the server, then retry."
+        return JSONResponse({'error': f'command failed: {detail[-1500:]}{hint}'},
                             status_code=500)
     return None
 
@@ -4732,15 +4755,10 @@ async def api_rkn_scan_flags(request: Request):
     return {str(i): s for i, s in results if s}
 
 
-@app.post('/api/servers/{server_id}/check', tags=["Servers"])
-def api_check_server(request: Request, server_id: int):
-    if not _check_admin(request):
-        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+def _collect_dashboard_status(data, server):
+    """Observe into a private candidate; never persist an SSH-era snapshot."""
+    ssh = None
     try:
-        data = load_data()
-        if server_id >= len(data['servers']):
-            return JSONResponse({'error': 'Server not found'}, status_code=404)
-        server = data['servers'][server_id]
         ssh = get_ssh(server)
         ssh.connect()
         # Just use awg's docker checker since it uses the same command
@@ -4769,9 +4787,14 @@ def api_check_server(request: Request, server_id: int):
                 merged['awg_params'] = db_proto.get('awg_params')
             merged['base_protocol'] = db_proto.get('base_protocol') or protocol_base(proto)
             merged['instance'] = db_proto.get('instance') or protocol_instance(proto)
-            merged['display_name'] = db_proto.get('display_name') or protocol_display_name(proto)
-            if protocol_base(proto) == 'awg2' and 'header_protection' in merged:
-                merged['display_name'] = protocol_display_name(proto, merged['header_protection'])
+            if 'protocol_version' not in merged:
+                # An explicit legacy result clears 3.x; a partial modern
+                # response retains the last detected minor version.
+                merged['protocol_version'] = ('2.0' if merged.get('header_protection') is False
+                                              else db_proto.get('protocol_version'))
+            merged['display_name'] = protocol_display_name(
+                proto, merged.get('header_protection', db_proto.get('header_protection')),
+                merged.get('protocol_version'))
             merged['container_name'] = db_proto.get('container_name') or protocol_container_name(proto)
             if protocol_base(proto) == 'adguard':
                 for key in ('web_port', 'mode', 'internal_ip', 'expose_web'):
@@ -4856,7 +4879,7 @@ def api_check_server(request: Request, server_id: int):
                         'awg_params': result.get('awg_params', {}),
                         'base_protocol': protocol_base(proto),
                         'instance': protocol_instance(proto),
-                        'display_name': protocol_display_name(proto, result.get('header_protection')),
+                        'display_name': protocol_display_name(proto, result.get('header_protection'), result.get('protocol_version')),
                         'container_name': protocol_container_name(proto),
                     }
                     if protocol_base(proto) == 'adguard':
@@ -4882,19 +4905,25 @@ def api_check_server(request: Request, server_id: int):
                 record = server['protocols'][proto]
                 if protocol_base(proto) == 'awg2' and 'header_protection' in result:
                     header_protection = bool(result['header_protection'])
-                    if bool(record.get('header_protection')) != header_protection:
+                    name = protocol_display_name(proto, header_protection, result.get('protocol_version'))
+                    if (bool(record.get('header_protection')) != header_protection
+                            or record.get('display_name') != name
+                            or ('protocol_version' in result and record.get('protocol_version') != result['protocol_version'])):
                         record['header_protection'] = header_protection
-                        record['display_name'] = protocol_display_name(proto, header_protection)
+                        record['display_name'] = name
+                        if 'protocol_version' in result:
+                            record['protocol_version'] = result['protocol_version']
                         changed = True
             else:
                 if proto in server['protocols']:
                     if should_preserve_saved_protocol(proto, result, err):
                         # Keep saved dynamic instances visible as installed but stopped/unchecked.
+                        live_missing = not result.get('container_exists')
                         status['protocols'][proto]['container_exists'] = True
                         status['protocols'][proto].setdefault('container_running', False)
                         status['protocols'][proto]['status_preserved'] = True
                         link = (server['protocols'][proto] or {}).get('exit_link')
-                        if link and not err and not link.get('stale') and result and not result.get('container_exists'):
+                        if link and not err and not link.get('stale') and live_missing:
                             # Container gone but the exit still has our peer
                             link['stale'] = 'entry_container_missing'
                             changed = True
@@ -4902,11 +4931,61 @@ def api_check_server(request: Request, server_id: int):
                         del server['protocols'][proto]
                         changed = True
                 
-        if changed:
-            save_data(data)
-            
-        ssh.disconnect()
+        return status, server['protocols']
+    finally:
+        if ssh is not None:
+            ssh.disconnect()
+
+
+class _DashboardPartial(RuntimeError):
+    def __init__(self, status):
+        self.status = status
+        super().__init__('Incomplete server observation')
+
+
+async def _refresh_dashboard_status(data, original):
+    status, candidate = await asyncio.to_thread(
+        _collect_dashboard_status, copy.deepcopy(data), copy.deepcopy(original))
+    async with DATA_LOCK:
+        with STATE_FILE_LOCK:
+            current = load_data()
+            from dashboard_observation import reconcile_status
+            if not reconcile_status(current, data, original, candidate, status):
+                raise ObservationInvalidated('Server changed during observation')
+            save_data(current, _dashboard_observation=True)
+    if status.get('observation_conflict') or any(p.get('error') for p in status['protocols'].values()):
+        raise _DashboardPartial(status)
+    return status
+
+
+@app.post('/api/servers/{server_id}/check', tags=["Servers"])
+async def api_check_server(request: Request, server_id: int, response: Response = None,
+                           server_uid: Optional[str] = None):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        async with DATA_LOCK:
+            with STATE_FILE_LOCK:
+                data = load_data()
+                if server_id < 0 or server_id >= len(data['servers']):
+                    return JSONResponse({'error': 'Server not found'}, status_code=404)
+                if backfill_server_uids(data['servers']):
+                    save_data(data)
+                original = copy.deepcopy(data['servers'][server_id])
+                if server_uid is not None and original['uid'] != server_uid:
+                    return JSONResponse({'error': 'Inventory changed; refresh and retry'}, status_code=409)
+                key = observation_key(DATA_FILE, data, original)
+        status, metadata = await display_cache.observe('status', key,
+            lambda: _refresh_dashboard_status(data, original), force=True)
+        if response is not None:
+            response.headers.update(_dashboard_headers(metadata))
         return status
+    except _DashboardPartial as e:
+        if response is not None:
+            response.headers.update(_dashboard_headers({'error': True}))
+        return e.status
+    except ObservationInvalidated as e:
+        return JSONResponse({'error': str(e), 'connection': 'changed'}, status_code=409)
     except Exception as e:
         logger.exception("Error checking server")
         return JSONResponse({'error': str(e), 'connection': 'failed'}, status_code=500)
@@ -5838,6 +5917,7 @@ async def _run_awg_plugin_update(op_id, server_id, component, target, allow_inte
 async def _run_awg_plugin_update_locked(op_id, server_id, component, target, allow_interrupt, started):
     started.set()
     op = _awg_plugin_ops[op_id]
+    display_cache.begin_mutation(DATA_FILE, op['server_uid'])
 
     def log(stage, message):
         op['lines'].append({
@@ -5881,6 +5961,7 @@ async def _run_awg_plugin_update_locked(op_id, server_id, component, target, all
         op['error'] = {'code': 'internal_error', 'message': str(e)}
         log('error', str(e))
     finally:
+        display_cache.end_mutation(DATA_FILE, op['server_uid'])
         op['finished_at'] = datetime.now().isoformat(timespec='seconds')
         op['finished_ts'] = datetime.now().timestamp()
         _awg_plugin_active.pop(op['server_uid'], None)
@@ -6952,7 +7033,9 @@ def api_wgeasy_import(request: Request, server_id: int, req: WgEasyImportRequest
             'awg_params': {},
             'base_protocol': protocol_base(target),
             'instance': protocol_instance(target),
-            'display_name': protocol_display_name(target),
+            # wg-easy imports only AWG 2.0 parameters, not 3.x config keys.
+            'protocol_version': '2.0' if protocol_base(target) == 'awg2' else None,
+            'display_name': protocol_display_name(target, protocol_version='2.0'),
             'container_name': protocol_container_name(target),
         }
         save_data(data)
@@ -8133,6 +8216,7 @@ def api_get_user_connections(request: Request, user_id: str):
         sid = c.get('server_id', 0)
         if sid < len(data['servers']):
             c['server_name'] = data['servers'][sid].get('name', '')
+            c['protocol_name'] = server_protocol_names(data['servers'][sid]).get(c.get('protocol', 'awg'), '')
 
     # Enrich with live peer data (IP, enabled, handshake, transfer, speed
     # limit) from each server the user has connections on. One SSH session
@@ -8191,9 +8275,13 @@ def api_my_connections(request: Request):
         sid = c.get('server_id', 0)
         if sid < len(data['servers']):
             c['server_name'] = data['servers'][sid].get('name', '')
+            c['protocol_name'] = server_protocol_names(data['servers'][sid]).get(c.get('protocol', 'awg'), '')
         else:
             c['server_name'] = 'Unknown'
-        c['protocol_name'] = protocol_display_name(c.get('protocol', ''))
+        record = {}
+        if 0 <= sid < len(data['servers']):
+            record = (data['servers'][sid].get('protocols') or {}).get(c.get('protocol')) or {}
+        c['protocol_name'] = protocol_display_name(c.get('protocol', ''), record.get('header_protection'), record.get('protocol_version'))
     return {'connections': conns}
 
 
@@ -9093,6 +9181,7 @@ async def api_backup_restore(request: Request, file: UploadFile = File(...),
                 check_create_journal(DATA_FILE, replacement=backup_data)
                 before = pathlib_read_data_bytes() if os.path.exists(DATA_FILE) else b''
                 result = store.commit(op, actor, 'ordinary_restore', intent, before, backup_data)
+                display_cache.invalidate(DATA_FILE)
         
         # Full disaster recovery is deliberately separate and offline; see
         # scripts/panel_recovery.py. Never use a force flag on this endpoint.

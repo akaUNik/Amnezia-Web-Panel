@@ -8,7 +8,6 @@ of the command. The password now travels through the channel's stdin only.
 """
 
 import logging
-import io
 import threading
 import unittest
 from unittest import mock
@@ -18,38 +17,10 @@ from managers.ssh_manager import SSHManager
 PASSWORD = "S3cr3t Pa'ss w0rd"
 
 
-class FakeChannel:
-    def __init__(self):
-        self.write_closed = False
-
-    def settimeout(self, timeout):
-        pass
-
-    def recv_exit_status(self):
-        return 0
-
-    def shutdown_write(self):
-        self.write_closed = True
-
-
-class FakeStream:
-    def __init__(self, channel=None):
-        self.channel = channel or FakeChannel()
-
-    def read(self):
-        return b''
-
-
-class FakeStdin(FakeStream):
-    def __init__(self):
-        super().__init__()
-        self.written = []
-
-    def write(self, data):
-        self.written.append(data)
-
-    def flush(self):
-        pass
+try:
+    from .ssh_channel_fixture import Channel
+except ImportError:
+    from ssh_channel_fixture import Channel
 
 
 def make_ssh():
@@ -66,15 +37,18 @@ def make_ssh():
 class SudoPasswordLeakTests(unittest.TestCase):
     def run_and_capture(self, fn):
         ssh = make_ssh()
-        stdin = FakeStdin()
-        channel = FakeChannel()
-        def execute(command, **kwargs):
-            stdout = (io.BytesIO(b'/tmp/amnezia-private.ABC123def0\n')
-                      if command.startswith('mktemp -d ') else FakeStream(channel))
-            if isinstance(stdout, io.BytesIO):
-                stdout.channel = channel
-            return stdin, stdout, FakeStream(channel)
-        ssh.client.exec_command.side_effect = execute
+        channels = []
+        def open_session(**kwargs):
+            channel = Channel(output=b'')
+            def execute(command):
+                channel.commands.append(command)
+                channel.expect_stdin = command.startswith('sudo ')
+                if command.startswith('mktemp -d '):
+                    channel.output.extend(b'/tmp/amnezia-private.ABC123def0\n')
+            channel.exec_command = execute
+            channels.append(channel)
+            return channel
+        ssh.client.get_transport.return_value.open_session.side_effect = open_session
 
         records = []
 
@@ -89,43 +63,36 @@ class SudoPasswordLeakTests(unittest.TestCase):
             fn(ssh)
         finally:
             logger.removeHandler(handler)
-        return ssh, stdin, records
+        return ssh, channels, records
 
-    def assert_password_hidden(self, ssh, stdin, records):
-        for call in ssh.client.exec_command.call_args_list:
-            self.assertNotIn(PASSWORD, call[0][0])
-        self.assertTrue(all(PASSWORD not in r for r in records))
-        self.assertEqual(stdin.written, [PASSWORD + '\n'])
-        self.assertTrue(stdin.channel.write_closed)
+    def assert_password_hidden(self, channels, records):
+        commands = [command for channel in channels for command in channel.commands]
+        self.assertTrue(all(PASSWORD not in command for command in commands))
+        self.assertTrue(all(PASSWORD not in record for record in records))
+        self.assertEqual([bytes(channel.input) for channel in channels if channel.input],
+                         [(PASSWORD + '\n').encode()])
+        self.assertTrue(all(channel.input_closed for channel in channels if channel.input))
 
     def test_sudo_command(self):
-        ssh, stdin, records = self.run_and_capture(
-            lambda s: s.run_sudo_command('docker ps'))
-        self.assert_password_hidden(ssh, stdin, records)
-        command = ssh.client.exec_command.call_args[0][0]
-        self.assertEqual(command, "sudo -S -p '' docker ps")
+        ssh, channels, records = self.run_and_capture(lambda s: s.run_sudo_command('docker ps'))
+        self.assert_password_hidden(channels, records)
+        self.assertEqual(channels[0].commands, ["sudo -S -p '' docker ps"])
 
     def test_sudo_script(self):
-        ssh, stdin, records = self.run_and_capture(
-            lambda s: s.run_sudo_script('echo hi'))
-        self.assert_password_hidden(ssh, stdin, records)
-        command = ssh.client.exec_command.call_args[0][0]
-        commands = [call[0][0] for call in ssh.client.exec_command.call_args_list]
+        ssh, channels, records = self.run_and_capture(lambda s: s.run_sudo_script('echo hi'))
+        self.assert_password_hidden(channels, records)
+        commands = [command for channel in channels for command in channel.commands]
         self.assertTrue(any(cmd.startswith("sudo -S -p '' bash /tmp/") for cmd in commands))
-        self.assertTrue(command.startswith('rm -rf -- /tmp/amnezia-private.'))
+        self.assertTrue(commands[-1].startswith('rm -rf -- /tmp/amnezia-private.'))
 
     def test_root_login_needs_no_stdin(self):
         ssh = make_ssh()
         ssh._is_root = True
-        stdin = FakeStdin()
-        channel = FakeChannel()
-        ssh.client = mock.Mock()
-        ssh.client.exec_command.return_value = (
-            stdin, FakeStream(channel), FakeStream(channel))
-        ssh.run_sudo_command('docker ps')
-        command = ssh.client.exec_command.call_args[0][0]
-        self.assertEqual(command, 'docker ps')
-        self.assertEqual(stdin.written, [])
+        channel = Channel()
+        ssh.client.get_transport.return_value.open_session.return_value = channel
+        self.assertEqual(ssh.run_sudo_command('docker ps'), ('ok', '', 0))
+        self.assertEqual(channel.commands, ['docker ps'])
+        self.assertEqual(channel.input, b'')
 
 
 if __name__ == '__main__':

@@ -824,11 +824,12 @@ class AWGManager:
 
     def check_docker_installed(self):
         """Check if Docker is installed and running."""
-        out, err, code = self.ssh.run_command("docker --version 2>/dev/null")
-        if code != 0:
-            return False
-        out2, _, code2 = self.ssh.run_command("systemctl is-active docker 2>/dev/null || service docker status 2>/dev/null")
-        return 'active' in out2 or 'running' in out2.lower()
+        _, _, code = self.ssh.run_command(
+            "export LC_ALL=C; docker --version >/dev/null 2>&1 && "
+            "if command -v systemctl >/dev/null 2>&1; then "
+            "systemctl is-active --quiet docker; "
+            "else service docker status >/dev/null 2>&1; fi", timeout=30)
+        return code == 0
 
     def install_docker(self):
         """Install Docker on the server (mirrors install_docker.sh)."""
@@ -1053,13 +1054,21 @@ fi
         v = self.AWG_MODULE_VERSION
         script = f"""
 CUR=$(modinfo amneziawg 2>/dev/null | awk '/^version:/{{print $2; exit}}')
-if [ -n "$CUR" ] && [ "$CUR" = "{v}" ]; then
-    echo "KERNEL_MODULE: ok: already present ($CUR)"
-    exit 0
+if [ -n "$CUR" ]; then
+    # Never downgrade: a newer (or equal) module is left untouched.
+    NEWEST=$(printf '%s\\n%s\\n' "$CUR" "{v}" | sort -V | tail -1)
+    if [ "$NEWEST" = "$CUR" ]; then
+        echo "KERNEL_MODULE: ok: already present ($CUR)"
+        exit 0
+    fi
 fi
 if [ -n "$CUR" ]; then
-    # An older/newer module is present: upgrade. The module can only be
+    # An older module is present: upgrade. The module can only be
     # unloaded when no tunnel uses it; otherwise defer the upgrade.
+    if docker ps --format '{{{{.Names}}}}' 2>/dev/null | grep -q '^amnezia-awg'; then
+        echo "KERNEL_MODULE: skipped: $CUR installed, {v} wanted; stop the AWG containers to upgrade"
+        exit 0
+    fi
     if ! modprobe -r amneziawg 2>/dev/null; then
         echo "KERNEL_MODULE: skipped: version $CUR present but in use by running tunnels; stop all AWG containers and reinstall to upgrade to {v}"
         exit 0
@@ -1089,6 +1098,10 @@ if ! git clone --depth 1 --branch v{v} {self.AWG_MODULE_REPO} /tmp/awg-module >>
 fi
 cd /tmp/awg-module/src
 sed -i 's/^PACKAGE_VERSION=.*/PACKAGE_VERSION="{v}"/' dkms.conf
+if dkms status -m amneziawg -v "{v}" 2>/dev/null | grep -q .; then
+    # A stale DKMS tree entry for the target version breaks `dkms add`.
+    dkms remove "amneziawg/{v}" --all >/dev/null 2>&1 || true
+fi
 if ! dkms add . >>/tmp/awg-kmod.log 2>&1; then
     echo "KERNEL_MODULE: failed: dkms add failed: $(tail -3 /tmp/awg-kmod.log | tr '\\n' ' ' | cut -c1-300)"
     exit 1
@@ -2885,7 +2898,7 @@ done < "$BW"
         # to a one-off live count so the UI is not empty for the first minute.
         try:
             conn_counts = self._load_conn_counts(protocol_type)
-            if not conn_counts:
+            if conn_counts is None:
                 conn_counts = self._count_connections_by_ip(protocol_type)
             conn_warnings = self._load_conn_warnings(protocol_type)
             for client in clients_table:
@@ -3019,18 +3032,23 @@ done < "$BW"
         return '/opt/amnezia/awg/conn_counts.json'
 
     def _load_conn_counts(self, protocol_type):
-        """Load latest {ip: count} snapshot written by the collector."""
+        """Return a valid snapshot (including {}), or None for unreadable data."""
         container_name = self._container_name(protocol_type)
         out, err, code = self.ssh.run_sudo_command(
             f"docker exec -i {container_name} cat {self._conn_counts_path()} 2>/dev/null"
         )
         if code != 0 or not out.strip():
-            return {}
+            return None
         try:
             data = json.loads(out)
-            return {k: int(v) for k, v in data.items()} if isinstance(data, dict) else {}
+            if not isinstance(data, dict) or any(
+                not isinstance(k, str) or type(v) is not int or v < 0
+                for k, v in data.items()
+            ):
+                return None
+            return data
         except (json.JSONDecodeError, ValueError, TypeError):
-            return {}
+            return None
 
     def _save_conn_counts(self, protocol_type, counts):
         """Persist the {ip: count} snapshot into the container."""
@@ -4040,6 +4058,17 @@ PersistentKeepalive = 25
                     # The official Amnezia client installs AWG 3.x into the
                     # amnezia-awg2 container, so only the config tells 2.0 and 3.x apart.
                     info['header_protection'] = bool(info['awg_params'].get('header_protection_key'))
+                    # HeaderProtectionKey alone only proves 3.x. RandomTrailers
+                    # and DisableCookies were added in 3.1; explicit "off" also
+                    # identifies that config format. Do not use the container
+                    # name or the tools/daemon build number as a protocol version.
+                    if any(str(info['awg_params'].get(key, '')).strip()
+                           for key in ('random_trailers', 'disable_cookies')):
+                        info['protocol_version'] = '3.1'
+                    elif info['header_protection']:
+                        info['protocol_version'] = '3.x'
+                    elif self._base_protocol(protocol_type) == self.AWG2:
+                        info['protocol_version'] = '2.0'
                     # Count ALL peers, not only clientsTable rows: peers that
                     # exist in awg0.conf but not in the table (shown as
                     # 'External' in the list) are still real connections.
