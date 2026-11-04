@@ -1,4 +1,5 @@
 import os
+import copy
 import sys
 import json
 import logging
@@ -4689,15 +4690,10 @@ async def api_rkn_scan_flags(request: Request):
     return {str(i): s for i, s in results if s}
 
 
-@app.post('/api/servers/{server_id}/check', tags=["Servers"])
-def api_check_server(request: Request, server_id: int):
-    if not _check_admin(request):
-        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+def _collect_dashboard_status(data, server):
+    """Observe into a private candidate; never persist an SSH-era snapshot."""
+    ssh = None
     try:
-        data = load_data()
-        if server_id >= len(data['servers']):
-            return JSONResponse({'error': 'Server not found'}, status_code=404)
-        server = data['servers'][server_id]
         ssh = get_ssh(server)
         ssh.connect()
         # Just use awg's docker checker since it uses the same command
@@ -4847,11 +4843,12 @@ def api_check_server(request: Request, server_id: int):
                 if proto in server['protocols']:
                     if should_preserve_saved_protocol(proto, result, err):
                         # Keep saved dynamic instances visible as installed but stopped/unchecked.
+                        live_missing = not result.get('container_exists')
                         status['protocols'][proto]['container_exists'] = True
                         status['protocols'][proto].setdefault('container_running', False)
                         status['protocols'][proto]['status_preserved'] = True
                         link = (server['protocols'][proto] or {}).get('exit_link')
-                        if link and not err and not link.get('stale') and result and not result.get('container_exists'):
+                        if link and not err and not link.get('stale') and live_missing:
                             # Container gone but the exit still has our peer
                             link['stale'] = 'entry_container_missing'
                             changed = True
@@ -4859,10 +4856,35 @@ def api_check_server(request: Request, server_id: int):
                         del server['protocols'][proto]
                         changed = True
                 
-        if changed:
-            save_data(data)
-            
-        ssh.disconnect()
+        return status, server['protocols']
+    finally:
+        if ssh is not None:
+            ssh.disconnect()
+
+
+@app.post('/api/servers/{server_id}/check', tags=["Servers"])
+async def api_check_server(request: Request, server_id: int):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        async with DATA_LOCK:
+            with STATE_FILE_LOCK:
+                data = load_data()
+                if server_id < 0 or server_id >= len(data['servers']):
+                    return JSONResponse({'error': 'Server not found'}, status_code=404)
+                if backfill_server_uids(data['servers']):
+                    save_data(data)
+                original = copy.deepcopy(data['servers'][server_id])
+        status, candidate = await asyncio.to_thread(
+            _collect_dashboard_status, copy.deepcopy(data), copy.deepcopy(original))
+        async with DATA_LOCK:
+            with STATE_FILE_LOCK:
+                current = load_data()
+                from dashboard_observation import reconcile_status
+                if not reconcile_status(current, data, original, candidate, status):
+                    return JSONResponse({'error': 'Server changed during observation',
+                                         'connection': 'changed'}, status_code=409)
+                save_data(current)
         return status
     except Exception as e:
         logger.exception("Error checking server")
