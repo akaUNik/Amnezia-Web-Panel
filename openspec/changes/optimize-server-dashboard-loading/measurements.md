@@ -53,3 +53,5 @@ Summary command count: 6 → 1 cold, 6 → 0 warm. First row: 490 → 115 ms col
 - Targeted backend and real-browser regressions pass, including stalled SSH ACK/status/stdin, output windows, rekey cleanup, lifecycle fencing, delayed state races, cache TTL/retention/cancellation/invalidation, warm/stale/error UI, and authorization.
 - `openspec validate optimize-server-dashboard-loading --strict` and `git diff --check` pass.
 - The first macOS full-suite run exposed fixture updates plus host differences: BSD `chmod 600 --` and symlinked `/var` temporary paths. Fixture updates pass; backup tests pass with `TMPDIR=/private/tmp`. The unchanged Linux shell tests will be verified by the standard GitHub Linux CI job.
+
+Standard Linux CI passed: [run 41794916695](https://github.com/akaUNik/Amnezia-Web-Panel/actions/runs/41794916695), 1,549 tests (one pre-existing pytest-only live-server module skipped by the unittest runner) plus 117 root backup/peer regressions. The follow-up active-refresh capacity test also passes locally. Results are published in [PR #26](https://github.com/akaUNik/Amnezia-Web-Panel/pull/26).

@@ -2725,7 +2725,7 @@
             const currentVal = protoSelect.value;
             protoSelect.innerHTML = '';
             let firstVal = null;
-    
+
             for (const [proto, info] of orderedProtocolEntries(data.protocols)) {
                 updateProtocolCard(proto, info);
                 const isVPN = ['awg', 'awg2', 'awg3', 'awg_legacy', 'xray', 'telemt', 'wireguard'].includes(protoBase(proto));
@@ -2737,7 +2737,7 @@
                     if (!firstVal) firstVal = proto;
                 }
             }
-    
+
             if (protoSelect.innerHTML === '') {
                 const opt = document.createElement('option');
                 opt.textContent = _('no_protocols');

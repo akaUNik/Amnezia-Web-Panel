@@ -89,6 +89,28 @@ class DisplayCacheTests(unittest.IsolatedAsyncioTestCase):
             await first
         self.assertEqual(self.cache.peek('stats', self.key)['data']['cpu'], 1)
 
+    async def test_refresh_capacity_stays_bounded_across_invalidations(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def slow():
+            entered.set()
+            await release.wait()
+            return {'cpu': 1}
+        first = asyncio.create_task(self.cache.observe('stats', self.key, slow))
+        await entered.wait()
+        self.cache.invalidate()
+        entered.clear()
+        second = asyncio.create_task(self.cache.observe('stats', self.key, slow))
+        await entered.wait()
+        self.cache.invalidate()
+        try:
+            with self.assertRaisesRegex(RuntimeError, 'capacity'):
+                await self.cache.observe('stats', self.key, slow)
+        finally:
+            release.set()
+            for task in (first, second):
+                with self.assertRaises(ObservationInvalidated):
+                    await task
+
     def test_identity_contains_no_raw_credentials(self):
         key = observation_key('state', {}, {'uid': 'uid', 'password': 'secret'})
         self.assertNotIn('secret', str(key))
