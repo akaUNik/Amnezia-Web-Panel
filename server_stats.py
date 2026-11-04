@@ -10,11 +10,12 @@ HOST_STATS_COMMANDS = {
         "awk '{u=$2+$4; t=$2+$4+$5; if(NR==1){pu=u;pt=t} else printf \"%.1f\", (u-pu)/(t-pt)*100}' "
         "<(grep 'cpu ' /proc/stat) <(sleep 0.5 && grep 'cpu ' /proc/stat) 2>/dev/null"
     ),
-    'ram': "free -b | awk 'NR==2{printf \"%d %d\", $3, $2}'",
-    'disk': "df -B1 / | awk 'NR==2{printf \"%d %d\", $3, $2}'",
+    # Keep byte counters as strings: awk integer formatting can overflow or round them.
+    'ram': "free -b | awk 'NR==2{printf \"%s %s\", $3, $2}'",
+    'disk': "df -B1 / | awk 'NR==2{printf \"%s %s\", $3, $2}'",
     'network': (
         "DEV=$(ip route | awk '/default/ {print $5}' | head -1); "
-        "cat /proc/net/dev | awk -v dev=\"$DEV:\" '$1==dev{printf \"%d %d\", $2, $10}'"
+        "cat /proc/net/dev | awk -v dev=\"$DEV:\" '$1==dev{printf \"%s %s\", $2, $10}'"
     ),
     'uptime': 'uptime -p 2>/dev/null || uptime',
     'ipv6': (

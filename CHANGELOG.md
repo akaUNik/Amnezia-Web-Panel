@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [1.11.1] - 2026-11-04
+
+### Fixed
+- Preserve large disk, RAM, and network byte counters instead of truncating them during host statistics collection (#36).
+
 ## [1.11.0] - 2026-11-04
 
 ### Added
