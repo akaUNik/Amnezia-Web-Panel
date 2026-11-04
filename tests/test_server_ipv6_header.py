@@ -59,7 +59,7 @@ class ServerStatsIpv6Tests(unittest.TestCase):
                     if addr.startswith('fd') or (plen and int(plen) > 64):
                         continue
                     kept.append(addr)
-                return '\n'.join(kept) + ('\n' if kept else ''), '', 0
+                return '__AWP_IPV6__\n' + '\n'.join(kept) + ('\n' if kept else ''), '', 0
             return '0', '', 0
 
         ssh.run_command.side_effect = run_command
