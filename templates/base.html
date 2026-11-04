@@ -304,7 +304,7 @@
         });
 
         /* ===== API Helper ===== */
-        async function apiCall(url, method = 'GET', body = null) {
+        async function apiCall(url, method = 'GET', body = null, onResponse = null) {
             const opts = {
                 method,
                 headers: { 'Content-Type': 'application/json' },
@@ -336,6 +336,7 @@
                 err.payload = data;  // keep extra fields (e.g. import log)
                 throw err;
             }
+            if (onResponse) onResponse(res);
             return data;
         }
 

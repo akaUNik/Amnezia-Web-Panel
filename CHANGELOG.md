@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Changed
+- Load saved-instance connections independently and reuse dashboard snapshots with visible freshness (#23).
+- Collect server summary metrics in one SSH command and reuse empty AWG counter snapshots (#23).
+
+### Fixed
+- Bound SSH channel execution and reconcile server observations without overwriting concurrent changes (#23).
+
 ## [1.10.1] - 2026-11-02
 
 ### Fixed

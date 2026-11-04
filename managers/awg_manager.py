@@ -2885,7 +2885,7 @@ done < "$BW"
         # to a one-off live count so the UI is not empty for the first minute.
         try:
             conn_counts = self._load_conn_counts(protocol_type)
-            if not conn_counts:
+            if conn_counts is None:
                 conn_counts = self._count_connections_by_ip(protocol_type)
             conn_warnings = self._load_conn_warnings(protocol_type)
             for client in clients_table:
@@ -3019,18 +3019,23 @@ done < "$BW"
         return '/opt/amnezia/awg/conn_counts.json'
 
     def _load_conn_counts(self, protocol_type):
-        """Load latest {ip: count} snapshot written by the collector."""
+        """Return a valid snapshot (including {}), or None for unreadable data."""
         container_name = self._container_name(protocol_type)
         out, err, code = self.ssh.run_sudo_command(
             f"docker exec -i {container_name} cat {self._conn_counts_path()} 2>/dev/null"
         )
         if code != 0 or not out.strip():
-            return {}
+            return None
         try:
             data = json.loads(out)
-            return {k: int(v) for k, v in data.items()} if isinstance(data, dict) else {}
+            if not isinstance(data, dict) or any(
+                not isinstance(k, str) or type(v) is not int or v < 0
+                for k, v in data.items()
+            ):
+                return None
+            return data
         except (json.JSONDecodeError, ValueError, TypeError):
-            return {}
+            return None
 
     def _save_conn_counts(self, protocol_type, counts):
         """Persist the {ip: count} snapshot into the container."""

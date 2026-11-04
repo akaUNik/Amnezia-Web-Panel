@@ -1029,5 +1029,10 @@
     "awg_plugin_cancel": "Cancel",
     "awg_plugin_cancelling": "Cancelling…",
     "awg_plugin_cancelled": "Update cancelled; the previous version is still running",
-    "awg_plugin_step": "Step {step} of {total}"
+    "awg_plugin_step": "Step {step} of {total}",
+    "dashboard_observed": "Observed",
+    "dashboard_stale": "Stale",
+    "dashboard_refreshing": "Refreshing…",
+    "dashboard_refresh_error": "Refresh failed",
+    "dashboard_no_snapshot": "No snapshot yet"
 }

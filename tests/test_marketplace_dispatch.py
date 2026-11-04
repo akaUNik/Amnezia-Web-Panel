@@ -95,7 +95,7 @@ class MarketplaceBrowserTests(unittest.TestCase):
         source = (ROOT / 'templates/server.html').read_text(encoding='utf-8')
         functions = []
         for name in ('renderMarketplace', 'applyInstalledAppsVisibility', 'loadRknBlock',
-                     'renderRknBlockCard', 'checkServer', 'installRknBlock', 'uninstallRknBlock'):
+                     'renderRknBlockCard', 'checkServer', 'renderDashboardStatus', 'installRknBlock', 'uninstallRknBlock'):
             match = re.search(r'    (?:async )?function ' + name + r'\([^)]*\) \{.*?\n    \}', source, re.S)
             self.assertIsNotNone(match, name)
             functions.append(match[0])
@@ -110,7 +110,9 @@ class MarketplaceBrowserTests(unittest.TestCase):
         prelude = '''
 const SERVER_ID=0, calls=[], pending=[];
 let rknBlockStatus={installed:true,available:false,agent_state:'unknown',running:false,healthy:false}, rknBlockLoadId=0, rknBlockBusy=false;
-let smartRouteStatus=null, currentProtocolStatus={}, installedAppsLoading=false;
+let smartRouteStatus=null, currentProtocolStatus={}, installedAppsLoading=false, checkGeneration=0;
+const dashboardTimers={}, showDashboardFreshness=()=>{}, receiveDashboardMetadata=()=>{};
+const dashboardURL=kind=>`/api/servers/${SERVER_ID}/${kind}`;
 const MARKETPLACE_APPS=[{proto:'rknblock',category:'security',title:'RKN Block',descKey:'description',icon:''}];
 const MARKETPLACE_CATEGORIES=[{id:'security',titleKey:'security',icon:''}];
 document.body.dataset.serverUid='fixture-node';

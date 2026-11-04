@@ -69,7 +69,7 @@ class SSHManager:
         # otherwise every API request kills the shared transport.
         self.pooled = False
 
-    def connect(self):
+    def connect(self, deadline=None):
         """Establish SSH connection to the server."""
         # Legacy endpoints still call connect() after get_ssh() has returned a
         # pooled manager.  Reconnecting there used to close the shared
@@ -94,7 +94,13 @@ class SSHManager:
                 last_exc = None
                 for attempt in (1, 2):
                     try:
-                        self._connect_once()
+                        if deadline is None:
+                            self._connect_once()
+                        else:
+                            budget = deadline - time.monotonic()
+                            if budget <= 0:
+                                raise TimeoutError('SSH command deadline exceeded')
+                            self._connect_once(timeout=budget)
                         last_exc = None
                         break
                     except (TimeoutError, OSError) as e:
@@ -131,7 +137,7 @@ class SSHManager:
         self._connect_cooldown = self._connect_cooldown_base
         self._last_connect_fail = 0.0
 
-    def _connect_once(self):
+    def _connect_once(self, timeout=15):
         """Single TCP+SSH handshake attempt (caller holds _conn_lock)."""
         self.client = paramiko.SSHClient()
         self.client.load_system_host_keys()
@@ -148,7 +154,9 @@ class SSHManager:
             'hostname': self.host,
             'port': self.port,
             'username': self.username,
-            'timeout': 15,
+            'timeout': timeout,
+            'banner_timeout': timeout,
+            'auth_timeout': timeout,
             'allow_agent': False,
             'look_for_keys': False,
         }
@@ -168,7 +176,15 @@ class SSHManager:
         elif self.password:
             kwargs['password'] = self.password
 
-        self.client.connect(**kwargs)
+        client = self.client
+        watchdog = threading.Timer(timeout, client.close)
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            client.connect(**kwargs)
+        finally:
+            watchdog.cancel()
+            watchdog.join()
         # Keep NAT/stateful firewalls from silently dropping the idle
         # long-lived transport between command bursts.
         try:
@@ -291,55 +307,101 @@ class SSHManager:
         return str(exc).strip() or type(exc).__name__
 
     def _run_command_locked(self, command, timeout, _retried, stdin_input=None):
+        from peer_lifecycle_lock import note_ssh_uncertainty, check_remote_fence
         self.ensure_connected()
-
+        deadline = time.monotonic() + timeout
         logger.info(f"Running command: {command[:100]}...")
+        channel = None
+        watchdog = None
+        dispatched = False
+
+        def remaining():
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                raise TimeoutError('SSH command deadline exceeded')
+            return budget
+
         try:
-            stdin, stdout, stderr = self.client.exec_command(command, timeout=timeout)
-        except Exception as e:
-            # Transport can be dead while is_active() still claims otherwise
-            # (silent NAT drop). Reconnect once and retry before giving up.
-            from peer_lifecycle_lock import note_ssh_uncertainty
-            note_ssh_uncertainty()
-            if not _retried:
-                logger.warning(f"exec failed ({e}); reconnecting and retrying once")
+            # Before exec there is no ambiguous remote write, so one reconnect
+            # remains safe. After dispatch we never blindly replay a command.
+            for attempt in range(1 if _retried else 2):
                 try:
-                    self.connect()
-                except Exception as ce:
-                    logger.error(f"reconnect failed: {ce}")
-                    return "", self._reason(ce), -1
-                return self.run_command(command, timeout=timeout, _retried=True, stdin_input=stdin_input)
-            logger.error(f"exec failed after retry: {e}")
-            return "", self._reason(e), -1
+                    transport = self.client.get_transport()
+                    channel = transport.open_session(timeout=remaining())
+                    break
+                except Exception:
+                    if attempt or _retried:
+                        raise
+                    self._disconnect_locked()
+                    self.connect(deadline=deadline)
+            check_remote_fence()
+            channel.settimeout(remaining())
+            # Paramiko's exec ACK wait ignores settimeout. Closing this exact
+            # channel wakes it; no command worker is left behind on timeout.
+            def expire():
+                # Channel.close itself can wait for rekey/transport output.
+                # Execution is serialized, so retiring this transport safely
+                # unblocks both the ACK wait and channel cleanup at the deadline.
+                transport.close()
+                channel.close()
 
-        if stdin_input is not None:
+            watchdog = threading.Timer(remaining(), expire)
+            watchdog.name = 'ssh-command-deadline'
+            watchdog.daemon = True
+            watchdog.start()
+            dispatched = True
+            channel.exec_command(command)
+            pending = stdin_input.encode('utf-8') if isinstance(stdin_input, str) else stdin_input
+            offset = 0
+            input_closed = pending is None
+            stdout, stderr = [], []
+            while True:
+                channel.settimeout(remaining())
+                progressed = False
+                # Alternate bounded reads so neither stream can starve the other
+                # or block stdin delivery when the remote window is full.
+                if channel.recv_ready():
+                    stdout.append(channel.recv(65536))
+                    progressed = True
+                if channel.recv_stderr_ready():
+                    stderr.append(channel.recv_stderr(65536))
+                    progressed = True
+                if not input_closed:
+                    if offset < len(pending) and channel.send_ready():
+                        sent = channel.send(pending[offset:offset + 65536])
+                        if sent <= 0:
+                            raise EOFError('SSH stdin closed before delivery')
+                        offset += sent
+                        progressed = True
+                    if offset == len(pending):
+                        channel.shutdown_write()
+                        input_closed = True
+                if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
+                    if not input_closed:
+                        raise EOFError('SSH command exited before stdin delivery')
+                    code = channel.recv_exit_status()
+                    if code == -1:
+                        raise EOFError('SSH exit status missing')
+                    return (b''.join(stdout).decode('utf-8', errors='replace').strip(),
+                            b''.join(stderr).decode('utf-8', errors='replace').strip(), code)
+                if channel.closed:
+                    raise EOFError('SSH channel closed without exit status')
+                if not progressed:
+                    time.sleep(min(.01, remaining()))
+        except Exception as exc:
+            if dispatched:
+                note_ssh_uncertainty()
+            reason = self._reason(exc)
+            logger.error('SSH command failed: %s', reason)
+            return '', f'SSH connection lost while running the command ({reason})', -1
+        finally:
             try:
-                stdin.write(stdin_input)
-                stdin.flush()
-                # Signal EOF so consumers of stdin (e.g. docker exec -i)
-                # behave exactly as with the old `echo ... |` pipe.
-                stdin.channel.shutdown_write()
-            except Exception as e:
-                logger.warning(f"failed to write command stdin: {e}")
-
-        # Crucial: set timeout on the channel to prevent hanging indefinitely
-        stdout.channel.settimeout(timeout)
-        stderr.channel.settimeout(timeout)
-
-        try:
-            exit_code = stdout.channel.recv_exit_status()
-            out = stdout.read().decode('utf-8', errors='replace').strip()
-            err = stderr.read().decode('utf-8', errors='replace').strip()
-        except Exception as e:
-            from peer_lifecycle_lock import note_ssh_uncertainty
-            note_ssh_uncertainty()
-            logger.error(f"Command timed out or failed to read: {e}")
-            out, err, exit_code = "", f"SSH connection lost while running the command ({self._reason(e)})", -1
-
-        if exit_code != 0:
-            logger.warning(f"Command exited with code {exit_code}: {err}")
-
-        return out, err, exit_code
+                if channel is not None:
+                    channel.close()
+            finally:
+                if watchdog:
+                    watchdog.cancel()
+                    watchdog.join()
 
     def run_sudo_command(self, command, timeout=60):
         """

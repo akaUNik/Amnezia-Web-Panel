@@ -1029,5 +1029,10 @@
     "awg_plugin_cancel": "取消",
     "awg_plugin_cancelling": "正在取消…",
     "awg_plugin_cancelled": "更新已取消，仍在使用之前的版本",
-    "awg_plugin_step": "第 {step} 步，共 {total} 步"
+    "awg_plugin_step": "第 {step} 步，共 {total} 步",
+    "dashboard_observed": "采集时间",
+    "dashboard_stale": "已过期",
+    "dashboard_refreshing": "正在刷新…",
+    "dashboard_refresh_error": "刷新失败",
+    "dashboard_no_snapshot": "暂无快照"
 }
