@@ -13,19 +13,10 @@ from unittest import mock
 from managers.ssh_manager import SSHManager
 
 
-class _FakeStream:
-    def __init__(self):
-        self.channel = mock.Mock()
-        self.channel.recv_exit_status.return_value = 0
-
-    def read(self):
-        return b'ok'
-
-    def write(self, data):
-        pass
-
-    def flush(self):
-        pass
+try:
+    from .ssh_channel_fixture import Channel
+except ImportError:
+    from ssh_channel_fixture import Channel
 
 
 class _FakeClient:
@@ -49,17 +40,18 @@ class _FakeClient:
     def get_transport(self):
         transport = mock.Mock()
         transport.is_active.return_value = True
+        transport.open_session.side_effect = self.open_session
         return transport
 
-    def exec_command(self, command, timeout=60):
-        # Signal "exec entered", then wait until the other thread had its
-        # chance to force_disconnect(). Pre-fix, the eviction would null
-        # ssh.client here and a real transport would die under us.
-        self._started.set()
-        self.assert_closed_false()
-        self._release.wait(5)
-        self.assert_closed_false()
-        return _FakeStream(), _FakeStream(), _FakeStream()
+    def open_session(self, timeout=60):
+        channel = Channel()
+        def execute(command):
+            self._started.set()
+            self.assert_closed_false()
+            self._release.wait(5)
+            self.assert_closed_false()
+        channel.exec_command = execute
+        return channel
 
     def assert_closed_false(self):
         if self.closed:

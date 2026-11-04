@@ -37,7 +37,9 @@ class ReasonTests(unittest.TestCase):
     def test_a_transport_dying_mid_command_is_reported(self):
         ssh = SSHManager.__new__(SSHManager)
         ssh.client = mock.Mock()
-        ssh.client.exec_command.return_value = (None, DeadStream(), DeadStream())
+        channel = mock.Mock()
+        channel.exec_command.side_effect = EOFError()
+        ssh.client.get_transport.return_value.open_session.return_value = channel
         ssh.ensure_connected = lambda: None
 
         out, err, code = ssh._run_command_locked('whoami', 10, False)

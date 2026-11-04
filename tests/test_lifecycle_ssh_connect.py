@@ -56,9 +56,9 @@ class LifecycleSSHConnectTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_lost_command_reply_still_fences_across_restart(self):
         self.ssh.client = Mock()
-        stdout = Mock()
-        stdout.channel.recv_exit_status.side_effect = TimeoutError('reply lost')
-        self.ssh.client.exec_command.return_value = (Mock(), stdout, Mock())
+        channel = Mock()
+        channel.exec_command.side_effect = TimeoutError('reply lost')
+        self.ssh.client.get_transport.return_value.open_session.return_value = channel
         @lifecycle.serialize_peer_lifecycle
         async def command():
             return await asyncio.to_thread(self.ssh.run_command, 'true')
@@ -69,11 +69,11 @@ class LifecycleSSHConnectTests(unittest.IsolatedAsyncioTestCase):
         lifecycle.configure(self.data_file)
         with self.assertRaises(lifecycle.PeerLifecycleUncertain):
             await command()
-        self.ssh.client.exec_command.assert_called_once()
+        channel.exec_command.assert_called_once()
 
-    async def test_failed_reconnect_after_exec_failure_keeps_fence(self):
+    async def test_exec_failure_keeps_fence_without_reconnect(self):
         self.ssh.client = Mock()
-        self.ssh.client.exec_command.side_effect = EOFError('exec reply lost')
+        self.ssh.client.get_transport.return_value.open_session.return_value.exec_command.side_effect = EOFError('exec reply lost')
         @lifecycle.serialize_peer_lifecycle
         async def command():
             return await asyncio.to_thread(self.ssh.run_command, 'true')
