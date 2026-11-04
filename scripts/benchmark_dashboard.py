@@ -62,6 +62,7 @@ async def measure(panel, client, ssh):
                 start = time.monotonic()
                 count, waiting = ssh.calls, ssh.wait
                 summary = None
+                timers = []
 
                 async def route_request(route):
                     nonlocal summary
@@ -70,16 +71,17 @@ async def measure(panel, client, ssh):
                         await route.fulfill(content_type='text/html', body=html)
                     elif path.endswith('/check'):
                         await asyncio.sleep(.35)
-                        await route.fulfill(json={'connection': 'ok', 'docker_installed': True,
-                            'protocols': {'awg2': {'container_exists': True, 'container_running': True}}})
+                        response = await asyncio.to_thread(client.post, path)
+                        await route.fulfill(status=response.status_code, body=response.content,
+                                            headers=dict(response.headers))
                     elif path.endswith('/stats'):
                         # Deterministic competing transport owner, separate from
                         # the per-command latency. A cache hit never waits on it.
                         ssh.lock.acquire()
                         timer = threading.Timer(.05, ssh.lock.release)
+                        timers.append(timer)
                         timer.start()
                         response = await asyncio.to_thread(client.post, path)
-                        timer.join()
                         summary = time.monotonic() - start
                         await route.fulfill(status=response.status_code, body=response.content,
                                             headers=dict(response.headers))
@@ -104,6 +106,11 @@ async def measure(panel, client, ssh):
                 samples.append({'path': label, 'first_row_ms': round(first_row * 1000),
                     'summary_ms': round(summary * 1000), 'ssh_commands': ssh.calls - count,
                     'transport_wait_ms': round((ssh.wait - waiting) * 1000)})
+                # Let the delayed live check publish its snapshot so the next
+                # page really exercises warm status as well as warm stats.
+                await page.wait_for_function("!document.getElementById('checkBtn').disabled")
+                for timer in timers:
+                    await asyncio.to_thread(timer.join)
                 await page.close()
         finally:
             await browser.close()
@@ -124,7 +131,10 @@ def main():
         ssh = DelayedSSH()
         with patch.object(panel, '_check_admin', return_value=admin), \
              patch.object(panel, 'get_current_user', return_value=admin), \
-             patch.object(panel, 'get_ssh', return_value=ssh):
+             patch.object(panel, 'get_ssh', return_value=ssh), \
+             patch.object(panel, '_collect_dashboard_status', side_effect=lambda data, server: (
+                 {'connection': 'ok', 'docker_installed': True, 'protocols': {
+                     'awg2': {'container_exists': True, 'container_running': True}}}, server['protocols'])):
             client = TestClient(panel.app)
             print(json.dumps(asyncio.run(measure(panel, client, ssh)), indent=2))
 
