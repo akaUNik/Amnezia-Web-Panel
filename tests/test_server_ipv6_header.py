@@ -7,6 +7,7 @@ link-local stay excluded), and the page renders a second mono line under
 
 import json
 import os
+import re
 import shutil
 import tempfile
 import unittest
@@ -24,6 +25,16 @@ def server_with():
 
 
 class ServerStatsIpv6Tests(unittest.TestCase):
+    def test_batch_transport_failure_without_cached_stats_returns_error(self):
+        client = self.client()
+        ssh = mock.Mock()
+        ssh.run_command.return_value = ('', 'synthetic timeout', -1)
+        with mock.patch.object(panel, 'get_ssh', return_value=ssh):
+            response = client.post('/api/servers/0/stats')
+        self.assertEqual(response.status_code, 500, response.text)
+        self.assertIn('Host statistics unavailable', response.json()['error'])
+        ssh.disconnect.assert_called_once()
+
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self._data_file = panel.DATA_FILE
@@ -59,7 +70,11 @@ class ServerStatsIpv6Tests(unittest.TestCase):
                     if addr.startswith('fd') or (plen and int(plen) > 64):
                         continue
                     kept.append(addr)
-                return '__AWP_IPV6__\n' + '\n'.join(kept) + ('\n' if kept else ''), '', 0
+                marker = re.search(r'@@HOST_STATS_[0-9a-f]+@@', cmd)[0]
+                fields = {'cpu': '0', 'ram': '0 0', 'disk': '0 0', 'network': '0 0',
+                          'uptime': '', 'ipv6': '\n'.join(kept)}
+                output = '\n'.join(marker + ':' + name + '\n' + value + '\n' + marker + ':end:' + name + ':0' for name, value in fields.items())
+                return output + '\n' + marker + ':done\n', '', 0
             return '0', '', 0
 
         ssh.run_command.side_effect = run_command

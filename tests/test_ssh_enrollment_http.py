@@ -33,6 +33,7 @@ class EnrollmentHTTPTests(unittest.TestCase):
         self.data_lock = asyncio.Lock()
         for name, value in [('DATA_LOCK', self.data_lock), ('ssh_trust', self.trust),
                             ('_check_admin', lambda request: self.user),
+                            ('get_current_user', lambda request: self.user),
                             ('load_data', lambda: {'servers': [self.server]}),
                             ('drop_ssh', self.drop)]:
             patch = mock.patch.object(self.module, name, value)
@@ -47,7 +48,7 @@ class EnrollmentHTTPTests(unittest.TestCase):
             for action in ['inspect', 'confirm']:
                 response = self.client.post('/api/servers/0/ssh-trust/' + action,
                                             json={'token': 'abc', 'confirmed': True})
-                self.assertEqual(response.status_code, 403)
+                self.assertEqual(response.status_code, 401 if user is None else 403)
         self.trust.inspect.assert_not_called()
         self.trust.prepare_enrollment.assert_not_called()
         self.trust.commit_enrollment.assert_not_called()

@@ -1,4 +1,5 @@
 """Real rendered page; held API responses, no network or SSH."""
+from contextlib import ExitStack, closing
 import json
 import os
 from pathlib import Path
@@ -134,6 +135,65 @@ class DashboardLoadingBrowserTests(unittest.TestCase):
                     page.wait_for_function('!window.connLoading')
                     self.assertTrue(page.locator('#connectionsSection').is_hidden())
                     self.assertNotIn('Deleted peer', page.locator('#connectionsListInner').inner_text())
+                    self.assertEqual(errors, [])
+                    page.close()
+            browser.close()
+
+    def test_slow_queue_script_does_not_break_initial_polling(self):
+        with tempfile.TemporaryDirectory() as tmp, sync_playwright() as pw, ExitStack() as cleanup:
+            options = {'headless': True}
+            if os.environ.get('PANEL_BROWSER_EXECUTABLE'):
+                options['executable_path'] = os.environ['PANEL_BROWSER_EXECUTABLE']
+            browser = pw.chromium.launch(**options)
+            cleanup.callback(browser.close)
+            datafile = Path(tmp) / 'data.json'
+            datafile.write_text(json.dumps({'servers': [{'uid': 'fixture', 'name': 'Test',
+                'host': '192.0.2.1', 'ssh_port': 22, 'username': 'root', 'peer_poll_interval': 5,
+                'protocols': {'awg2': {'installed': True}}}]}))
+            admin = {'id': 'fixture', 'role': 'admin'}
+            with patch.object(panel, 'DATA_FILE', str(datafile)), \
+                 patch.object(panel, 'get_current_user', return_value=admin), \
+                 patch.object(panel, '_check_admin', return_value=admin), \
+                 patch.object(panel, 'get_ssh', side_effect=AssertionError('Real SSH forbidden')):
+                with closing(TestClient(panel.app)) as client:
+                    html = client.get('/server/0').text
+                    page = browser.new_page()
+                    held, errors = [], []
+                    page.on('pageerror', lambda error: errors.append(str(error)))
+
+                    def route_request(route):
+                        path = urlsplit(route.request.url).path
+                        if path == '/server/0':
+                            route.fulfill(content_type='text/html', body=html)
+                        elif path == '/static/js/peer-queue.js':
+                            held.append(route)
+                        elif path.startswith('/static/'):
+                            response = client.get(path)
+                            route.fulfill(body=response.content, content_type=response.headers.get('content-type'))
+                        elif path.endswith('/check'):
+                            route.fulfill(json={'connection': 'ok', 'docker_installed': True,
+                                'protocols': {'awg2': {'container_exists': True, 'container_running': True}}})
+                        elif path.endswith('/connections'):
+                            route.fulfill(json={'clients': [{'clientId': 'peer', 'userData': {'clientName': 'One'}}]})
+                        elif route.request.url.startswith('http://panel.test/'):
+                            route.fulfill(json={})
+                        else:
+                            route.abort()
+
+                    page.route('**/*', route_request)
+                    page.goto('http://panel.test/server/0', wait_until='commit')
+                    for _ in range(100):
+                        if held:
+                            break
+                        page.wait_for_timeout(20)
+                    self.assertTrue(held)
+                    # Allow fast API responses to overtake the held script.
+                    page.wait_for_timeout(500)
+                    held[0].fulfill(content_type='application/javascript',
+                                    body=(Path(__file__).resolve().parents[1] / 'static/js/peer-queue.js').read_text())
+                    page.locator('.client-name').filter(has_text='One').wait_for()
+                    self.assertEqual(errors, [])
+                    page.wait_for_function('Boolean(window.connPollTimer)')
                     self.assertEqual(errors, [])
                     page.close()
             browser.close()

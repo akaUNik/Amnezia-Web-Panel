@@ -18,14 +18,23 @@ STAT_FIELDS = frozenset(('cpu', 'ram_used', 'ram_total', 'ram_percent', 'disk_us
     'disk_total', 'disk_percent', 'net_rx', 'net_tx', 'uptime', 'ipv6'))
 PROTOCOL_FIELDS = frozenset(('protocol', 'base_protocol', 'instance', 'display_name',
     'container_name', 'container_exists', 'container_running', 'installed', 'port',
-    'header_protection', 'status_preserved', 'clients_count', 'peers_count', 'mode',
+    'header_protection', 'protocol_version', 'status_preserved', 'clients_count', 'peers_count', 'mode',
     'internal_ip', 'web_port', 'web_exposed', 'expose_web', 'domain', 'site_url',
     'subnet', 'obfuscation'))
 
 
 def projection(kind, value):
     if kind == 'stats':
-        return {key: copy.deepcopy(value[key]) for key in STAT_FIELDS if key in value}
+        result = {key: copy.deepcopy(value[key]) for key in STAT_FIELDS if key in value}
+        # Keep bounded probe status codes so cached unavailable fields do not
+        # become successful zero readings. Never cache remote error messages.
+        errors = {field: code for field, code in value.get('errors', {}).items()
+                  if field in ('batch', 'cpu', 'ram', 'disk', 'network', 'uptime', 'ipv6')
+                  and code in ('invalid_framing', 'probe_failed', 'command_failed',
+                               'incomplete_response', 'unavailable', 'invalid_value')}
+        if errors:
+            result['errors'] = errors
+        return result
     protocols = {}
     for proto, info in value.get('protocols', {}).items():
         item = {key: copy.deepcopy(info[key]) for key in PROTOCOL_FIELDS if key in info}
