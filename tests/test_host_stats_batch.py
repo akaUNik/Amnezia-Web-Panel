@@ -1,9 +1,11 @@
 """Exercise framing/parsing and the actual shell command without a VPS."""
 import os
+from pathlib import Path
 import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import unittest
 from unittest import mock
 
@@ -23,6 +25,56 @@ def batch_output(command, values=None):
     values = VALUES if values is None else values
     return '\n'.join(marker + ':' + name + '\n' + values.get(name, '') + '\n' + marker + ':end:' + name + ':0'
                      for name in server_stats.HOST_STATS_COMMANDS) + '\n' + marker + ':done\n'
+
+
+@unittest.skipUnless(os.name == 'posix' and shutil.which('bash') and shutil.which('awk'),
+                     'Bash and awk required')
+class HostByteCounterTests(unittest.TestCase):
+    def test_shell_probes_preserve_byte_counters(self):
+        cases = (
+            (0, 1024, 0, 0),
+            (600, 1000, 123456, 987654),
+            (2147483647, 2147483648, 2147483648, 4294967296),
+            (5046586573, 32212254720, 9007199254740993, 18446744073709551615),
+        )
+        for used, total, rx, tx in cases:
+            with self.subTest(used=used, total=total), tempfile.TemporaryDirectory() as directory:
+                # Replace only host data sources; run the production awk probes.
+                sources = {
+                    'df': ('-B1 /', f'Filesystem 1B-blocks Used Available Use% Mounted on\n'
+                           f'/dev/sda1 {total} {used} {total - used} 17% /\n'),
+                    'free': ('-b', f'              total used free shared buff/cache available\n'
+                             f'Mem: {total} {used} {total - used} 0 0 0\n'),
+                    'ip': ('route', 'default via 192.0.2.1 dev eth0\n'),
+                    'cat': ('/proc/net/dev',
+                            f'lo: 42 0 0 0 0 0 0 0 84 0 0 0 0 0 0 0\n'
+                            f'eth0: {rx} 0 0 0 0 0 0 0 {tx} 0 0 0 0 0 0 0\n'),
+                }
+                for name, (args, output) in sources.items():
+                    path = Path(directory) / name
+                    path.write_text('#!/bin/sh\n'
+                                    f'[ "$*" = {shlex.quote(args)} ] || exit 1\n'
+                                    'printf %s ' + shlex.quote(output), encoding='utf8')
+                    path.chmod(0o755)
+                env = dict(os.environ, PATH=directory + os.pathsep + os.environ['PATH'])
+
+                class ShellSSH:
+                    def run_command(self, command, **kw):
+                        result = subprocess.run(command, shell=True, env=env,
+                                                capture_output=True, text=True, timeout=10)
+                        return result.stdout, result.stderr, result.returncode
+
+                commands = {name: 'printf %s ' + shlex.quote(VALUES[name])
+                            for name in ('cpu', 'uptime', 'ipv6')}
+                with mock.patch.dict(server_stats.HOST_STATS_COMMANDS, commands):
+                    result = server_stats.collect_host_stats(ShellSSH())
+                self.assertNotIn('errors', result)
+                for field in ('disk', 'ram'):
+                    self.assertEqual(result[field + '_used'], used)
+                    self.assertEqual(result[field + '_total'], total)
+                    self.assertEqual(result[field + '_percent'], round(used / total * 100, 1))
+                self.assertEqual(result['net_rx'], rx)
+                self.assertEqual(result['net_tx'], tx)
 
 
 class HostStatsBatchTests(unittest.TestCase):

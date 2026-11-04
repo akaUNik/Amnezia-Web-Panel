@@ -10,13 +10,14 @@ class HostStatsBrowserTests(unittest.TestCase):
         from playwright.sync_api import sync_playwright
         source = (Path(__file__).resolve().parents[1] / 'templates/server.html').read_text(encoding='utf8')
         function = re.search(r'    async function loadServerStats\(.*?\n    }', source, re.S)[0]
+        formatter = re.search(r'    function formatBytes\(.*?\n    }', source, re.S)[0]
         with sync_playwright() as pw:
             options = {'executable_path': os.environ['PANEL_BROWSER_EXECUTABLE']} if os.environ.get('PANEL_BROWSER_EXECUTABLE') else {}
             browser = pw.chromium.launch(headless=True, **options)
             try:
                 page = browser.new_page()
                 page.set_content('<div id="serverStats"></div><div id="serverIpv6"></div><script>'
-                    'const SERVER_ID = 0; const formatBytes = n => String(n || 0);'
+                    'const SERVER_ID = 0;' + formatter +
                     'const showDashboardFreshness = () => {}; const dashboardURL = () => `/stats`;'
                     'const receiveDashboardMetadata = () => {};'
                     'let stats = {}; const apiCall = async () => stats;' + function + '</script>')
@@ -33,5 +34,12 @@ class HostStatsBrowserTests(unittest.TestCase):
                 self.assertNotIn('0%', text.replace('60%', ''))
                 page.evaluate('stats = {cpu: 0, ram_percent: 0, disk_percent: 0}; loadServerStats()')
                 self.assertIn('⚡ 0%', page.locator('#serverStats').inner_text())
+                page.evaluate('''async () => {
+                    stats = {disk_used: 5046586573, disk_total: 32212254720, disk_percent: 15.7};
+                    await loadServerStats();
+                }''')
+                disk = page.locator('#serverStats [title^="Disk:"]')
+                self.assertEqual(disk.get_attribute('title'), 'Disk: 4.7 GB / 30 GB')
+                self.assertEqual(disk.inner_text(), '💾 15.7%')
             finally:
                 browser.close()
