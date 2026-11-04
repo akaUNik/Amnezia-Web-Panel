@@ -78,6 +78,40 @@
         states.forEach(rec => paint(rec.task));
     }
 
+    function applySuccess(t) {
+        rows(t).forEach(row => {
+            if (t.action === 'delete') {
+                row.remove();
+                return;
+            }
+            const enabled = t.action === 'enable';
+            const opacityTarget = row.matches('[data-peer-opacity]')
+                ? row : row.querySelector('[data-peer-opacity]');
+            if (opacityTarget) opacityTarget.style.opacity = enabled ? '' : '0.5';
+            const button = row.querySelector('.peer-toggle');
+            if (button) {
+                button.classList.toggle('peer-toggle-off', !enabled);
+                button.title = _(enabled ? 'stop_peer_title' : 'start_peer_title');
+                button.removeAttribute('onclick');
+                button.onclick = () => enqueue({
+                    serverId: t.serverId, protocol: t.protocol, clientId: t.clientId,
+                    peerName: row.dataset.peerName || t.peerName,
+                    action: enabled ? 'disable' : 'enable',
+                });
+            }
+            let badge = row.querySelector('.peer-disabled-badge');
+            if (enabled) {
+                if (badge) badge.remove();
+            } else if (!badge) {
+                badge = document.createElement('span');
+                badge.className = 'badge badge-danger peer-disabled-badge';
+                badge.style.fontSize = '0.65rem';
+                badge.textContent = _('stop');
+                (row.querySelector('.client-meta') || row).appendChild(badge);
+            }
+        });
+    }
+
     function makeToast(t) {
         const el = document.createElement('div');
         el.className = 'toast peer-queue-toast';
@@ -170,6 +204,7 @@
             startProgress(t);
             try {
                 await run(t);
+                applySuccess(t);
                 clearInterval(t.timer);
                 t.percent = 100;
                 renderToast(t);

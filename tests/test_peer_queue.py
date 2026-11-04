@@ -44,6 +44,50 @@ class PeerQueueBrowserTests(unittest.TestCase):
         page.add_script_tag(path=str(JS))
         return page
 
+    def test_completed_toggle_updates_both_row_layouts_before_queue_drains(self):
+        for users_page in (False, True):
+            with self.subTest(users_page=users_page):
+                page = self.page()
+                self.addCleanup(page.close)
+                # Use the two production layouts: server dims the row; users
+                # dims only the information panel. Keep another row's editor.
+                page.evaluate("""users => {
+                    const row = document.querySelector('[data-client-id="p1"]');
+                    row.innerHTML = `<div class="client-info"><div class="client-meta"></div></div>
+                        <button class="peer-toggle" onclick="PeerQueue.enqueue({serverId:1,protocol:'awg',clientId:'p1',action:'disable'})">toggle</button>`;
+                    (users ? row.querySelector('.client-info') : row).setAttribute('data-peer-opacity', '');
+                    document.querySelector('[data-client-id="p2"]').insertAdjacentHTML('beforeend', '<input class="rename-editor" value="draft">');
+                }""", users_page)
+                page.locator('.peer-toggle').click()
+                page.evaluate("PeerQueue.enqueue({serverId:1,protocol:'awg',clientId:'p2',action:'disable'})")
+                page.evaluate('requests[0].resolve({status:"success",enabled:false})')
+                page.wait_for_function('requests.length === 2')
+                button = page.locator('.peer-toggle')
+                self.assertIn('peer-toggle-off', button.get_attribute('class'))
+                self.assertEqual(button.get_attribute('title'), 'start_peer_title')
+                self.assertEqual(page.locator('[data-peer-opacity]').evaluate('el => el.style.opacity'), '0.5')
+                self.assertEqual(page.locator('.rename-editor').input_value(), 'draft')
+                button.click()
+                page.evaluate('requests[1].resolve({status:"success",enabled:false})')
+                page.wait_for_function('requests.length === 3')
+                self.assertTrue(page.evaluate('requests[2].body.enable'))
+                page.evaluate('requests[2].resolve({status:"success",enabled:true})')
+                page.wait_for_function("!document.querySelector('.peer-toggle').classList.contains('peer-toggle-off')")
+                self.assertEqual(page.locator('[data-client-id="p1"] .peer-disabled-badge').count(), 0)
+                page.close()
+
+    def test_completed_delete_removes_only_its_row_while_next_task_runs(self):
+        page = self.page()
+        self.addCleanup(page.close)
+        page.evaluate("""() => {
+            PeerQueue.enqueue({serverId:1,protocol:'awg',clientId:'p1',action:'delete'});
+            PeerQueue.enqueue({serverId:1,protocol:'awg',clientId:'p2',action:'disable'});
+            requests[0].resolve({status:'success'});
+        }""")
+        page.wait_for_function('requests.length === 2')
+        self.assertEqual(page.locator('[data-client-id="p1"]').count(), 0)
+        self.assertEqual(page.locator('[data-client-id="p2"]').count(), 1)
+
     def test_one_request_at_a_time_fifo(self):
         page = self.page()
         page.evaluate("""

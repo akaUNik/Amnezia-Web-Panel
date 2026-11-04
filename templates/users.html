@@ -1169,7 +1169,7 @@
                 const serverLink = `/server/${sid}?protocol=${encodeURIComponent(proto)}&highlight=${encodeURIComponent(c.client_id)}`;
                 listEl.innerHTML += `
                     <div class="client-item" data-maxspeed="${maxSpeed}" data-server-id="${sid}" data-protocol="${escapeHtml(proto)}" data-client-id="${escapeHtml(c.client_id)}" data-peer-name="${escapeHtml(name)}">
-                        <div class="client-info" style="${disabledStyle}">
+                        <div class="client-info" data-peer-opacity style="${disabledStyle}">
                             <div class="client-avatar">${escapeHtml((name[0] || '🔗').toUpperCase())}</div>
                             <div>
                                 <div class="client-name">${escapeHtml(name)}${ip ? ` <span class="client-ip">${escapeHtml(ip)}</span>` : ''}</div>

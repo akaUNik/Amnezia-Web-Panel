@@ -5017,7 +5017,7 @@
                     if (isOnline) client._online = true;
                 }
 
-                if (!enabled) metaHtml += `<span class="badge badge-danger" style="font-size:0.65rem">${_('stop')}</span>`;
+                if (!enabled) metaHtml += `<span class="badge badge-danger peer-disabled-badge" style="font-size:0.65rem">${_('stop')}</span>`;
 
                 const disabledStyle = enabled ? '' : 'opacity:0.5;';
                 // 💡 is used for both states; the "off" look lives in CSS (.peer-toggle-off)
@@ -5028,7 +5028,7 @@
                 const canShowConfig = proto === 'xray' || true; // always show 📄 button
 
                 listEl.innerHTML += `
-                    <div class="client-item" style="${disabledStyle}" data-maxspeed="${maxSpeed}" data-assigned-user="${client.assigned_user_id || ''}" data-server-id="${SERVER_ID}" data-protocol="${escapeHtml(proto)}" data-client-id="${escapeHtml(client.clientId).replace(/"/g, '&quot;')}" data-peer-name="${escapeHtml(name).replace(/"/g, '&quot;')}">
+                    <div class="client-item" data-peer-opacity style="${disabledStyle}" data-maxspeed="${maxSpeed}" data-assigned-user="${client.assigned_user_id || ''}" data-server-id="${SERVER_ID}" data-protocol="${escapeHtml(proto)}" data-client-id="${escapeHtml(client.clientId).replace(/"/g, '&quot;')}" data-peer-name="${escapeHtml(name).replace(/"/g, '&quot;')}">
                         <div class="client-info">
                             <div class="client-avatar${client._online ? ' avatar-online' : ''}">${initial}</div>
                             <div>
