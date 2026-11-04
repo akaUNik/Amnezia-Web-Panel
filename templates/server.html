@@ -2191,6 +2191,7 @@
                     document.getElementById('serverIpv6').style.display = 'none';
                 } else {
                     currentProtocolStatus = {};
+                    document.getElementById('statusBadges').innerHTML = '';
                     applyInstalledAppsVisibility();
                 }
                 showDashboardFreshness(kind, {observed_at: null, stale: false});

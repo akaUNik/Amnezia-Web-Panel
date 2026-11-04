@@ -95,6 +95,7 @@ class DashboardFreshnessBrowserTests(unittest.TestCase):
                     self.assertNotIn('Observed', page.locator('#statsFreshness').inner_text())
                     self.assertEqual(page.locator('#serverStats .stat-pill').count(), 0)
                     self.assertTrue(page.locator('#proto-awg2').is_hidden())
+                    self.assertEqual(page.locator('#statusBadges').inner_text(), '')
                     for route in held.values():
                         route.fulfill(status=500, json={'error': 'Synthetic failure'})
                     self.assertEqual(errors, [])
