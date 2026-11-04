@@ -449,7 +449,8 @@ class HTTPTests(StateFixture, unittest.TestCase):
         for role in [None, 'support', 'owner']:
             self.identity(role)
             result = self.client.post('/api/settings/backup/archive', headers=self.headers, json={})
-            self.assertEqual(result.status_code, 403)
+            # The owner fixture is disabled, so its session is invalid too.
+            self.assertEqual(result.status_code, 403 if role == 'support' else 401)
             self.assertIn('no-store', result.headers['cache-control'])
             self.assertNotIn('synthetic-sensitive-password', result.text)
             self.assertNotIn(str(self.root), result.text)

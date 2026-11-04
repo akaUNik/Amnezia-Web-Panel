@@ -798,7 +798,8 @@
     <div class="card card-hover protocol-card protocol-awg" id="proto-awg2">
         <div class="protocol-card-head">
             <div class="protocol-icon"><img src="/static/img/amnezia.svg" alt="AmneziaWG"></div>
-            <div class="protocol-name">{{ 'AmneziaWG 3 (amnezia-awg2)' if ((server.get('protocols') or {}).get('awg2') or {}).get('header_protection') else 'AmneziaWG 2.0' }}</div>
+            {% set awg2_info = (server.get('protocols') or {}).get('awg2') or {} %}
+            <div class="protocol-name">{{ protocol_display_name('awg2', awg2_info.get('header_protection'), awg2_info.get('protocol_version')) }}</div>
         </div>
         <div class="flex gap-sm protocol-ctrl" id="awg2-ctrl" style="display:none!important;"></div>
         <div class="protocol-desc">
@@ -2128,12 +2129,9 @@
         {{ proto|tojson }}: {{ info.get('custom_name')|tojson }},
         {%- endfor %}
     };
-    // AWG 3.x installed by the official Amnezia client lives in amnezia-awg2.
-    const AWG3_IN_AWG2 = {
-        {%- for proto, info in (server.get('protocols') or {}).items() if info.get('header_protection') %}
-        {{ proto|tojson }}: true,
-        {%- endfor %}
-    };
+    // Labels come from the shared Python helper; never infer versions in JS.
+    const PROTOCOL_LABELS = {{ server_protocol_names(server) | tojson }};
+    const DEFAULT_PROTOCOL_LABELS = {{ default_protocol_labels | tojson }};
     // Per-instance public address. Absent = the instance is reached at the
     // server's own address and its listen port.
     const PUBLIC_ENDPOINTS = {
@@ -2646,22 +2644,8 @@
         if (CUSTOM_PROTO_NAMES[proto]) return CUSTOM_PROTO_NAMES[proto];
         const base = protoBase(proto);
         const idx = protoInstance(proto);
-        let title;
-        switch (base) {
-            case 'awg': title = 'AmneziaWG'; break;
-            case 'awg2': title = AWG3_IN_AWG2[proto] ? 'AmneziaWG 3 (amnezia-awg2)' : 'AmneziaWG 2.0'; break;
-            case 'awg3': title = 'AmneziaWG 3.1'; break;
-            case 'awg_legacy': title = 'AmneziaWG Legacy'; break;
-            case 'xray': title = 'Xray'; break;
-            case 'telemt': title = 'Telemt'; break;
-            case 'wireguard': title = 'WireGuard'; break;
-            case 'dns': title = 'AmneziaDNS'; break;
-            case 'socks5': title = 'SOCKS5 Proxy'; break;
-            case 'adguard': title = 'AdGuard Home'; break;
-            case 'nginx': title = 'NGINX'; break;
-            case 'exit': title = 'Exit Node'; break;
-            default: title = proto;
-        }
+        if (PROTOCOL_LABELS[proto]) return PROTOCOL_LABELS[proto];
+        const title = DEFAULT_PROTOCOL_LABELS[base] || base;
         return idx > 1 ? `${title} #${idx}` : title;
     }
 
@@ -2687,11 +2671,13 @@
                 response => receiveDashboardMetadata('stats', response));
             const el = document.getElementById('serverStats');
             el.style.display = '';
+            const failed = stats.errors || {};
+            const percent = (field, value) => field in failed ? '—' : `${value || 0}%`;
             el.innerHTML = `
-                <span class="stat-pill" title="CPU">⚡ ${stats.cpu || 0}%</span>
-                <span class="stat-pill" title="RAM: ${formatBytes(stats.ram_used)} / ${formatBytes(stats.ram_total)}">🧠 ${stats.ram_percent || 0}%</span>
-                <span class="stat-pill" title="Disk: ${formatBytes(stats.disk_used)} / ${formatBytes(stats.disk_total)}">💾 ${stats.disk_percent || 0}%</span>
-                <span class="stat-pill" title="Network">🌐 ↓${formatBytes(stats.net_rx)} ↑${formatBytes(stats.net_tx)}</span>
+                <span class="stat-pill" title="CPU">⚡ ${percent('cpu', stats.cpu)}</span>
+                <span class="stat-pill" title="RAM: ${formatBytes(stats.ram_used)} / ${formatBytes(stats.ram_total)}">🧠 ${percent('ram', stats.ram_percent)}</span>
+                <span class="stat-pill" title="Disk: ${formatBytes(stats.disk_used)} / ${formatBytes(stats.disk_total)}">💾 ${percent('disk', stats.disk_percent)}</span>
+                <span class="stat-pill" title="Network">🌐 ${'network' in failed ? '—' : `↓${formatBytes(stats.net_rx)} ↑${formatBytes(stats.net_tx)}`}</span>
             `;
             const ipv6 = Array.isArray(stats.ipv6) ? stats.ipv6 : [];
             const ipv6El = document.getElementById('serverIpv6');
@@ -2976,14 +2962,15 @@
     function updateProtocolCard(proto, info) {
         ensureProtocolCard(proto);
         const protoKey = protoDomKey(proto);
-        if (protoBase(proto) === 'awg2' && 'header_protection' in info) {
-            if (info.header_protection) AWG3_IN_AWG2[proto] = true; else delete AWG3_IN_AWG2[proto];
-            const nameEl = document.querySelector(`#proto-${protoKey} .protocol-name`);
-            if (nameEl && !CUSTOM_PROTO_NAMES[proto]) {
-                const pencil = nameEl.querySelector('.proto-rename');
-                nameEl.textContent = getProtoTitle(proto);
-                if (pencil) nameEl.appendChild(pencil);
-            }
+        // Replace on every response, including downgrade/partial results.
+        // A missing label must not resurrect an old 3.1 label from this page.
+        delete PROTOCOL_LABELS[proto];
+        if (info.display_name) PROTOCOL_LABELS[proto] = info.display_name;
+        const cardNameEl = document.querySelector(`#proto-${protoKey} .protocol-name`);
+        if (cardNameEl && !CUSTOM_PROTO_NAMES[proto]) {
+            const pencil = cardNameEl.querySelector('.proto-rename');
+            cardNameEl.textContent = getProtoTitle(proto);
+            if (pencil) cardNameEl.appendChild(pencil);
         }
         const statusEl = document.getElementById(`${protoKey}-status`);
         const infoEl = document.getElementById(`${protoKey}-info`);
@@ -5041,7 +5028,7 @@
                 const canShowConfig = proto === 'xray' || true; // always show 📄 button
 
                 listEl.innerHTML += `
-                    <div class="client-item" style="${disabledStyle}" data-maxspeed="${maxSpeed}" data-assigned-user="${client.assigned_user_id || ''}">
+                    <div class="client-item" style="${disabledStyle}" data-maxspeed="${maxSpeed}" data-assigned-user="${client.assigned_user_id || ''}" data-server-id="${SERVER_ID}" data-protocol="${escapeHtml(proto)}" data-client-id="${escapeHtml(client.clientId).replace(/"/g, '&quot;')}" data-peer-name="${escapeHtml(name).replace(/"/g, '&quot;')}">
                         <div class="client-info">
                             <div class="client-avatar${client._online ? ' avatar-online' : ''}">${initial}</div>
                             <div>
@@ -5067,6 +5054,7 @@
             showToast(_('connections_load_error') + ': ' + err.message, 'error');
         } finally {
             window.connLoading = false;
+            PeerQueue.reapplyRowStates();
             highlightPeerFromQuery();
             // A switch or forced refresh was requested mid-flight: load the
             // currently selected protocol now, including after a rename save.
@@ -5219,33 +5207,21 @@
         }
     }
 
-    async function removeConnection(clientId, enabled) {
+    function peerRow(clientId, proto) {
+        return document.querySelector(
+            `.client-item[data-server-id="${SERVER_ID}"]` +
+            `[data-protocol="${CSS.escape(proto)}"]` +
+            `[data-client-id="${CSS.escape(String(clientId))}"]`);
+    }
+
+    function removeConnection(clientId, enabled) {
         if (!confirm(_('delete_connection_confirm'))) return;
         const proto = document.getElementById('connProtoSelect').value;
-        try {
-            await apiCall(`/api/servers/${SERVER_ID}/connections/remove`, 'POST', {
-                protocol: proto, client_id: clientId,
-            });
-            showToast(_('connection_deleted'), 'success');
-            loadConnections();
-        } catch (err) {
-            if (err.payload && err.payload.code === 'final_counter_read_failed' && err.payload.can_force) {
-                if (confirm(_('delete_unverified_confirm'))) {
-                    try {
-                        await apiCall(`/api/servers/${SERVER_ID}/connections/remove`, 'POST', {
-                            protocol: proto, client_id: clientId,
-                            allow_unverified: true,
-                        });
-                        showToast(_('connection_deleted'), 'success');
-                        loadConnections();
-                    } catch (retryErr) {
-                        showToast(_('error') + ': ' + retryErr.message, 'error');
-                    }
-                }
-                return;
-            }
-            showToast(_('error') + ': ' + err.message, 'error');
-        }
+        const row = peerRow(clientId, proto);
+        PeerQueue.enqueue({
+            serverId: SERVER_ID, protocol: proto, clientId: clientId,
+            peerName: row ? row.dataset.peerName : clientId, action: 'delete',
+        });
     }
 
     // Clear connection-flood (torrent) warnings history for a peer
@@ -5479,67 +5455,17 @@
         }
     }
 
-    async function toggleConnection(clientId, enable, btn) {
+    function toggleConnection(clientId, enable, btn) {
         const proto = document.getElementById('connProtoSelect').value;
-        // One toggle at a time across the whole instance: parallel toggles of
-        // DIFFERENT peers race the same server config file (each rewrites
-        // wg0.conf/awg0.conf wholesale) and trip the read-back verification.
-        if (window.peerToggling) {
-            showToast(_('conn_toggle_busy'), 'info');
-            return;
-        }
-        window.peerToggling = true;
-        const action = enable ? _('enable_connection_progress') : _('disable_connection_progress');
-        // Lock the whole client row and swap the bulb for a spinner until done
-        const row = btn ? btn.closest('.client-item') : null;
-        let originalContent = null;
-        if (row) {
-            row.classList.add('client-toggling');
-            row.querySelectorAll('button').forEach(b => b.disabled = true);
-        }
-        if (btn) {
-            originalContent = btn.innerHTML;
-            btn.innerHTML = '<span class="spinner"></span>';
-        }
-        const restore = () => {
-            if (row) {
-                row.classList.remove('client-toggling');
-                row.querySelectorAll('button').forEach(b => b.disabled = false);
-            }
-            if (btn && originalContent !== null) btn.innerHTML = originalContent;
-        };
-        try {
-            showToast(action, 'info');
-            await apiCall(`/api/servers/${SERVER_ID}/connections/toggle`, 'POST', {
-                protocol: proto, client_id: clientId, enable: enable,
-            });
-            showToast(enable ? _('connection_enabled') : _('connection_disabled'), 'success');
-            // Update just this row in place — no full list reload. The 5s
-            // poll reconciles speeds/badges anyway.
-            if (row && btn) {
-                row.style.opacity = enable ? '' : '0.5';
-                btn.classList.toggle('peer-toggle-off', !enable);
-                btn.title = enable ? _('stop') : _('starting');
-                btn.setAttribute('onclick', `toggleConnection('${escapeJs(clientId)}', ${!enable}, this)`);
-                const meta = row.querySelector('.client-meta');
-                if (meta) {
-                    const offBadge = meta.querySelector('.badge-danger');
-                    if (!enable && !offBadge) {
-                        meta.insertAdjacentHTML('afterbegin', `<span class="badge badge-danger" style="font-size:0.65rem">${_('stop')}</span>`);
-                    } else if (enable && offBadge) {
-                        offBadge.remove();
-                    }
-                }
-            }
-        } catch (err) {
-            showToast(_('error') + ': ' + err.message, 'error');
-        } finally {
-            window.peerToggling = false;
-            // Also on success: if loadConnections() fails the row it was
-            // supposed to rebuild would stay disabled with a spinning bulb.
-            restore();
-        }
+        const row = btn && btn.closest('.client-item');
+        PeerQueue.enqueue({
+            serverId: SERVER_ID, protocol: proto, clientId: clientId,
+            peerName: row ? row.dataset.peerName : clientId,
+            action: enable ? 'enable' : 'disable',
+        });
     }
+
+    window.peerQueueOnIdle = function () { loadConnections(); };
 
     // ========== Config Tabs ==========
     function switchConfigTab(tab) {
@@ -5977,21 +5903,15 @@
         fillEl.style.background = '';
         logEl.innerHTML = `<div class="log-line info">${_('install_starting')}</div>`;
         openModal('installModal');
-        const steps = [
-            { pct: 25, msg: _('rknblock_step_download') },
-            { pct: 45, msg: _('rknblock_step_sets') },
-            { pct: 65, msg: _('rknblock_step_rules') },
-            { pct: 85, msg: _('rknblock_step_agent') },
-        ];
-        let stepIdx = 0;
+        // The install is one long SSH call; its internals are not observable
+        // here. Do not invent per-stage progress, just say it takes a while.
+        logEl.innerHTML += `<div class="log-line info">${_('rknblock_install_wait')}</div>`;
+        logEl.scrollTop = logEl.scrollHeight;
+        let pct = 10;
         const progressInterval = setInterval(() => {
-            if (stepIdx < steps.length) {
-                fillEl.style.width = steps[stepIdx].pct + '%';
-                logEl.innerHTML += `<div class="log-line info">${steps[stepIdx].msg}</div>`;
-                logEl.scrollTop = logEl.scrollHeight;
-                stepIdx++;
-            }
-        }, 1500);
+            pct = Math.min(90, pct + 2);
+            fillEl.style.width = pct + '%';
+        }, 2000);
         try {
             await apiCall(`/api/servers/${SERVER_ID}/rknblock/install?server_uid=${encodeURIComponent(document.body.dataset.serverUid || '')}`, 'POST');
             rknBlockStatus = {installed: true, available: false, agent_state: 'unknown', running: false, healthy: false};

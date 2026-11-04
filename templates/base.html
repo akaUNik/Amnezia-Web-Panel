@@ -18,6 +18,7 @@
     <script>!function () { var t = localStorage.getItem('theme') || 'dark'; document.documentElement.setAttribute('data-theme', t); var m = document.querySelector('meta[name=theme-color]'); if (m) m.content = t === 'light' ? '#f5f5f7' : '#0a0a0f'; }()</script>
     <script src="/static/js/qrcode.min.js"></script>
     <script src="/static/js/searchable-select.js" defer></script>
+    <script src="/static/js/peer-queue.js" defer></script>
     {% block head_extra %}{% endblock %}
     <style>
         .lang-check {
@@ -313,7 +314,10 @@
 
             const res = await fetch(url, opts);
 
-            if (res.status === 401 || res.status === 403) {
+            // A forbidden optional feature is not an expired session. For
+            // example self-service may be disabled or a proxy may deny tunnels.
+            // Keep the page open and let the caller handle that 403 response.
+            if (res.status === 401) {
                 window.location.href = '/login';
                 throw new Error('Session expired');
             }

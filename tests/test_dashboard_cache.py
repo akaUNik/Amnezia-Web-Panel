@@ -2,7 +2,7 @@ import asyncio
 import json
 import unittest
 
-from dashboard_cache import DisplayCache, ObservationInvalidated, observation_key
+from dashboard_cache import DisplayCache, ObservationInvalidated, observation_key, projection
 
 
 class DisplayCacheTests(unittest.IsolatedAsyncioTestCase):
@@ -114,3 +114,9 @@ class DisplayCacheTests(unittest.IsolatedAsyncioTestCase):
     def test_identity_contains_no_raw_credentials(self):
         key = observation_key('state', {}, {'uid': 'uid', 'password': 'secret'})
         self.assertNotIn('secret', str(key))
+
+    def test_stats_projection_keeps_only_bounded_error_codes(self):
+        result = projection('stats', {'cpu': 0, 'errors': {
+            'cpu': 'unavailable', 'ram': 'private remote output',
+            'password': 'unavailable'}})
+        self.assertEqual(result, {'cpu': 0, 'errors': {'cpu': 'unavailable'}})

@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 from fastapi.responses import Response
 from starlette.requests import Request
 import app as panel
+from tests.test_host_stats_batch import batch_output, VALUES
 from dashboard_cache import DisplayCache, observation_key
 
 
@@ -23,11 +24,11 @@ class DashboardInvalidationTests(unittest.IsolatedAsyncioTestCase):
                 entered, release = threading.Event(), threading.Event()
                 cache = DisplayCache()
                 ssh = Mock()
-                def command(*args):
+                def command(command, **kwargs):
                     entered.set()
                     if not release.wait(3):
                         raise AssertionError('test barrier not released')
-                    return '__AWP_CPU__\n12.5\n', '', 0
+                    return batch_output(command, dict(VALUES, cpu='12.5')), '', 0
                 ssh.run_command.side_effect = command
                 with patch.object(panel, 'DATA_FILE', str(file)), \
                      patch.object(panel, 'DATA_LOCK', asyncio.Lock()), \

@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 import app as panel
+from tests.test_host_stats_batch import batch_output, VALUES
 from dashboard_cache import DisplayCache
 
 
@@ -29,7 +30,7 @@ class DashboardAPITests(unittest.TestCase):
         self.admin = self.stack.enter_context(patch.object(panel, '_check_admin', return_value=True))
         self.stack.enter_context(patch.object(panel, 'get_current_user', return_value={'id': 'admin', 'role': 'admin'}))
         self.ssh = Mock()
-        self.ssh.run_command.return_value = '__AWP_CPU__\n12.5\n', '', 0
+        self.ssh.run_command.side_effect = lambda command, **kw: (batch_output(command, dict(VALUES, cpu='12.5')), '', 0)
         self.get_ssh = self.stack.enter_context(patch.object(panel, 'get_ssh', return_value=self.ssh))
         self.client = TestClient(panel.app)
 
@@ -54,6 +55,18 @@ class DashboardAPITests(unittest.TestCase):
         self.assertEqual(self.client.post('/api/servers/0/stats').status_code, 403)
         self.assertEqual(self.client.post('/api/servers/0/check').status_code, 403)
         self.assertEqual(self.get_ssh.call_count, count)
+
+    def test_partial_stats_preserve_errors_through_cache(self):
+        self.ssh.run_command.side_effect = lambda command, **kw: (
+            batch_output(command).replace(':end:ram:0', ':end:ram:1'), '', 0)
+        response = self.client.post('/api/servers/0/stats')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['cpu'], 7.3)
+        self.assertEqual(response.json()['errors'], {'ram': 'probe_failed'})
+        self.assertEqual(response.headers['x-dashboard-stale'], '0')
+        self.assertEqual(self.client.post('/api/servers/0/stats').json(), response.json())
+        self.ssh.run_command.assert_called_once()
+        self.ssh.disconnect.assert_called_once()
 
     def test_status_html_is_safe_and_manual_check_always_live(self):
         status = {'connection': 'ok', 'docker_installed': True, 'protocols': {'awg2': {
