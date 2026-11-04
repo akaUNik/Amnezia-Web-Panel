@@ -42,6 +42,7 @@ class SudoPasswordLeakTests(unittest.TestCase):
             channel = Channel(output=b'')
             def execute(command):
                 channel.commands.append(command)
+                channel.expect_stdin = command.startswith('sudo ')
                 if command.startswith('mktemp -d '):
                     channel.output.extend(b'/tmp/amnezia-private.ABC123def0\n')
             channel.exec_command = execute

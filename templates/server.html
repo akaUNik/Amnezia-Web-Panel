@@ -2707,55 +2707,55 @@
     }
 
     function renderDashboardStatus(data) {
-    const statusDiv = document.getElementById('serverStatus');
-    const badges = document.getElementById('statusBadges');
-    statusDiv.classList.remove('hidden');
-    let html = '';
-    if (data.connection === 'ok') {
-        html += `<span class="badge badge-success"><span class="badge-dot"></span> ${_('ssh_ok')}</span>`;
-    }
-    if (data.docker_installed) {
-        html += `<span class="badge badge-success"><span class="badge-dot"></span> ${_('docker_ok')}</span>`;
-    } else {
-        html += `<span class="badge badge-warn"><span class="badge-dot"></span> ${_('docker_not_installed')}</span>`;
-    }
-    badges.innerHTML = html;
-    if (data.protocols) {
-        const protoSelect = document.getElementById('connProtoSelect');
-        const currentVal = protoSelect.value;
-        protoSelect.innerHTML = '';
-        let firstVal = null;
-
-        for (const [proto, info] of orderedProtocolEntries(data.protocols)) {
-            updateProtocolCard(proto, info);
-            const isVPN = ['awg', 'awg2', 'awg3', 'awg_legacy', 'xray', 'telemt', 'wireguard'].includes(protoBase(proto));
-            if (info.container_running && isVPN) {
-                const opt = document.createElement('option');
-                opt.value = proto;
-                opt.textContent = getProtoTitle(proto);
-                protoSelect.appendChild(opt);
-                if (!firstVal) firstVal = proto;
-            }
+        const statusDiv = document.getElementById('serverStatus');
+        const badges = document.getElementById('statusBadges');
+        statusDiv.classList.remove('hidden');
+        let html = '';
+        if (data.connection === 'ok') {
+            html += `<span class="badge badge-success"><span class="badge-dot"></span> ${_('ssh_ok')}</span>`;
         }
-
-        if (protoSelect.innerHTML === '') {
-            const opt = document.createElement('option');
-            opt.textContent = _('no_protocols');
-            opt.disabled = true;
-            protoSelect.appendChild(opt);
-            hideConnectionsSection();
+        if (data.docker_installed) {
+            html += `<span class="badge badge-success"><span class="badge-dot"></span> ${_('docker_ok')}</span>`;
         } else {
-            if (data.protocols[currentVal] && data.protocols[currentVal].container_running) {
-                protoSelect.value = currentVal;
-            } else if (firstVal) {
-                protoSelect.value = firstVal;
+            html += `<span class="badge badge-warn"><span class="badge-dot"></span> ${_('docker_not_installed')}</span>`;
+        }
+        badges.innerHTML = html;
+        if (data.protocols) {
+            const protoSelect = document.getElementById('connProtoSelect');
+            const currentVal = protoSelect.value;
+            protoSelect.innerHTML = '';
+            let firstVal = null;
+    
+            for (const [proto, info] of orderedProtocolEntries(data.protocols)) {
+                updateProtocolCard(proto, info);
+                const isVPN = ['awg', 'awg2', 'awg3', 'awg_legacy', 'xray', 'telemt', 'wireguard'].includes(protoBase(proto));
+                if (info.container_running && isVPN) {
+                    const opt = document.createElement('option');
+                    opt.value = proto;
+                    opt.textContent = getProtoTitle(proto);
+                    protoSelect.appendChild(opt);
+                    if (!firstVal) firstVal = proto;
+                }
             }
-            if (currentVal !== protoSelect.value || window.connRequestedProto !== protoSelect.value) {
-                loadConnections();
+    
+            if (protoSelect.innerHTML === '') {
+                const opt = document.createElement('option');
+                opt.textContent = _('no_protocols');
+                opt.disabled = true;
+                protoSelect.appendChild(opt);
+                hideConnectionsSection();
+            } else {
+                if (data.protocols[currentVal] && data.protocols[currentVal].container_running) {
+                    protoSelect.value = currentVal;
+                } else if (firstVal) {
+                    protoSelect.value = firstVal;
+                }
+                if (currentVal !== protoSelect.value || window.connRequestedProto !== protoSelect.value) {
+                    loadConnections();
+                }
             }
         }
-    }
-    updateStatusCounts(data.protocols || {});
+        updateStatusCounts(data.protocols || {});
     }
 
     // ========== Server Check ==========
