@@ -193,6 +193,8 @@
         .awg-progress-fill { transition: none; }
         .awg-progress-fill::after { animation: none; }
     }
+
+    #installLog .log-line { white-space: pre-wrap; overflow-wrap: anywhere; }
 </style>
 {% endblock %}
 
@@ -1580,14 +1582,17 @@
             <div class="modal-footer">
                 <button class="btn btn-secondary" onclick="closeModal('installModal')">{{ _('cancel') }}</button>
                 <button class="btn btn-primary" onclick="installProtocol()" id="installBtn">
-                    <span id="installBtnText">{{ _('install') }}</span>
-                    <div class="spinner hidden" id="installSpinner"></div>
+                    {{ _('install') }}
                 </button>
             </div>
         </div>
 
         <div id="installProgress" class="hidden">
-            <div class="progress-bar">
+            <div id="installWaiting" class="flex items-center gap-sm hidden" role="status">
+                <span class="loading-spinner" aria-hidden="true"></span>
+                {{ _('install_waiting') }}
+            </div>
+            <div class="progress-bar hidden" id="installProgressBar">
                 <div class="progress-fill" id="installProgressFill" style="width: 0%"></div>
             </div>
             <div class="log-output" id="installLog"></div>
@@ -2161,6 +2166,7 @@
         { id: 'web_servers', icon: '🌐', titleKey: 'web_servers' },
     ];
     let currentInstallProto = 'awg';
+    let installModalBusy = false;
     let currentInstallAnother = false;
     let currentConfig = '';
     let currentVpnLink = '';
@@ -3616,6 +3622,10 @@
     }
 
     function openInstallModal(proto, installAnother = false) {
+        if (installModalBusy) {
+            openModal('installModal');
+            return;
+        }
         const base = protoBase(proto);
         currentInstallProto = installAnother ? base : proto;
         currentInstallAnother = !!installAnother;
@@ -3717,64 +3727,19 @@
         openModal('installModal');
     }
 
-    // A network abort ("Failed to fetch") only says the browser-to-panel
-    // connection died — e.g. a from-scratch Xray build keeps the request
-    // busy for minutes and a proxy/VPN hop in between times out. The server
-    // side keeps installing; decide from the live status, not from the
-    // dead fetch.
-    function isNetworkAbort(err) {
-        return err instanceof TypeError || /Failed to fetch|NetworkError|Load failed/i.test(err && err.message || '');
-    }
-
-    // Poll /check until the just-installed protocol shows up on the server
-    // (or give up after ~10 minutes). Returns true when the install
-    // evidently completed despite the aborted fetch.
-    async function waitForInstallVisible(protocol, timeoutMs = 600000, intervalMs = 10000) {
-        const deadline = Date.now() + timeoutMs;
-        while (Date.now() < deadline) {
-            await new Promise(r => setTimeout(r, intervalMs));
-            try {
-                const data = await apiCall(dashboardURL('check'), 'POST', null,
-                    response => receiveDashboardMetadata('status', response));
-                const info = (data.protocols || {})[protocol];
-                if (info && (info.container_exists || info.installed)) return true;
-            } catch (_) { /* panel or network not reachable yet — keep polling */ }
-        }
-        return false;
-    }
-
     async function installProtocol() {
+        if (installModalBusy) return;
+        installModalBusy = true;
         const port = document.getElementById('installPort').value;
-        const btn = document.getElementById('installBtn');
-        const text = document.getElementById('installBtnText');
-        const spinner = document.getElementById('installSpinner');
-        btn.disabled = true;
-        text.textContent = _('installing');
-        spinner.classList.remove('hidden');
         document.getElementById('installForm').classList.add('hidden');
-        const progressDiv = document.getElementById('installProgress');
-        progressDiv.classList.remove('hidden');
+        document.getElementById('installProgress').classList.remove('hidden');
+        document.getElementById('installProgressBar').classList.add('hidden');
+        const waiting = document.getElementById('installWaiting');
+        waiting.classList.remove('hidden');
         const logEl = document.getElementById('installLog');
-        const fillEl = document.getElementById('installProgressFill');
-        logEl.innerHTML = `<div class="log-line info">${_('install_starting')}</div>`;
-        fillEl.style.width = '10%';
-        fillEl.style.background = '';
-        let progressInterval = null;
+        logEl.replaceChildren();
+        logEl.classList.add('hidden');
         try {
-            const progressSteps = [
-                { pct: 20, msg: _('check_docker') },
-                { pct: 40, msg: _('prepare_host') },
-                { pct: 50, msg: _('build_container') },
-            ];
-            let stepIdx = 0;
-            progressInterval = setInterval(() => {
-                if (stepIdx < progressSteps.length) {
-                    fillEl.style.width = progressSteps[stepIdx].pct + '%';
-                    logEl.innerHTML += `<div class="log-line info">${progressSteps[stepIdx].msg}</div>`;
-                    logEl.scrollTop = logEl.scrollHeight;
-                    stepIdx++;
-                }
-            }, 2000);
             const params = {
                 protocol: currentInstallProto, port: port, install_another: currentInstallAnother,
             };
@@ -3812,15 +3777,14 @@
                 }
             }
             const result = await apiCall(`/api/servers/${SERVER_ID}/install`, 'POST', params);
-            clearInterval(progressInterval);
-            fillEl.style.width = '100%';
-            if (result.log) {
+            if (result.log?.length) {
+                logEl.classList.remove('hidden');
                 result.log.forEach(line => {
-                    // Installers mark a line that succeeded with a caveat by
-                    // prefixing it with "!" - a green tick would hide it.
-                    logEl.innerHTML += line.startsWith('!')
-                        ? `<div class="log-line warning">⚠ ${line.slice(1).trim()}</div>`
-                        : `<div class="log-line success">✓ ${line}</div>`;
+                    const warning = line.startsWith('!');
+                    const entry = document.createElement('div');
+                    entry.className = warning ? 'log-line warning' : 'log-line success';
+                    entry.textContent = warning ? `⚠ ${line.slice(1).trim()}` : `✓ ${line}`;
+                    logEl.appendChild(entry);
                 });
             }
             logEl.scrollTop = logEl.scrollHeight;
@@ -3828,38 +3792,38 @@
             document.getElementById('installDone').style.display = '';
             setTimeout(() => checkServer(), 800);
         } catch (err) {
-            clearInterval(progressInterval);
-            fillEl.style.width = '100%';
-            // Connection died mid-install: the server side may still complete
-            // fine. Poll for the protocol instead of declaring failure.
-            if (isNetworkAbort(err)) {
-                const waitDiv = document.createElement('div');
-                waitDiv.className = 'log-line info';
-                waitDiv.textContent = `… ${_('install_conn_interrupted')}`;
-                logEl.appendChild(waitDiv);
-                logEl.scrollTop = logEl.scrollHeight;
-                if (await waitForInstallVisible(currentInstallProto)) {
-                    const okDiv = document.createElement('div');
-                    okDiv.className = 'log-line success';
-                    okDiv.textContent = `✓ ${_('install_success')}`;
-                    logEl.appendChild(okDiv);
-                    logEl.scrollTop = logEl.scrollHeight;
-                    showToast(_('install_success'), 'success');
-                    document.getElementById('installDone').style.display = '';
-                    setTimeout(() => checkServer(), 800);
-                    return;
-                }
+            logEl.classList.remove('hidden');
+            let message;
+            let tone = 'error';
+            switch (err.payload?.code) {
+                case 'peer_lifecycle_busy':
+                    message = _('install_lifecycle_busy');
+                    break;
+                case 'peer_lifecycle_uncertain':
+                    message = _('install_recovery_required');
+                    break;
+                case 'peer_lifecycle_still_running':
+                    message = _('install_still_running');
+                    tone = 'info';
+                    break;
+                default:
+                    if (err.status === 502 || err.status === 504 || err instanceof TypeError || err.name === 'AbortError') {
+                        message = _('install_outcome_unknown');
+                        tone = 'info';
+                    } else {
+                        message = _('install_error') + err.message;
+                    }
             }
-            fillEl.style.background = 'linear-gradient(135deg, #ef4444, #dc2626)';
-            // textContent, not innerHTML: build logs can contain sequences
-            // that parse as HTML and silently swallow the rest of the error.
-            const errDiv = document.createElement('div');
-            errDiv.className = 'log-line error';
-            errDiv.textContent = `✕ ${_('error')}: ${err.message}`;
-            logEl.appendChild(errDiv);
+            const line = document.createElement('div');
+            line.className = `log-line ${tone}`;
+            line.textContent = message;
+            logEl.appendChild(line);
             logEl.scrollTop = logEl.scrollHeight;
-            showToast(_('install_error') + err.message, 'error');
+            showToast(escapeHtml(message), tone);
             document.getElementById('installDone').style.display = '';
+        } finally {
+            waiting.classList.add('hidden');
+            installModalBusy = false;
         }
     }
 
@@ -5882,10 +5846,10 @@
         }
     }
 
-    // Host-level install with the same progress UX as protocol installs:
-    // the shared installModal switches to progress-only mode (form hidden).
+    // Host-level installs reuse the installation dialog.
     async function installRknBlock() {
-        if (rknBlockBusy || !rknBlockStatus || rknBlockStatus.available === false || rknBlockStatus.installed) return;
+        if (installModalBusy || rknBlockBusy || !rknBlockStatus || rknBlockStatus.available === false || rknBlockStatus.installed) return;
+        installModalBusy = true;
         rknBlockBusy = true;
         ++rknBlockLoadId;
         closeModal('marketplaceModal');
@@ -5897,7 +5861,9 @@
         document.getElementById('installDone').style.display = 'none';
         const progressDiv = document.getElementById('installProgress');
         progressDiv.classList.remove('hidden');
+        document.getElementById('installProgressBar').classList.remove('hidden');
         const logEl = document.getElementById('installLog');
+        logEl.classList.remove('hidden');
         const fillEl = document.getElementById('installProgressFill');
         fillEl.style.width = '10%';
         fillEl.style.background = '';
@@ -5937,6 +5903,7 @@
             showToast(_('error') + ': ' + (err.message || err), 'error');
             document.getElementById('installDone').style.display = '';
         } finally {
+            installModalBusy = false;
             rknBlockBusy = false;
             if (btn) btn.disabled = false;
         }

@@ -5046,7 +5046,7 @@ def api_used_ports(request: Request, server_id: int):
 
 
 @app.post('/api/servers/{server_id}/install', tags=["Protocols"])
-@serialize_peer_lifecycle
+@serialize_peer_lifecycle(wait_for_completion=True)
 async def api_install_protocol(request: Request, server_id: int, req: InstallProtocolRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)

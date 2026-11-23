@@ -106,10 +106,11 @@ class MarketplaceBrowserTests(unittest.TestCase):
             <div id="marketplaceContent"></div><button id="checkBtn"></button><span id="checkBtnText"></span><span id="checkSpinner"></span>
             <div id="serverStatus"></div><div id="statusBadges"></div><select id="connProtoSelect"></select>
             <div id="installModalTitle"></div><div id="installForm"></div><div id="installDone"></div><div id="installProgress"></div>
-            <div id="installLog"></div><div id="installProgressFill"></div>'''
+            <div id="installLog"></div><div id="installProgressBar"><div id="installProgressFill"></div></div>'''
         prelude = '''
 const SERVER_ID=0, calls=[], pending=[];
 let rknBlockStatus={installed:true,available:false,agent_state:'unknown',running:false,healthy:false}, rknBlockLoadId=0, rknBlockBusy=false;
+let installModalBusy=false;
 let smartRouteStatus=null, currentProtocolStatus={}, installedAppsLoading=false, checkGeneration=0;
 const dashboardTimers={}, showDashboardFreshness=()=>{}, receiveDashboardMetadata=()=>{};
 const dashboardURL=kind=>`/api/servers/${SERVER_ID}/${kind}`;
