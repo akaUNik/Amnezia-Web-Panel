@@ -3181,7 +3181,8 @@
             <div class="modal-footer">
                 <button class="btn btn-secondary" onclick="closeModal('installModal')">{{ _('cancel') }}</button>
                 <button class="btn btn-primary" onclick="installProtocol()" id="installBtn">
-                    {{ _('install') }}
+                    <span id="installBtnText">{{ _('install') }}</span>
+                    <span class="spinner hidden" id="installSpinner"></span>
                 </button>
             </div>
         </div>
@@ -6699,6 +6700,7 @@
             openModal('installModal');
             return;
         }
+        setInstallIpv6Pending(false);
         const base = protoBase(proto);
         currentInstallProto = installAnother ? base : proto;
         currentInstallAnother = !!installAnother;
@@ -7012,6 +7014,7 @@
             document.getElementById('installDone').style.display = '';
         } finally {
             pending = false;
+            spinner.classList.add('hidden');
             waiting.classList.add('hidden');
             installModalBusy = false;
         }
