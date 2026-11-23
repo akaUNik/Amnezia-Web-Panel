@@ -137,6 +137,7 @@ class ProtocolInstallBrowserTests(unittest.TestCase):
             ('first install', {}, False, None),
             ('reinstall', {'awg3': {'installed': True}}, False, 502),
             ('additional instance', {'awg3': {'installed': True}}, True, 504),
+            ('Cloudflare Quick Tunnel', {}, False, 524),
         )
         for mode, protocols, another, status in cases:
             with self.subTest(mode=mode, status=status):
@@ -149,6 +150,8 @@ class ProtocolInstallBrowserTests(unittest.TestCase):
                     self.installs[0].fulfill(status=status, content_type='text/html', body='<h1>Bad Gateway</h1>')
                 elif status == 504:
                     self.installs[0].fulfill(status=status, json={'error': 'Gateway Timeout'})
+                elif status == 524:
+                    self.installs[0].fulfill(status=status, content_type='text/html', body='<h1>A timeout occurred</h1>')
                 else:
                     self.installs[0].abort('connectionreset')
                 page.clock.run_for(11000)

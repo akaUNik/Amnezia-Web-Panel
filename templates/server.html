@@ -3807,7 +3807,7 @@
                     tone = 'info';
                     break;
                 default:
-                    if (err.status === 502 || err.status === 504 || err instanceof TypeError || err.name === 'AbortError') {
+                    if ([502, 504, 524].includes(err.status) || err instanceof TypeError || err.name === 'AbortError') {
                         message = _('install_outcome_unknown');
                         tone = 'info';
                     } else {
