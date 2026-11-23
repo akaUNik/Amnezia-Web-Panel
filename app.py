@@ -258,7 +258,7 @@ DATA_FILE = os.path.abspath(os.path.expanduser(
     os.environ.get('DATA_FILE') or os.path.join(application_path, 'data.json')
 ))
 ssh_trust.configure(DATA_FILE)
-CURRENT_VERSION = "v1.11.1"
+CURRENT_VERSION = "v1.11.2"
 
 # Custom protocol instance names: the rename modal caps input at 64 chars.
 CUSTOM_PROTOCOL_NAME_MAX = 64
@@ -5046,7 +5046,7 @@ def api_used_ports(request: Request, server_id: int):
 
 
 @app.post('/api/servers/{server_id}/install', tags=["Protocols"])
-@serialize_peer_lifecycle
+@serialize_peer_lifecycle(wait_for_completion=True)
 async def api_install_protocol(request: Request, server_id: int, req: InstallProtocolRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
