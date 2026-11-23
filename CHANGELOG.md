@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [1.11.2] - 2026-11-23
+
+### Fixed
+- Wait for protocol installation to finish and show when a proxy timeout leaves the outcome unknown (#40).
+- Reopen the active installation dialog when RKN Block is selected in the marketplace (#40).
+
 ## [1.11.1] - 2026-11-04
 
 ### Fixed
