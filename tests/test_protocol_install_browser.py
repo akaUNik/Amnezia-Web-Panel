@@ -63,6 +63,8 @@ class ProtocolInstallBrowserTests(unittest.TestCase):
                 route.fulfill(content_type='text/html', body=html.text)
             elif parsed.path == '/api/servers/0/install':
                 self.installs.append(route)
+            elif parsed.path == '/api/servers/0/rkn_scans':
+                route.fulfill(json={'installed': False, 'available': True})
             elif parsed.path == '/api/servers/0/check':
                 self.checks.append(route.request.method)
                 route.fulfill(json={'connection': 'ok', 'docker_installed': True,
@@ -104,6 +106,24 @@ class ProtocolInstallBrowserTests(unittest.TestCase):
         self.assertEqual(self.errors, [])
         self.installs[0].fulfill(json={'status': 'success', 'log': ['Interface verified']})
         expect(dialog.locator('#installDone')).to_be_visible()
+
+    def test_marketplace_rkn_click_reopens_active_protocol_install(self):
+        page = self.open_server()
+        rkn_requests = []
+        page.on('request', lambda req: rkn_requests.append(req) if '/rknblock/install' in req.url else None)
+        self.start_install(page)
+        dialog = page.locator('#installModal')
+        dialog.locator('.modal-close').click()
+        page.locator('#marketplaceBtn').click()
+        marketplace = page.locator('#marketplaceModal')
+        marketplace.locator('.marketplace-app-card').filter(has_text='RKN Block').get_by_role('button').click()
+        expect(marketplace).to_be_hidden()
+        expect(dialog.get_by_role('status')).to_be_visible()
+        expect(dialog.locator('#installModalTitle')).to_contain_text('AmneziaWG')
+        self.installs[0].fulfill(json={'status': 'success'})
+        expect(dialog.locator('#installDone')).to_be_visible()
+        self.assertEqual(len(self.installs), 1)
+        self.assertEqual(rkn_requests, [])
 
     def test_lifecycle_errors_and_installer_error_are_distinct(self):
         page = self.open_server()

@@ -5848,7 +5848,11 @@
 
     // Host-level installs reuse the installation dialog.
     async function installRknBlock() {
-        if (installModalBusy || rknBlockBusy || !rknBlockStatus || rknBlockStatus.available === false || rknBlockStatus.installed) return;
+        if (installModalBusy) {
+            openModal('installModal');
+            return;
+        }
+        if (rknBlockBusy || !rknBlockStatus || rknBlockStatus.available === false || rknBlockStatus.installed) return;
         installModalBusy = true;
         rknBlockBusy = true;
         ++rknBlockLoadId;
