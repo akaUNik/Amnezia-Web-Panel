@@ -40,7 +40,7 @@ class ServerStatsIpv6Tests(unittest.TestCase):
         self._data_file = panel.DATA_FILE
         panel.DATA_FILE = os.path.join(self.tmp, 'data.json')
         with open(panel.DATA_FILE, 'w', encoding='utf-8') as f:
-            json.dump({'servers': [server_with()], 'users': [], 'user_connections': []}, f)
+            json.dump({'servers': [server_with()], 'users': [{'id': 'admin-id', 'username': 'admin', 'password_hash': panel.hash_password('admin'), 'role': 'admin', 'enabled': True}], 'user_connections': []}, f)
         self._monitor_flag = panel._conn_monitor_started
         panel._conn_monitor_started = True
 
@@ -96,13 +96,19 @@ class ServerStatsIpv6Tests(unittest.TestCase):
         self.assertEqual(res.status_code, 200, res.text)
         self.assertEqual(res.json()['ipv6'], [])
 
-    def test_page_has_the_header_line_and_renders_it_only_with_data(self):
+    def test_page_shows_chips_from_ip_status_not_from_stats(self):
         page = open(os.path.join(os.path.dirname(panel.__file__),
                                  'templates', 'server.html'), encoding='utf-8').read()
-        self.assertIn('id="serverIpv6"', page)
-        self.assertIn("Array.isArray(stats.ipv6)", page)
-        self.assertIn("ipv6.join(' • ')", page)
-        self.assertIn("ipv6El.style.display = 'none'", page)
+        # The old duplicate `#serverIpv6` line is gone: IPv6 status has one
+        # source, the /ip-status endpoint.
+        self.assertNotIn('id="serverIpv6"', page)
+        self.assertNotIn("ipv6.join(' • ')", page)
+        self.assertIn('id="serverIpChips"', page)
+        self.assertIn('/ip-status', page)
+        self.assertIn('function renderIpChips', page)
+        self.assertIn('id="ipSettingsModal"', page)
+        # An old IPv4-only container is a fixable state, not a refusal.
+        self.assertIn("IP_AUTO_FIXABLE = new Set(['needs_recreate'])", page)
 
 
 if __name__ == '__main__':

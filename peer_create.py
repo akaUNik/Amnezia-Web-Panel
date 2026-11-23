@@ -90,10 +90,11 @@ def eligible(user):
 
 class PeerCreateService:
     def __init__(self, *, path, load_data, save_data, data_lock, get_ssh,
-                 get_manager, public_endpoint):
+                 get_manager, public_endpoint, warp_ctx=None):
         self.journal = CreateJournal(path)
         self.load_data, self.save_data, self.data_lock = load_data, save_data, data_lock
         self.get_ssh, self.get_manager, self.public_endpoint = get_ssh, get_manager, public_endpoint
+        self.warp_ctx = warp_ctx
         self.tasks = {}
         self.recovery_offset = 0
         self.recovery_task = None
@@ -112,7 +113,8 @@ class PeerCreateService:
         return self.recovery_task
 
     @serialize_peer_lifecycle
-    async def create(self, user_id, server_id, protocol, name, operation_id=None):
+    async def create(self, user_id, server_id, protocol, name, operation_id=None,
+                     expected_server_uid=None):
         if str(protocol).split('__', 1)[0] not in ('awg', 'awg2', 'awg3', 'awg_legacy'):
             raise PeerCreateError('Protocol has no inactive-create adapter', 409)
         # Read and persist the intent before even obtaining a pooled SSH client.
@@ -126,6 +128,10 @@ class PeerCreateService:
             server = data['servers'][server_id]
             if not server.get('uid'):
                 raise PeerCreateError('Server identity is not initialized', 409)
+            if expected_server_uid is not None and server['uid'] != expected_server_uid:
+                raise PeerCreateError('Server identity changed', 409)
+            if expected_server_uid is not None and protocol not in server.get('protocols', {}):
+                raise PeerCreateError('Protocol instance not found', 409)
             identity = [user_id, server['uid'], protocol, name]
             try:
                 op_id = str(uuid.UUID(operation_id)) if operation_id else str(
@@ -203,6 +209,7 @@ class PeerCreateService:
             manager = self.get_manager(ssh, protocol)
             host, public_port = self.public_endpoint(server, protocol)
             port = server['protocols'][protocol].get('port', '55424')
+            warp_ctx = self.warp_ctx(server, protocol) if self.warp_ctx else None
             if operation['phase'] in ('complete', 'blocked'):
                 # Replaying success must not re-create or re-enable a peer
                 # subsequently disabled/deleted by an administrator.
@@ -215,14 +222,19 @@ class PeerCreateService:
                                    for c in data.get('user_connections', []))
                 if operation['phase'] == 'blocked' or not retained:
                     raise PeerCreateError('Operation is blocked; no automatic activation', 409, op_id)
-                config = await asyncio.to_thread(manager.get_client_config, protocol,
-                    operation['public'], host, port, public_port=public_port)
+                config = await asyncio.to_thread(
+                    manager.get_client_config, protocol, operation['public'],
+                    host, port, public_port=public_port,
+                    **({'warp_ctx': warp_ctx} if self.warp_ctx else {}))
                 return {'status': 'success', 'operation_id': op_id,
                         'client_id': operation['public'], 'config': config}
             # Safe even if a previous call timed out after the remote rename:
             # same operation/keypair, and preparation never activates a peer.
-            result = await asyncio.to_thread(manager.prepare_client, protocol, op_id, name,
-                operation['private'], operation['public'], host, port, public_port=public_port)
+            result = await asyncio.to_thread(
+                manager.prepare_client, protocol, op_id, name,
+                operation['private'], operation['public'], host, port,
+                public_port=public_port,
+                **({'warp_ctx': warp_ctx} if self.warp_ctx else {}))
             if result.get('client_id') != operation['public']:
                 raise PeerCreateError('Prepared peer identity mismatch', 409, op_id)
             operation['phase'] = 'prepared'

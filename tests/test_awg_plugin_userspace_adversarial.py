@@ -131,7 +131,7 @@ def userspace_handler(*, containers=CONTAINERS, ports=PORTS, networks=None,
             return ('yes', '', 0)
 
         # Backup: docker cp <name>:/opt/amnezia /tmp/awg-plugin-backup-...
-        if command.startswith('docker cp ') and ':/opt/amnezia ' in command:
+        if command.startswith('docker cp ') and ':/tmp/awp-updater-warp-exclude.tgz ' in command:
             return ('', '', 0)
         # Restore: docker cp /tmp/awg-plugin-userspace.-.../. <name>:/opt/...
         if command.startswith('docker cp /tmp/awg-plugin-userspace.'):
@@ -228,7 +228,7 @@ class AllSucceedTests(_UserspaceAdversarialTest):
         # Even the last image must be built before the first mutable snapshot.
         last_build = max(i for i, c in enumerate(ssh.commands) if c.startswith('docker build'))
         first_backup = min(i for i, c in enumerate(ssh.commands)
-                           if c.startswith('docker cp ') and ':/opt/amnezia ' in c)
+                           if c.startswith('docker cp ') and ':/tmp/awp-updater-warp-exclude.tgz ' in c)
         self.assertLess(last_build, first_backup)
 
         # The tunnel check of the second container is the last verification
@@ -334,7 +334,9 @@ class NetworkTests(_UserspaceAdversarialTest):
 
         for name in CONTAINERS:
             run = _index(ssh.commands, '--name %s' % name)
-            restore = _index(ssh.commands, '. %s:/opt/amnezia/' % name)
+            restore = _index(
+                ssh.commands, '%s:/tmp/awp-restore.tgz' % name,
+            )
             dns = _index(
                 ssh.commands, 'docker network connect amnezia-dns-net %s' % name,
             )

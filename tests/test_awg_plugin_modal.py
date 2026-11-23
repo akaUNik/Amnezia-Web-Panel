@@ -10,9 +10,11 @@ class PluginModalTests(unittest.TestCase):
     def run_scenario(self, pending_response=False):
         source = (Path(__file__).parents[1] / 'templates/server.html').read_text()
         lifecycle = source[source.index('    function openAwgPluginModal()'):source.index('    function awgPluginElement(')]
-        polling = source[source.index('    async function pollAwgPluginUpdate('):source.index("    document.addEventListener('DOMContentLoaded', loadAwgPluginStatus);")]
+        polling = source[source.index('    async function pollAwgPluginUpdate('):source.index('    let installOp =')]
         script = r'''
 const assert = require('node:assert/strict');
+const xrayProtocols = [];
+const updateAwgPluginComponentLine = () => {};
 let seq = 0;
 const timers = new Map();
 const intervals = new Map();

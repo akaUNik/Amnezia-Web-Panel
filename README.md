@@ -97,6 +97,9 @@ Configuration panel for system parameters and preferences:
 *   **🤖 Telegram Bot Integration**:
     *   Notify users about new connections or limits.
     *   Integrated management via Telegram commands.
+    *   Start/Stop persists the bot's enabled state: enabled bots start again after a panel/container restart; manually stopped bots stay stopped. Saving other settings does not change this choice.
+    *   Temporary initialization failures retry after 5, 10, 20, 40, then 60 seconds (capped). Stop cancels pending retries; invalid tokens require correction and a new Start.
+    *   API clients should use `POST /api/settings/telegram/toggle` with `{"enabled": true}` or `{"enabled": false}`. Empty POSTs toggle saved intent for compatibility. The general settings save preserves the existing `telegram.enabled` value, even if an older client submits it.
     *   Admin-role workflows for managing servers, protocols, users, and connections directly from Telegram.
 *   **🔄 Built-in Update Checker**:
     *   View your current panel version directly in Settings.
@@ -111,6 +114,11 @@ Configuration panel for system parameters and preferences:
     *   SMTP is configured in `/settings` (host, port, none/STARTTLS/SSL, credentials, sender name and address, Reply-To, timeout) with a one-click test message. The stored password is never echoed back to the page: leaving the field empty on save keeps it.
     *   A mass send runs in the background over a single SMTP session and reports progress per user — sent, skipped (no address, disabled, no connections yet) or failed, with the reason next to each name. One unreachable node costs that one connection, not the message and not the run.
     *   Messages are text plus an HTML alternative dressed in the panel's own appearance (title, logo, colours) — no third-party branding anywhere.
+*   **🧭 Networks Outside the VPN (client-side split tunneling)**:
+    *   A list of IPv4 networks in `/settings` that clients reach through their own ISP instead of the tunnel. Every WireGuard / AmneziaWG config the panel hands out — download, `vpn://` key, share link, self-service page, Telegram bot, email — gets `AllowedIPs = 0.0.0.0/0` minus the list minus local ranges; `::/0` stays as it was. Servers are not touched, so configs issued earlier keep working next to regenerated ones.
+    *   Type the list, load it from a file (plain CIDRs, `a-b` ranges, AmneziaVPN site lists, ipset dumps, JSON), or press **Load Russian networks** to fetch the current list from RIPEstat (fallbacks: ipdeny.com, country-ip-blocks); the fetched list is saved and switched on at once.
+    *   **Shorten the list** is on by default. The full Russian list is ~8.7k networks, ~22k AllowedIPs entries; on Windows every entry becomes a route (plus a broadcast route Windows adds), connecting takes minutes and the Network List Service keeps a CPU core busy. The shortened list keeps /16-and-larger networks plus the networks of popular Russian services (~1.1k entries) and does not load the CPU; anything left out simply stays in the tunnel.
+    *   A hand-edited config keeps following the list as long as its AllowedIPs still contains `0.0.0.0/0`; a deliberately narrowed line is left alone. AmneziaVPN's own site-based split tunneling is disabled for such configs (it needs `0.0.0.0/0, ::/0`).
 
 *   **🔗 Public Sharing**:
     *   Generate password-protected links for users to download their configurations without panel access.
@@ -263,7 +271,9 @@ all checksums before running. See [CI, checksums, retries, and draft recovery](d
 
 The bundled `docker-compose.yml` sets `DATA_FILE=/app/data/data.json` so panel state lands on the
 `amnezia_data` volume and survives container rebuilds — see [Environment Variables](#-environment-variables)
-for the full list of knobs.
+for the full list of knobs. Where no persistent volume is available (for example Kubernetes with an
+`emptyDir`), `PANEL_STORAGE=s3` restores the folder holding `DATA_FILE` from an S3-compatible bucket at
+startup and keeps mirroring it back as encrypted snapshots — see [docs/S3_STORAGE.md](docs/S3_STORAGE.md).
 
 
 
@@ -277,10 +287,7 @@ response; the standard user-connection dialog retains it until success.
 
 
 ### Initial Login
-*   **Username**: `admin`
-*   **Password**: `admin`
-> [!IMPORTANT]  
-> Secure your panel by changing the default password in the **Users** section immediately after first login.
+On a fresh installation no account is created automatically. Open `/login`, choose a unique username and a password of at least 12 characters, and create the first administrator. The setup form disappears as soon as any user record exists; there is no default `admin/admin` account. Existing installations keep their current users and password hashes unchanged.
 
 ## 🧰 Environment Variables
 
@@ -291,9 +298,13 @@ next to `app.py`, or next to the executable in the standalone builds from *Insta
 | --- | --- | --- |
 | `SECRET_KEY` | random on each start | Key used to sign session cookies. Without it a fresh key is generated at every start, which logs all admins out on restart — set a long random value in production. |
 | `DATA_FILE` | `<app dir>/data.json` | Path to the JSON state file (servers, users, API tokens, settings). `~` is expanded and missing parent directories are created on first save. |
+| `PANEL_BIND_ALL_INTERFACES` | unset (`1` in bundled Compose) | Runtime override for `settings.ssl.bind_all_interfaces`, without rewriting `data.json`. `1`, `true`, `yes` or `on` binds `0.0.0.0`; `0`, `false`, `no`, `off` (and unrecognized values) binds `127.0.0.1`. When unset, the Settings-page checkbox controls binding. The bundled Compose files enable it by default so the published container port is reachable; set `PANEL_BIND_ALL_INTERFACES=0` in `.env` to force loopback. |
+| `CREDENTIAL_KEY_FILE` | `<DATA_FILE>.credential.key` | AES-256 key used to encrypt managed-server SSH passwords/private keys and recovery snapshots. It is created automatically on first migration, must be readable only by the panel user, and is required to decrypt state. The complete admin backup includes it for portability; protect that archive like a root password. |
 | `TUNNEL_STATE_FILE` | `<app dir>/tunnels_state.json` | Path where Cloudflare/ngrok tunnel runtime state (PID, public URL) is persisted between restarts. |
 | `TUNNEL_BIN_DIR` | `<app dir>/bin` | Directory holding the panel-managed `cloudflared` / `ngrok` binaries downloaded from the **Settings** page. |
 | `AWG_IPV6` | `auto` | Dual-stack policy for AWG tunnels: `auto` probes the host and the protocol container, `off` keeps every tunnel IPv4-only, `on` forces dual-stack. |
+| `PANEL_STORAGE` | `local` | Where the state directory (the folder holding `DATA_FILE`) is kept. `local` uses the disk only. `s3` restores the directory from an S3-compatible bucket before the panel reads it and mirrors it back as encrypted snapshots, for deployments without a persistent volume; it requires `DATA_FILE` to be set explicitly and the `PANEL_S3_*` variables below, and is not available in the standalone builds from *Installation Method 2*. |
+| `PANEL_S3_*` | unset | Bucket, endpoint, region, access keys, encryption key and sync timing for `PANEL_STORAGE=s3`. They are ignored in `local` mode and are documented in [docs/S3_STORAGE.md](docs/S3_STORAGE.md). |
 
 Two things that are deliberately *not* environment variables: the port the panel listens on and its SSL
 certificates, both configured in **Settings → SSL** and stored in the state file. For ngrok, the authtoken
@@ -325,6 +336,7 @@ Docker Compose additionally reads these from your shell or from an `.env` file n
 | --- | --- | --- |
 | `APP_PORT` | `5000` | Host port published for the panel container. |
 | `DATA_FILE` | `/app/data/data.json` | Forwarded into the container; keep it under `/app/data` so state stays on the `amnezia_data` volume. |
+| `PANEL_BIND_ALL_INTERFACES` | `1` | Forwarded into the container and enabled by default in both Compose files so `APP_PORT` is reachable from outside Docker. Set it to `0` in `.env` to override the published container back to `127.0.0.1` without editing `data.json`. |
 
 ## 🔧 Project Details
 
@@ -375,7 +387,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/jso
 ### Technology Stack
 *   **Backend**: FastAPI (Python), `asyncio` for concurrent SSH/probe work
 *   **Frontend**: Vanilla JS, Jinja2, Custom CSS (Glassmorphism, full set of CSS animations for promo blocks)
-*   **Database**: Local JSON storage (`data.json`, path overridable via the `DATA_FILE` environment variable) with an `asyncio.Lock` for thread-safe writes
+*   **Database**: Local JSON storage (`data.json`, path overridable via the `DATA_FILE` environment variable) with an `asyncio.Lock` for thread-safe writes; optionally mirrored to S3-compatible object storage via botocore with client-side AES-256-GCM (`PANEL_STORAGE=s3`)
 *   **SSH Engine**: Paramiko
 
 ### Project Structure
@@ -387,6 +399,7 @@ web-panel/
 ├── exit_failover.py          # Health, thresholds and failback policy (no SSH)
 ├── telegram_bot.py           # Optional Telegram bot integration
 ├── mail_service.py           # SMTP delivery of configs/links (single and bulk)
+├── panel_storage.py          # Optional S3 mirror of the state directory (PANEL_STORAGE=s3) + CLI
 ├── managers/                 # Protocol & service managers (one file per protocol)
 │   ├── ssh_manager.py        # SSH abstraction (Paramiko wrapper)
 │   ├── awg_manager.py        # AmneziaWG / AWG 2.0 / AWG Legacy
@@ -407,7 +420,7 @@ web-panel/
 ## 🛡 Security Recommendations
 
 *   **Reverse Proxy**: It is highly recommended to run the panel behind Nginx/Apache with an SSL certificate.
-*   **SSH Keys**: Use SSH keys rather than passwords for connecting to your VPN servers.
+*   **SSH Keys**: Use SSH keys rather than passwords for connecting to your VPN servers. Both SSH passwords and private keys are sealed with AES-256-GCM in `data.json`; legacy plaintext fields are migrated automatically. Keep `<DATA_FILE>.credential.key` private and back it up only through the admin-only complete archive (or copy it together with `data.json` for a manual migration). The legacy plaintext JSON download is disabled.
 *   **Secret Key**: Set a custom `SECRET_KEY` environment variable for secure session management (see [Environment Variables](#-environment-variables)).
 *   **IPv6**: if your servers have global IPv6 but Docker is IPv4-only, leave `AWG_IPV6` at `auto` — the panel probes the container and keeps tunnels IPv4-only rather than blackholing client IPv6. Set `AWG_IPV6=off` to disable dual-stack everywhere.
 *   **SMTP Password**: stored in `data.json` next to the other credentials. Use a mailbox dedicated to the panel (or an app password), not your personal account, and keep `data.json` readable only by the user the panel runs as.

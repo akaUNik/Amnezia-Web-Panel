@@ -85,15 +85,16 @@ class DashboardFreshnessBrowserTests(unittest.TestCase):
                     self.assertTrue(page.locator('#proto-awg2').is_visible())
                     check.fulfill(json=status, headers={'X-Dashboard-Observed-At': str(time.time()),
                         'X-Dashboard-Age-Seconds': '0', 'X-Dashboard-Ttl': '30', 'X-Dashboard-Stale': '0'})
-                    page.wait_for_function("!document.getElementById('checkBtn').disabled")
+                    page.wait_for_function("document.getElementById('serverStatus').getAttribute('aria-busy') !== 'true'")
                     self.assertEqual(page.locator('#statusFreshness').get_attribute('data-state'), 'fresh')
-                    page.locator('#checkBtn').click()
+                    page.locator('#managementBtn').click()
+                    page.locator('[data-server-management-action="check"]').click()
                     wait_request('check').fulfill(status=500, json={'error': 'Synthetic failure'})
                     page.wait_for_function("document.getElementById('statusFreshness').dataset.state === 'error'")
                     # Five-minute retention also applies to already-open pages.
                     page.clock.fast_forward(301000)
                     self.assertNotIn('Observed', page.locator('#statsFreshness').inner_text())
-                    self.assertEqual(page.locator('#serverStats .stat-pill').count(), 0)
+                    self.assertEqual(page.locator('#serverStatsBody .server-stat-row').count(), 0)
                     self.assertTrue(page.locator('#proto-awg2').is_hidden())
                     self.assertEqual(page.locator('#statusBadges').inner_text(), '')
                     for route in held.values():

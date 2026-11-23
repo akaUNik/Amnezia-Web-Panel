@@ -2,9 +2,12 @@ import os
 import copy
 import sys
 import json
+import copy as copy_module
 import logging
 import base64
 import hashlib
+import hmac
+import ipaddress
 import secrets
 import uuid
 import asyncio
@@ -17,6 +20,7 @@ import tempfile
 import subprocess
 import tarfile
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 import urllib.parse
 import urllib.request
@@ -34,37 +38,79 @@ from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi import FastAPI, Request, Query, UploadFile, File, Form
+from fastapi.exceptions import RequestValidationError
+from fastapi.exception_handlers import request_validation_exception_handler
+from starlette.datastructures import Headers, MutableHeaders
 from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel, Field, StrictBool, constr, conint
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 import uvicorn
 import httpx
-
+import cheburcheck
 try:
     from multicolorcaptcha import CaptchaGenerator
 except ImportError:
     CaptchaGenerator = None
 
 from dashboard_cache import display_cache, observation_key, ObservationInvalidated
-from managers.ssh_manager import SSHManager
+import public_port_forward
+from managers.ssh_manager import SSHManager, configure_jump_resolver
 from managers import ssh_trust
-from managers.awg_manager import AWGManager, normalize_special_junk
+from managers import split_tunnel
+from managers.awg_junk import (
+    DEVICE_PROFILES as AWG_I1_DEVICE_PROFILES,
+    catalog as awg_i1_catalog,
+    generate_i1 as awg_generate_i1,
+    is_valid_domain as awg_i1_is_valid_domain,
+    parse_i1 as awg_parse_i1,
+    pool_for as awg_i1_pool_for,
+)
+from managers.awg_manager import AWGManager, ICMP_ECHO_ALLOW_SCRIPT, normalize_special_junk
 from managers.awg_plugin_updater import (
     COMPONENTS as AWG_PLUGIN_COMPONENTS,
-    KERNEL_MODULE as AWG_PLUGIN_KERNEL,
-    USERSPACE as AWG_PLUGIN_USERSPACE,
     TOTAL_STEPS as AWG_PLUGIN_TOTAL_STEPS,
     AwgPluginUpdater,
     PluginUpdateError,
     stage_step as awg_plugin_stage_step,
 )
-from managers.xray_manager import XrayManager
+from managers.xray_manager import (
+    XrayManager,
+    XRAY_DEFAULT_FINGERPRINT,
+    XRAY_FINGERPRINTS,
+)
 from managers.wireguard_manager import WireGuardManager
 from managers.backup_manager import BackupManager
+from managers.torrent_guard import MODES as TORRENT_MODES
+from torrent_plugin_service import (
+    PluginError as TorrentPluginError,
+    TorrentPlugin,
+)
+from managers.instance_copy import (
+    COPY_STEPS as INSTANCE_COPY_STEPS,
+    CopyCancelled,
+    InstanceCopier,
+    InstanceCopyError,
+    proto_base as instance_copy_base,
+)
 import telegram_bot as tg_bot
 
 from exit_link_service import ExitLinkError, ExitLinkService
-from smartroute_service import SmartRouteError, SmartRouteService
+from smartroute_service import SmartRouteError, SmartRouteService, split_instances
+from warp_service import (
+    INSTANCE_STATES,
+    SrvWarpError,
+    WarpStateStore,
+    WARP_CLIENT_MTU_CAP,
+    WARP_REGISTER_LIMIT,
+    aggregate_state,
+    classify_instance_state,
+    proto_record,
+    quota_exhausted,
+    register_timestamps,
+    warp_ctx_for,
+    warp_link,
+)
+from warp_runtime import WarpRuntime
 from mail_service import (
     DEFAULT_MAIL_SETTINGS,
     MailError,
@@ -76,6 +122,7 @@ from protocol_names import protocol_display_name, server_protocol_names
 from pwa import build_manifest
 from project_info import UPDATE_SOURCE
 from captcha_challenges import captcha_challenges
+from credential_store import CredentialError, CredentialStore, default_key_path
 from user_state import reconcile_user_state, apply_traffic_samples, traffic_server_identity
 from connection_service import (
     ConnectionService,
@@ -85,6 +132,7 @@ from connection_service import (
     sanitize_allowed_protocols,
     self_service_protocol_choices,
 )
+import panel_storage
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -129,6 +177,21 @@ async def api_json_error_handler(request: Request, exc: Exception):
     if request.url.path.startswith('/api/'):
         return JSONResponse({'error': 'Internal server error'}, status_code=500)
     return PlainTextResponse('Internal Server Error', status_code=500)
+
+
+# IPv6 mutation endpoints document a 400 bad_request for a malformed body,
+# while every other endpoint keeps FastAPI's stock 422 detail array. Only
+# these paths are remapped; the body model lives in the handlers below.
+_IPV6_BAD_BODY_PATH = re.compile(
+    r'^/api/servers/[^/]+/(?:ipv6|docker/ipv6/apply|protocol/[^/]+/ipv6)$')
+
+
+@app.exception_handler(RequestValidationError)
+async def ipv6_validation_error_handler(request: Request, exc: RequestValidationError):
+    if _IPV6_BAD_BODY_PATH.match(request.url.path):
+        return JSONResponse({'error': 'bad_request', 'code': 'bad_request'},
+                            status_code=400)
+    return await request_validation_exception_handler(request, exc)
 
 
 @app.get("/redoc", include_in_schema=False)
@@ -217,14 +280,277 @@ async def api_auth_status_middleware(request, call_next):
             and not path.startswith(('/api/auth/', '/api/share/'))
             and not request.headers.get('authorization', '').lower().startswith('bearer ')
             and get_current_user(request) is None):
-        return JSONResponse({'error': 'Session expired'}, status_code=401,
-                            headers={'Cache-Control': 'no-store'})
+        normalized = JSONResponse({'error': 'Session expired'}, status_code=401,
+                                  headers={'Cache-Control': 'no-store'})
+        # Carry the denied response's headers over. The panel marks sensitive
+        # denials 'Cache-Control: no-store'; a bare 401 drops that and lets a
+        # shared cache keep the denial body. content-length/content-type are
+        # skipped because the body itself is replaced.
+        for key, value in response.headers.items():
+            if key.lower() not in ('content-length', 'content-type'):
+                normalized.headers[key] = value
+        return normalized
     return response
+
+
+# ---- Panel access control: IP allowlist + domain-only mode ----------------
+# Cached copy of settings.panel_access: the middleware runs on every request,
+# and re-reading data.json (hundreds of KB) per hit would be wasteful. The
+# cache is rebuilt on startup and right after the settings are saved.
+_PANEL_ACCESS = {
+    'ip_allowlist_enabled': False, 'ip_allowlist': [],
+    'domain_only': False, 'allowed_domain': '', 'fleet_ips': [],
+}
+
+
+def _refresh_panel_access(data=None):
+    global _PANEL_ACCESS
+    try:
+        doc = data if data is not None else load_data()
+    except Exception as exc:
+        logger.warning("Panel access cache refresh failed: %s", exc)
+        return
+    sec = ((doc.get('settings') or {}).get('panel_access') or {})
+    _PANEL_ACCESS = {
+        'ip_allowlist_enabled': bool(sec.get('ip_allowlist_enabled')),
+        'ip_allowlist': [str(e).strip() for e in (sec.get('ip_allowlist') or [])
+                         if str(e).strip()],
+        'domain_only': bool(sec.get('domain_only')),
+        'allowed_domain': str(sec.get('allowed_domain') or '').strip().lower(),
+        'fleet_ips': [str(s.get('host') or '').strip()
+                      for s in (doc.get('servers') or [])
+                      if str(s.get('host') or '').strip()],
+    }
+
+
+def _is_loopback_ip(value):
+    try:
+        return ipaddress.ip_address(str(value or '').strip()).is_loopback
+    except ValueError:
+        return False
+
+
+def _request_client_ip(request):
+    """Caller address. X-Forwarded-For is honoured only when the immediate
+    peer is loopback (a local reverse proxy); a public peer could forge it."""
+    peer = request.client.host if request.client else ''
+    forwarded = (request.headers.get('x-forwarded-for') or '').split(',')[0].strip()
+    if forwarded and _is_loopback_ip(peer):
+        return forwarded
+    return str(peer or '')
+
+
+def _host_header_name(value):
+    """Host header hostname without the port; IPv6 literals arrive bracketed."""
+    host = str(value or '').strip()
+    if host.startswith('['):
+        close = host.find(']')
+        return (host[1:close] if close != -1 else host[1:]).lower()
+    if ':' in host:
+        return host.rsplit(':', 1)[0].lower()
+    return host.lower()
+
+
+def _ip_allowed(client_ip, entries):
+    try:
+        addr = ipaddress.ip_address(str(client_ip).strip())
+    except ValueError:
+        return False
+    for entry in entries or []:
+        try:
+            net = ipaddress.ip_network(str(entry).strip(), strict=False)
+        except ValueError:
+            continue
+        if addr.version == net.version and addr in net:
+            return True
+    return False
+
+
+_PANEL_NOT_FOUND_BODY = (
+    b'<html>\r\n<head><title>404 Not Found</title></head>\r\n'
+    b'<body>\r\n<center><h1>404 Not Found</h1></center>\r\n'
+    b'<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n')
+
+
+def _panel_access_denied(kind):
+    """A stock 404 of a generic web server, for denied callers.
+
+    Nothing here may hint that a panel lives behind the address: body, status
+    and headers are what an empty nginx returns. Loopback and the allowed
+    hosts are the only callers that ever reach the real handlers.
+    """
+    response = HTMLResponse(content=_PANEL_NOT_FOUND_BODY, status_code=404)
+    response.headers['Server'] = 'nginx'
+    return response
+
+
+@app.middleware("http")
+async def panel_access_middleware(request, call_next):
+    """IP allowlist and domain-only mode from the global settings.
+
+    Registered after the other middlewares, so it runs first: a denied caller
+    never reaches auth, templates or static files. Loopback stays allowed so
+    the admin can always recover through an SSH tunnel; the managed fleet
+    hosts are allowed implicitly (data.json servers[].host).
+    """
+    access = _PANEL_ACCESS
+    if not access.get('ip_allowlist_enabled') and not access.get('domain_only'):
+        return await call_next(request)
+    client_ip = _request_client_ip(request)
+    loopback = _is_loopback_ip(client_ip)
+    if access.get('domain_only') and not loopback:
+        allowed = access.get('allowed_domain') or ''
+        host = _host_header_name(request.headers.get('host', ''))
+        if not allowed or (host != allowed and not host.endswith('.' + allowed)):
+            return _panel_access_denied('domain')
+    if access.get('ip_allowlist_enabled') and not loopback:
+        entries = list(access.get('ip_allowlist') or []) + list(access.get('fleet_ips') or [])
+        if not _ip_allowed(client_ip, entries):
+            return _panel_access_denied('ip')
+    return await call_next(request)
 
 
 # Sessions must wrap every other middleware: the auth middleware above
 # reads request.session, so SessionMiddleware has to sit outside it.
 app.add_middleware(SessionMiddleware, secret_key=os.environ.get('SECRET_KEY', secrets.token_hex(32)))
+# Публичный порт держит panel_front.py - это релей байтов, он ничего не
+# сжимает. Без gzip страница сервера уходит по проводу как есть: HTML
+# /server/N ~800 КБ (вместе со словарём локали), CodeMirror 170 КБ, CSS 90 КБ.
+# GZipMiddleware сжимает текстовые ответы; гейт ниже не даёт ему трогать
+# уже сжатые бинарные (PNG-капча, zip-архив бэкапа, иконки, шрифты).
+COMPRESS_SKIP_PATHS = ('/api/auth/captcha', '/api/settings/backup/archive')
+COMPRESS_SKIP_SUFFIXES = (
+    '/backups/download',
+    '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.svgz',
+    '.woff', '.woff2', '.ttf', '.zip', '.gz', '.tgz', '.bz2', '.xz',
+    '.7z', '.pdf', '.mp4', '.webm',
+)
+
+
+def _compression_skipped(scope):
+    """True for responses that must reach the client uncompressed."""
+    path = str(scope.get('path') or '').lower()
+    if path in COMPRESS_SKIP_PATHS:
+        return True
+    return path.endswith(COMPRESS_SKIP_SUFFIXES)
+
+
+class CompressionGate:
+    """Снимает Accept-Encoding с запросов к бинарным ответам.
+
+    Порядок важен: гейт добавляется последним, поэтому он внешний по
+    отношению к GZipMiddleware и видит запрос раньше него. Ответ без
+    Accept-Encoding middleware отдаёт как есть - без повторного gzip.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope['type'] == 'http' and _compression_skipped(scope):
+            scope = dict(scope, headers=[
+                (name, value) for name, value in scope['headers']
+                if name.lower() != b'accept-encoding'])
+        await self.app(scope, receive, send)
+
+
+class _GzipResponder:
+    """Потоковый gzip через zlib (заголовок gzip без mtime)."""
+
+    def __init__(self, app, minimum_size, compresslevel):
+        self.app = app
+        self.minimum_size = minimum_size
+        self.compresslevel = compresslevel
+        self.send = None
+        self.start = None
+        self.started = False
+        self.skip = False
+        self.passthrough = False
+        self.compressor = None
+
+    async def __call__(self, scope, receive, send):
+        self.send = send
+        await self.app(scope, receive, self.send_with_compression)
+
+    async def send_with_compression(self, message):
+        kind = message['type']
+        if kind == 'http.response.start':
+            headers = Headers(raw=message['headers'])
+            # Уже сжатое, поток событий и «пустые» статусы не трогаем.
+            self.skip = ('content-encoding' in headers
+                         or headers.get('content-type', '').startswith('text/event-stream')
+                         or message['status'] in (204, 304))
+            self.start = message
+            return
+        if kind != 'http.response.body':
+            await self.send(message)
+            return
+        if self.passthrough:
+            await self.send(message)
+            return
+        if self.started:
+            await self.send_body(message)
+            return
+        self.started = True
+        body = message.get('body', b'')
+        more = message.get('more_body', False)
+        if self.skip or (not more and len(body) < self.minimum_size):
+            self.passthrough = True
+            await self.send(self.start)
+            await self.send(message)
+            return
+        self.start_stream()
+        await self.send(self.start)
+        await self.send_body(message)
+
+    def start_stream(self):
+        headers = MutableHeaders(raw=self.start['headers'])
+        headers.add_vary_header('Accept-Encoding')
+        headers['Content-Encoding'] = 'gzip'
+        if 'content-length' in headers:
+            del headers['Content-Length']
+        # wbits=31 — gzip-обёртка zlib: заголовок с mtime=0, без обращения
+        # к системным часам (stock GZipMiddleware падает, если часы сдвинуты).
+        self.compressor = zlib.compressobj(
+            self.compresslevel, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+
+    async def send_body(self, message):
+        body = message.get('body', b'')
+        more = message.get('more_body', False)
+        out = self.compressor.compress(body) if body else b''
+        if not more:
+            out += self.compressor.flush()
+        await self.send({'type': 'http.response.body', 'body': out,
+                         'more_body': more})
+
+
+class TextGZipMiddleware:
+    """gzip для текстовых ответов без зависимости от системных часов.
+
+    Starlette'овский GZipMiddleware пишет в gzip-заголовок текущее время
+    (gzip.GzipFile по умолчанию), поэтому запрос при сдвинутых часах —
+    например, в тестах с `mock.patch(time.time)` — падает на struct.pack.
+    """
+
+    def __init__(self, app, minimum_size=1024, compresslevel=6):
+        self.app = app
+        self.minimum_size = minimum_size
+        self.compresslevel = compresslevel
+
+    async def __call__(self, scope, receive, send):
+        if scope['type'] != 'http':
+            await self.app(scope, receive, send)
+            return
+        headers = Headers(scope=scope)
+        if 'gzip' not in headers.get('accept-encoding', '').lower():
+            await self.app(scope, receive, send)
+            return
+        responder = _GzipResponder(self.app, self.minimum_size, self.compresslevel)
+        await responder(scope, receive, send)
+
+
+app.add_middleware(TextGZipMiddleware, minimum_size=1024, compresslevel=6)
+app.add_middleware(CompressionGate)
 
 class CachedStaticFiles(StaticFiles):
     """Static assets that carry ?v=<static mtime> (see static_version()) change
@@ -258,7 +584,14 @@ DATA_FILE = os.path.abspath(os.path.expanduser(
     os.environ.get('DATA_FILE') or os.path.join(application_path, 'data.json')
 ))
 ssh_trust.configure(DATA_FILE)
+# Client configs read the bypass list from whatever DATA_FILE is at call time.
+split_tunnel.configure(lambda: DATA_FILE)
 CURRENT_VERSION = "v1.11.2"
+
+# Authoritative operational state for WARP lives outside data.json: dozens of
+# panel writers save their own snapshots and would overwrite it.
+WARP_STATE_PATH = DATA_FILE + '.srv_warp_state.json'
+warp_state_store = WarpStateStore(WARP_STATE_PATH)
 
 # Custom protocol instance names: the rename modal caps input at 64 chars.
 CUSTOM_PROTOCOL_NAME_MAX = 64
@@ -314,22 +647,80 @@ load_translations()
 
 # Global lock for data.json access to prevent race conditions during async operations
 from peer_lifecycle_lock import serialize_peer_lifecycle
+from ipv6_operations import OperationStore
 import peer_lifecycle_lock
 from peer_accounting import guard_user_deletions, ownership_rows
 from peer_recovery import (RecoveryStore, RecoveryError, PanelLease, STATE_FILE_LOCK,
-                           GENERATION, digest as recovery_digest, orphan_scope, validate_backup)
+                           GENERATION, digest as recovery_digest, orphan_scope, validate_backup,
+                           migrate_recovery_snapshots)
 from peer_recovery import verify_awg_peer_absent, check_create_journal, require_repair_target, DISASTER_HOLD
 from peer_finalization import (
     FinalizationError,
     connection_scope,
     find_connection,
     read_peer_state,
+    apply_final_sample,
     finalize_connection_record,
     commit_finalize,
     make_intent,
 )
 
 peer_lifecycle_lock.configure(DATA_FILE)
+
+
+def _ssh_scope_for(server):
+    """Identity the lifecycle fence compares against (never credentials)."""
+    return {'server_uid': server.get('uid'),
+            'host': server.get('host'),
+            'ssh_port': server.get('ssh_port', 22),
+            'username': server.get('username')}
+
+
+def _lifecycle_identity_for(server_id):
+    """Identity of the server an endpoint targets, by inventory index.
+
+    Returning None makes the fence behave as global for that call: an endpoint
+    that cannot name its target is never assumed to be unaffected.
+    """
+    try:
+        data = load_data()
+        if not 0 <= int(server_id) < len(data.get('servers', [])):
+            return None
+        return _ssh_scope_for(data['servers'][int(server_id)])
+    except Exception:
+        logger.warning('Cannot resolve the lifecycle target %s', server_id, exc_info=True)
+        return None
+
+
+def _lifecycle_dependents(server_uid):
+    """Servers whose lifecycle operations touch this server (exit links).
+
+    A fence on an exit node also covers the entries linked to it, and a fence
+    on an entry covers its exit: relink/detach on either side rewrites the
+    other side's configuration.
+    """
+    try:
+        data = load_data()
+    except Exception:
+        return ()
+    uid = str(server_uid or '')
+    if not uid:
+        return ()
+    linked = set()
+    for server in data.get('servers', []):
+        own = str(server.get('uid') or '')
+        for record in (server.get('protocols') or {}).values():
+            exit_uid = str(((record or {}).get('exit_link') or {}).get('exit_uid') or '')
+            if not exit_uid:
+                continue
+            if exit_uid == uid and own and own != uid:
+                linked.add(own)
+            if own == uid:
+                linked.add(exit_uid)
+    return tuple(sorted(linked))
+
+
+peer_lifecycle_lock.configure_resolvers(_lifecycle_identity_for, _lifecycle_dependents)
 _panel_lease = None
 
 DATA_LOCK = asyncio.Lock()
@@ -343,6 +734,7 @@ SERVER_MUTATION_LOCK = asyncio.Lock()
 
 @app.on_event('shutdown')
 async def close_panel_lease():
+    await tg_bot.stop_bot()
     if _panel_lease is not None:
         _panel_lease.close()
 
@@ -359,6 +751,60 @@ async def lifecycle_uncertain_response(request, error):
                          'code': error.code}, status_code=503)
 
 
+# --- WARP: error mapping, in-memory job registry, sync state reads ----------
+
+WARP_TOS_VERSION = 1
+_WARP_JOBS = {}
+_WARP_JOBS_LOCK = threading.Lock()
+_WARP_TASKS = set()
+
+
+@app.exception_handler(SrvWarpError)
+async def warp_error_response(request, error):
+    """User-facing warp failure: stable code for the UI/i18n, not a generic 500."""
+    return JSONResponse({'error': error.code, 'code': error.code},
+                        status_code=error.http_status)
+
+
+def _warp_job_active(uid):
+    with _WARP_JOBS_LOCK:
+        return bool(_WARP_JOBS.get(str(uid)))
+
+
+def _warp_job_begin(uid, kind):
+    uid = str(uid)
+    with _WARP_JOBS_LOCK:
+        if _WARP_JOBS.get(uid):
+            raise SrvWarpError('srv_warp_job_busy', 409)
+        job_id = uuid.uuid4().hex
+        _WARP_JOBS[uid] = {'id': job_id, 'kind': kind, 'started': time.time()}
+    return job_id
+
+
+def _warp_job_end(uid, job_id):
+    uid = str(uid)
+    with _WARP_JOBS_LOCK:
+        record = _WARP_JOBS.get(uid)
+        if record and record.get('id') == job_id:
+            _WARP_JOBS.pop(uid, None)
+
+
+def srv_warp_ctx(server, protocol):
+    """Synchronous state read for handlers that cannot await."""
+    return warp_ctx_for(warp_state_store.load(), server.get('uid'), protocol)
+
+
+# ``proto_record`` is also a local variable name in some handlers, so the
+# helper is aliased for module-level calls from those scopes.
+warp_proto_record = proto_record
+
+
+def _credential_store():
+    # Resolve from the current DATA_FILE so tests and restored trees never use
+    # another installation's key by accident.
+    return CredentialStore(default_key_path(DATA_FILE))
+
+
 def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, 'r', encoding='utf-8') as f:
@@ -369,6 +815,8 @@ def load_data():
     data.setdefault('users', [])
     data.setdefault('user_connections', [])
     data.setdefault('api_tokens', [])
+    # Legacy users inherit the configured limit through ConnectionService.
+    # A read must not migrate unrelated users or persist defaults on denial.
     settings = data.setdefault('settings', {})
     settings.setdefault('appearance', {
         'title': 'Amnezia',
@@ -386,12 +834,24 @@ def load_data():
     })
     settings.setdefault('captcha', {'enabled': False})
     settings.setdefault('exit_nodes', {'default_exit_uid': ''})
-    settings.setdefault('telegram', {'token': '', 'enabled': False})
+    settings.setdefault('ssh_jump', {'jump_host_uid': ''})
+    telegram_settings = settings.setdefault('telegram', {'token': '', 'enabled': False})
+    if not isinstance(telegram_settings, dict):
+        telegram_settings = settings['telegram'] = {'token': '', 'enabled': False}
+    telegram_settings.setdefault('auto_create_users', False)
+    telegram_settings.setdefault('create_users_disabled', False)
+    telegram_settings.setdefault('webapp_initdata_auth', False)
     mail = settings.setdefault('mail', dict(DEFAULT_MAIL_SETTINGS))
     for key, value in DEFAULT_MAIL_SETTINGS.items():
         mail.setdefault(key, value)
-    settings.setdefault('ssl', {
+    # Imported here so isolated handler/AST tests can run load_data on its own.
+    from managers.split_tunnel import default_settings as split_tunnel_defaults
+    bypass = settings.setdefault('split_tunnel', split_tunnel_defaults())
+    for key, value in split_tunnel_defaults().items():
+        bypass.setdefault(key, value)
+    ssl_settings = settings.setdefault('ssl', {
         'enabled': False,
+        'bind_all_interfaces': False,
         'domain': '',
         'cert_path': '',
         'key_path': '',
@@ -399,6 +859,9 @@ def load_data():
         'key_text': '',
         'panel_port': 5000
     })
+    if not isinstance(ssl_settings, dict):
+        ssl_settings = settings['ssl'] = {}
+    ssl_settings.setdefault('bind_all_interfaces', False)
     settings.setdefault('auto_backup', {
         'enabled': False,
         'interval_hours': 24,
@@ -416,6 +879,15 @@ def load_data():
         # (server['rknblock']). The old flag is dropped so every server shows
         # "not installed" until the app is installed from the store.
         server.pop('rkn_block_enabled', None)
+    # Transparent upgrade: legacy plaintext SSH fields are sealed atomically on
+    # first read, then only the AES-GCM envelope is kept on disk.
+    needs_save = False
+    if any(isinstance(s, dict) and ('password' in s or 'private_key' in s)
+           for s in data.get('servers', [])):
+        from credential_store import CredentialStore, default_key_path
+        needs_save = CredentialStore(default_key_path(DATA_FILE)).seal_document(data) or needs_save
+    if needs_save:
+        save_data(data)
     return data
 
 
@@ -431,6 +903,10 @@ def save_data(data, _dashboard_observation=False):
             if generation and data.get(GENERATION) != generation:
                 raise RecoveryError('stale_snapshot_after_recovery')
         os.makedirs(os.path.dirname(DATA_FILE) or '.', exist_ok=True)
+        # Last line of defense for every writer (including Telegram/import):
+        # plaintext SSH credentials must never reach the JSON document.
+        from credential_store import CredentialStore, default_key_path
+        CredentialStore(default_key_path(DATA_FILE)).seal_document(data)
         atomic_json(DATA_FILE, data)
         if not _dashboard_observation:
             from dashboard_cache import display_cache
@@ -450,23 +926,80 @@ _SSH_POOL = {}
 _SSH_POOL_LOCK = threading.Lock()
 
 
+def _ssh_jump_server(data, target):
+    jump_uid = str(((data.get('settings', {}).get('ssh_jump') or {})
+                    .get('jump_host_uid') or '')).strip()
+    if not jump_uid or jump_uid == target.get('uid'):
+        return None
+    return next((server for server in data.get('servers', [])
+                 if server.get('uid') == jump_uid), None)
+
+
+def _ssh_manager_for(server, data, *, allow_jump=True):
+    jump = _ssh_jump_server(data, server) if allow_jump else None
+    jump_manager = (_ssh_manager_for(jump, data, allow_jump=False) if jump else None)
+    from credential_store import CredentialStore, default_key_path
+    password, private_key = CredentialStore(default_key_path(DATA_FILE)).resolve(server)
+    return SSHManager(
+        host=server['host'], port=server.get('ssh_port', 22),
+        username=server['username'], password=password,
+        private_key=private_key,
+        connect_cooldown_base=float(server.get('ssh_cooldown_base') or 30),
+        jump_manager=jump_manager,
+        server_scope=_ssh_scope_for(server),
+    )
+
+
+def _server_for_ssh_endpoint(data, host, port, username=''):
+    matches = [server for server in data.get('servers', [])
+               if server.get('host') == host
+               and int(server.get('ssh_port', 22)) == int(port)
+               and (not username or server.get('username') == username)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _resolve_ssh_jump_manager(host, port, username):
+    data = load_data()
+    target = _server_for_ssh_endpoint(data, host, port, username)
+    if target is None:
+        return None
+    jump = _ssh_jump_server(data, target)
+    return _ssh_manager_for(jump, data, allow_jump=False) if jump else None
+
+
+def _resolve_ssh_trust_jump(server):
+    data = load_data()
+    target = (next((item for item in data.get('servers', [])
+                    if server.get('uid') and item.get('uid') == server.get('uid')), None)
+              or _server_for_ssh_endpoint(
+                  data, server.get('host'), server.get('ssh_port', 22),
+                  server.get('username', '')))
+    if target is None:
+        return None
+    jump = _ssh_jump_server(data, target)
+    return _ssh_manager_for(jump, data, allow_jump=False) if jump else None
+
+
+configure_jump_resolver(_resolve_ssh_jump_manager)
+ssh_trust.configure_jump_resolver(_resolve_ssh_trust_jump)
+
+
 def get_ssh(server):
-    key = (server['host'], int(server.get('ssh_port', 22)), server['username'])
+    data = load_data()
+    jump = _ssh_jump_server(data, server)
+    jump_identity = ((jump.get('uid'), jump['host'], int(jump.get('ssh_port', 22)),
+                      jump['username']) if jump else None)
+    key = (server['host'], int(server.get('ssh_port', 22)), server['username'],
+           jump_identity)
     cooldown_base = float(server.get('ssh_cooldown_base') or 30)
     with _SSH_POOL_LOCK:
         ssh = _SSH_POOL.get(key)
         if ssh is None:
-            ssh = SSHManager(
-                host=server['host'],
-                port=server.get('ssh_port', 22),
-                username=server['username'],
-                password=server.get('password'),
-                private_key=server.get('private_key'),
-                connect_cooldown_base=cooldown_base,
-            )
+            ssh = _ssh_manager_for(server, data)
             _SSH_POOL[key] = ssh
         # Apply edits without dropping the pooled connection.
         ssh._connect_cooldown_base = cooldown_base
+        ssh.server_scope = _ssh_scope_for(server)
         ssh.pooled = True
     ssh.ensure_connected()
     return ssh
@@ -475,10 +1008,15 @@ def get_ssh(server):
 def drop_ssh(server):
     """Remove a server's pooled connection (on edit/delete) and close it."""
     display_cache.invalidate(DATA_FILE, server.get('uid'))
-    key = (server['host'], int(server.get('ssh_port', 22)), server['username'])
     with _SSH_POOL_LOCK:
-        ssh = _SSH_POOL.pop(key, None)
-    if ssh is not None:
+        removed = [ssh for key, ssh in list(_SSH_POOL.items())
+                   if key[:3] == (server['host'], int(server.get('ssh_port', 22)),
+                                  server['username'])]
+        for key in [key for key in list(_SSH_POOL)
+                    if key[:3] == (server['host'], int(server.get('ssh_port', 22)),
+                                   server['username'])]:
+            _SSH_POOL.pop(key, None)
+    for ssh in removed:
         try:
             ssh.force_disconnect()
         except Exception:
@@ -1137,7 +1675,7 @@ async def wait_for_tunnel_url(provider: str, seconds: int = 20):
     return get_tunnel_status(provider)
 
 
-BASE_PROTOCOLS = ['awg', 'awg2', 'awg3', 'awg_legacy', 'xray', 'telemt', 'dns', 'wireguard', 'socks5', 'adguard', 'nginx', 'exit']
+BASE_PROTOCOLS = ['awg', 'awg2', 'awg3', 'awg_legacy', 'xray', 'telemt', 'dns', 'wireguard', 'socks5', 'adguard', 'nginx', 'haproxy', 'exit']
 MULTI_INSTANCE_PROTOCOLS = {'awg', 'awg2', 'awg3', 'awg_legacy', 'xray', 'telemt', 'socks5'}
 
 
@@ -1221,6 +1759,7 @@ def protocol_container_name(protocol: str) -> Optional[str]:
         'socks5': 'amnezia-socks5proxy',
         'adguard': 'amnezia-adguard',
         'nginx': 'amnezia-nginx',
+        'haproxy': 'amnezia-haproxy',
         'exit': 'amnezia-exit',
     }
     name = base_names.get(base)
@@ -1256,6 +1795,9 @@ def get_protocol_manager(ssh, protocol: str):
     elif base == 'nginx':
         from managers.nginx_manager import NginxManager
         return NginxManager(ssh, protocol)
+    elif base == 'haproxy':
+        from managers.haproxy_manager import HaproxyManager
+        return HaproxyManager(ssh, protocol)
     elif base == 'exit':
         from managers.exit_manager import ExitManager
         return ExitManager(ssh, protocol)
@@ -1376,6 +1918,32 @@ def split_dns(dns):
     return parts[0], parts[1]
 
 
+def awg_i1_domain_from(domain, pool=None):
+    """Validate a masking domain; '' or None means "pick one at random".
+
+    A domain from the built-in catalog brings its own address pool. A custom
+    domain needs an explicit pool, otherwise the answer would pair a name with
+    an address from a foreign network - exactly the mismatch this feature is
+    meant to remove.
+    """
+    name = (domain or '').strip().lower()
+    if not name:
+        return None
+    if not awg_i1_is_valid_domain(name):
+        raise ValueError('domain must look like example.com: ASCII letters, '
+                         'digits and hyphens only, no scheme, no spaces')
+    pool_name = (pool or '').strip().lower()
+    if pool_name and awg_i1_pool_for(pool_name) is None:
+        raise ValueError(f'unknown address pool: {pool}')
+    if awg_i1_pool_for(name) is not None and pool_name and pool_name != name:
+        # The catalog already knows this domain's network; a different pool
+        # would silently produce a packet from a foreign network.
+        raise ValueError(f'{name} already has its own address pool')
+    if awg_i1_pool_for(name) is None and not pool_name:
+        raise ValueError('a custom domain needs an address pool')
+    return name
+
+
 def awg_special_junk_from(req):
     """Collect I1-I5 from a request, or None when the form sent none of them."""
     values = {key: getattr(req, f'awg_{key}', None) for key in ('i1', 'i2', 'i3', 'i4', 'i5')}
@@ -1416,6 +1984,7 @@ def protocol_short_name(protocol: str, header_protection=False, protocol_version
         'dns': 'DNS',
         'adguard': 'AdGuard',
         'nginx': 'NGINX',
+        'haproxy': 'HAProxy',
         'exit': 'Exit',
     }
     name = names.get(base, base.upper())
@@ -1528,6 +2097,20 @@ def build_xray_client_config(link):
             stream.setdefault('grpcSettings', {})['serviceName'] = query['serviceName']
         if 'mode' in query:
             stream.setdefault('grpcSettings', {})['multiMode'] = query['mode'] == 'multi'
+    elif network == 'xhttp':
+        settings = stream.setdefault('xhttpSettings', {})
+        if query.get('path', '/') != '/':
+            settings['path'] = query['path']
+        if 'host' in query:
+            settings['host'] = query['host']
+        if 'mode' in query:
+            settings['mode'] = query['mode']
+        if 'extra' in query:
+            # extra rides on the link as compact, percent-encoded JSON
+            try:
+                settings['extra'] = json.loads(query['extra'])
+            except ValueError:
+                pass
 
     security = query.get('security', 'none')
     tls_key = 'xtlsSettings' if security == 'xtls' else ('tlsSettings' if security == 'tls' else 'realitySettings')
@@ -1575,6 +2158,24 @@ def build_amnezia_xray_config(config_text, description):
         'description': description,
         'hostName': client_config['outbounds'][0]['settings']['vnext'][0]['address'],
     }
+
+
+def xray_stored_fingerprint(server, protocol):
+    """The Reality fingerprint the panel remembers for this xray connection
+    (a protocol record field in data.json), or None for the built-in default."""
+    if protocol_base(protocol) != 'xray':
+        return None
+    record = (server.get('protocols') or {}).get(protocol) or {}
+    fp = record.get('fingerprint')
+    return fp if fp in XRAY_FINGERPRINTS else None
+
+
+def xray_fp_kwargs(server, protocol):
+    """Keyword args carrying the stored fingerprint into XrayManager link
+    builders; empty for every other protocol so managers keep their signature."""
+    if protocol_base(protocol) != 'xray':
+        return {}
+    return {'fingerprint': xray_stored_fingerprint(server, protocol)}
 
 
 def build_amnezia_config(config_text, description):
@@ -1750,6 +2351,7 @@ peer_creates = PeerCreateService(
     data_lock=DATA_LOCK, get_ssh=lambda server: get_ssh(server),
     get_manager=lambda ssh, protocol: get_protocol_manager(ssh, protocol),
     public_endpoint=lambda server, protocol: protocol_public_endpoint(server, protocol),
+    warp_ctx=lambda server, protocol: srv_warp_ctx(server, protocol),
 )
 
 
@@ -1811,6 +2413,16 @@ smartroute_svc = SmartRouteService(
     protocol_base=protocol_base,
     awg_protocols=AWG_PROTOCOLS,
     apply_dns_via_exit=lambda sid, proto, en: exit_link_svc.set_dns_via_exit(sid, proto, en),
+)
+
+warp_runtime = WarpRuntime(
+    load_data=load_data,
+    save_data=save_data,
+    data_lock=DATA_LOCK,
+    get_ssh=lambda server: get_ssh(server),
+    awg_manager_factory=lambda ssh: AWGManager(ssh),
+    state_store=warp_state_store,
+    job_end=_warp_job_end,
 )
 
 
@@ -1895,7 +2507,7 @@ def verify_password(password: str, password_hash: str) -> bool:
     try:
         salt, h = password_hash.split('$', 1)
         new_h = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 100000)
-        return new_h.hex() == h
+        return secrets.compare_digest(new_h.hex(), h)
     except Exception:
         return False
 
@@ -2119,6 +2731,11 @@ async def perform_mass_operations(delete_uids: List[str] = None, toggle_uids: Li
                 
                 if c_req['protocol'] == 'wireguard':
                     res = await asyncio.to_thread(manager.add_client, c_req['name'], pub_host, public_port=pub_port)
+                elif protocol_base(c_req['protocol']) in AWG_PROTOCOLS:
+                    res = await asyncio.to_thread(
+                        _manager_call, manager, 'add_client', c_req['protocol'],
+                        c_req['name'], pub_host, port, public_port=pub_port,
+                        warp_ctx=srv_warp_ctx(srv, c_req['protocol']))
                 else:
                     res = await asyncio.to_thread(_manager_call, manager, 'add_client', c_req['protocol'], c_req['name'], pub_host, port, public_port=pub_port)
                 
@@ -2323,6 +2940,30 @@ def static_version():
     return str(int(newest))
 
 
+def cheburcheck_enabled(data=None):
+    """Master switch for the Cheburcheck feature.
+
+    Off by default: nothing (badges, header button, popup, background checks)
+    is rendered or started until an administrator turns it on.
+    """
+    if data is None:
+        data = load_data()
+    return bool((data.get('settings') or {}).get('cheburcheck', {}).get('enabled'))
+
+
+def _script_json(value):
+    """JSON для вставки в <script> как готовый JS-объект.
+
+    ensure_ascii=False почти вдвое уменьшает русскую и персидскую локаль
+    (escaped JSON: 290 КБ против 128 КБ). `</` экранируется, иначе перевод
+    с `</script>` закрыл бы тег раньше времени; U+2028/U+2029 в JS-строках
+    недопустимы, хотя в JSON валидны.
+    """
+    return (json.dumps(value, ensure_ascii=False)
+            .replace('</', '<\\/')
+            .replace('\u2028', '\\u2028')
+            .replace('\u2029', '\\u2029'))
+
 def tpl(request, template, **kwargs):
     data = load_data()
     lang = request.cookies.get('lang', 'en')
@@ -2341,13 +2982,22 @@ def tpl(request, template, **kwargs):
         'bot_running': tg_bot.is_running(),
         'lang': lang,
         '_': lambda text_id: _t(text_id, lang),
-        'translations_json': json.dumps(TRANSLATIONS.get(lang, TRANSLATIONS.get('en', {}))),
+        'translations_json': _script_json(TRANSLATIONS.get(lang, TRANSLATIONS.get('en', {}))),
         # The login page is the only public page; it must not dump the whole
         # UI dictionary (a feature showcase of the panel) into view-source.
-        'login_translations_json': json.dumps({
-            k: _t(k, lang) for k in ('login', 'logging_in', 'login_error')
+        'login_translations_json': _script_json({
+            k: _t(k, lang) for k in ('login', 'logging_in', 'login_error',
+                                     'setup_submit', 'setup_creating', 'setup_error',
+                                     'telegram_webapp_auth_invalid',
+                                     'telegram_webapp_account_not_found',
+                                     'telegram_webapp_auth_unavailable')
         }),
-        'all_translations_json': json.dumps(TRANSLATIONS)
+        'cheburcheck_enabled': cheburcheck_enabled(data),
+        'telegram_webapp_auth_enabled': bool(
+            data.get('users')
+            and (data.get('settings', {}).get('telegram') or {}).get('webapp_initdata_auth')
+            and (data.get('settings', {}).get('telegram') or {}).get('token')
+        ),
     }
     ctx.update(kwargs)
     return templates.TemplateResponse(template, ctx)
@@ -2381,10 +3031,20 @@ def service_worker():
 
 # ======================== Pydantic Models ========================
 
+class TelegramWebAppAuthRequest(BaseModel):
+    init_data: str = Field(..., min_length=1, max_length=16384)
+
+
 class LoginRequest(BaseModel):
     username: str
     password: str
     captcha: Optional[str] = None
+
+
+class InitialSetupRequest(BaseModel):
+    username: str
+    password: str
+    password_confirm: str
 
 
 class AddServerRequest(BaseModel):
@@ -2437,9 +3097,13 @@ class InstallProtocolRequest(BaseModel):
     # NGINX
     nginx_domain: Optional[str] = None
     nginx_email: Optional[str] = None
+    # Xray
+    xray_transport: Optional[str] = None  # 'tcp' (legacy) or 'xhttp'
+    xray_domain: Optional[str] = None     # optional SNI/domain; empty keeps the default
     # Exit node
     exit_subnet: Optional[str] = None       # transit subnet, default 10.9.0.0/24
     exit_obfuscation: Optional[bool] = None  # AmneziaWG obfuscation on the transit link
+    exit_awg3: Optional[bool] = None         # ...and use the AWG 3.1 key set
     # AmneziaWG: values that end up in the generated client configs
     awg_mtu: Optional[str] = None
     awg_dns1: Optional[str] = None
@@ -2450,6 +3114,10 @@ class InstallProtocolRequest(BaseModel):
     awg_i3: Optional[str] = None
     awg_i4: Optional[str] = None
     awg_i5: Optional[str] = None
+    # Masking domain for the generated I1; None/'' picks one at random, so an
+    # install that never opened the I1 block still gets its own packet.
+    awg_i1_domain: Optional[str] = None
+    awg_i1_pool: Optional[str] = None
 
 
 class AwgSettingsRequest(BaseModel):
@@ -2463,6 +3131,15 @@ class AwgSettingsRequest(BaseModel):
     i3: Optional[str] = None
     i4: Optional[str] = None
     i5: Optional[str] = None
+    # Regenerate I1 for a domain instead of pasting a literal packet.
+    i1_domain: Optional[str] = None
+    i1_pool: Optional[str] = None
+    regenerate_i1: Optional[bool] = None
+
+
+class I1PreviewRequest(BaseModel):
+    domain: Optional[str] = None
+    pool: Optional[str] = None
 
 
 class ExitPeerAddRequest(BaseModel):
@@ -2501,6 +3178,19 @@ class ExitFailoverRequest(BaseModel):
     probe_egress: Optional[bool] = None
 
 
+class SrvWarpRequest(BaseModel):
+    """Body shared by every /warp POST (query-equivalent server_uid)."""
+    server_uid: Optional[str] = None
+    protocol: Optional[str] = None
+    confirm_regen: Optional[bool] = False
+    accept_tos: Optional[bool] = False
+    force_register: Optional[bool] = False
+    primary_uid: Optional[str] = None
+    backup_uids: Optional[List[str]] = None
+    dns_on: Optional[bool] = None
+    enable: Optional[bool] = None
+
+
 class SmartRouteOwnSubnetsRequest(BaseModel):
     cidrs: list = []
 
@@ -2533,6 +3223,26 @@ class Socks5SettingsRequest(BaseModel):
 
 class ProtocolRequest(BaseModel):
     protocol: str = 'awg'
+
+
+class Ipv6PreferenceRequest(BaseModel):
+    """None = auto (legacy behaviour), True/False = explicit choice.
+
+    `object` instead of Optional[bool]: Pydantic would coerce "yes" to True
+    and answer 422 for junk. The endpoint validates the type and returns
+    400 bad_request itself.
+    """
+    enabled: object = None
+
+
+class InstanceIpv6Request(BaseModel):
+    enabled: bool
+    # Repair path: drop IPv6 on a broken exit link even when peers exist.
+    repair: bool = False
+
+
+class DockerIpv6ApplyRequest(BaseModel):
+    confirm: str = ''
 
 
 class ContainerToggleRequest(ProtocolRequest):
@@ -2588,6 +3298,7 @@ class EditConnectionRequest(BaseModel):
 
 
 class ConnectionActionRequest(BaseModel):
+    server_uid: Optional[str] = None
     protocol: str = 'awg'
     client_id: str = ''
     allow_unverified: bool = False
@@ -2606,6 +3317,19 @@ class ConnectionSpeedRequest(BaseModel):
     # Validate numeric bounds in the handler so non-standard JSON NaN/Infinity
     # also receive a JSON error without serializing the invalid number back.
     max_speed: float = Field(strict=True, description='Finite Mbit/s, 0..1000000 in steps of 0.1; 0 = unlimited')
+
+
+class XrayUpdateRequest(BaseModel):
+    protocol: str = 'xray'
+    # None/'' updates to the latest published release.
+    target: Optional[str] = None
+      
+      
+class XrayFingerprintRequest(BaseModel):
+    protocol: str = 'xray'
+    # None/'' resets to the built-in default (chrome).
+    fingerprint: Optional[str] = None
+
 
 class SaveConnectionConfigRequest(BaseModel):
     protocol: str = 'awg'
@@ -2640,6 +3364,7 @@ class AddUserRequest(BaseModel):
     telemt_secret: Optional[str] = None
     telemt_ad_tag: Optional[str] = None
     telemt_max_conns: Optional[int] = None
+    max_connections: int = Field(0, ge=0, le=100)
 
 
 
@@ -2656,6 +3381,11 @@ class NginxSiteSaveRequest(BaseModel):
 class BackupDownloadRequest(BaseModel):
     protocol: str
     filename: str
+
+
+class InstanceCopyRequest(BaseModel):
+    protocol: str
+    target_server_id: int
 
 
 class AppearanceSettings(BaseModel):
@@ -2677,8 +3407,13 @@ class CaptchaSettings(BaseModel):
     enabled: bool = False
 
 
+class SSHJumpSettings(BaseModel):
+    jump_host_uid: str = ''
+
+
 class SSLSettings(BaseModel):
     enabled: bool = False
+    bind_all_interfaces: bool = False
     domain: str = ''
     cert_path: str = ''
     key_path: str = ''
@@ -2692,9 +3427,16 @@ class DuckDNSApplyRequest(BaseModel):
     # Empty keeps the stored token: the settings page never echoes it back.
     token: str = ''
 
+class TelegramToggleRequest(BaseModel):
+    enabled: StrictBool
+
+
 class TelegramSettings(BaseModel):
     token: str = ''
     enabled: bool = False
+    auto_create_users: bool = False
+    create_users_disabled: bool = False
+    webapp_initdata_auth: bool = False
 
 
 class MailSettings(BaseModel):
@@ -2720,7 +3462,7 @@ class SelfServiceSettings(BaseModel):
     enabled: bool = False
     web_enabled: bool = True
     telegram_enabled: bool = True
-    max_connections_per_user: int = Field(5, ge=1, le=100)
+    max_connections_per_user: int = Field(5, ge=0, le=100)
     rate_limit_count: int = Field(3, ge=1, le=100)
     rate_limit_window_seconds: int = Field(60, ge=1, le=86400)
     allowed_protocols: List[str] = Field(default_factory=lambda: ['awg', 'awg2'])
@@ -2735,6 +3477,7 @@ class SelfServiceConnectionRequest(BaseModel):
 
 
 class UpdateUserRequest(BaseModel):
+    max_connections: Optional[int] = Field(None, ge=0, le=100)
     username: Optional[str] = None
     telegramId: Optional[str] = None
     email: Optional[str] = None
@@ -2750,16 +3493,25 @@ class ExitNodesSettings(BaseModel):
     default_exit_uid: str = ''
 
 
+class PanelAccessSettings(BaseModel):
+    ip_allowlist_enabled: bool = False
+    ip_allowlist: str = ''
+    domain_only: bool = False
+    allowed_domain: str = ''
+
+
 class SaveSettingsRequest(BaseModel):
     appearance: AppearanceSettings
     sync: SyncSettings
     captcha: CaptchaSettings
+    ssh_jump: SSHJumpSettings = SSHJumpSettings()
     telegram: TelegramSettings
     ssl: SSLSettings
     auto_backup: AutoBackupSettings = AutoBackupSettings()
     self_service: SelfServiceSettings = SelfServiceSettings()
     exit_nodes: ExitNodesSettings = ExitNodesSettings()
     mail: MailSettings = MailSettings()
+    panel_access: PanelAccessSettings = PanelAccessSettings()
 
 
 class ToggleUserRequest(BaseModel):
@@ -2778,6 +3530,7 @@ def _normalize_telegram_id(value):
 
 
 class AddUserConnectionRequest(BaseModel):
+    server_uid: Optional[str] = None
     server_id: int
     protocol: str = 'awg'
     name: str = 'VPN Connection'
@@ -2839,25 +3592,117 @@ class TunnelStartRequest(BaseModel):
 # conntrack summary), so detection works 24/7 without anyone watching the UI
 # and the 6s UI refresh only reads the small snapshot files.
 CONN_MONITOR_INTERVAL = 600
+SUBSCRIPTION_MONITOR_INTERVAL = 600
+_subscription_monitor_started = False
+
+
+
+# ===== Плагин «Защита от торрентов» =====
+# Фича живёт вне ядра: стор, настройки, статус и операции — в
+# torrent_plugin_service.py. Пока плагин не установлен на сервере, ядро не
+# рендерит его разметку, не отдаёт его роуты и не ходит на сервер по SSH.
+torrent_plugin = TorrentPlugin(lambda: DATA_FILE)
+
+
+def _torrent_prune_marks():
+    """Снимает просроченные метки; TTL и состав — по установленным серверам."""
+    try:
+        data = load_data()
+    except Exception as exc:                            # noqa: BLE001
+        logger.warning('torrent journal prune: %s', exc)
+        return 0
+    return torrent_plugin.prune(data.get('servers', []))
+
+
+def _conn_monitor_once(data):
+    """Один проход по всем инстансам: flood-статистика + торрент-фильтр.
+
+    Инстансы обходятся параллельно (4 потока): раньше зависшая нода съедала
+    до 300 с на протокол и остальные ноды всё это время не восстанавливали
+    правила после перезагрузки.
+
+    Flood-детект — ядровая функция и работает всегда. Торрент-ветка плагина
+    выполняется только для серверов, где плагин установлен: иначе панель
+    «без торрентов» всё равно ходила бы по SSH ради правил.
+    """
+    tasks = []
+    for server in data.get('servers', []):
+        installed = torrent_plugin.installed(server)
+        protocols = server.get('protocols') or {}
+        for proto in torrent_plugin.capable(server, True):
+            entry = protocols.get(proto)
+            if not isinstance(entry, dict) or entry.get('installed') is False:
+                continue
+            tasks.append((server, proto, installed))
+
+    def work(item):
+        server, proto, guard_on = item
+        try:
+            manager = get_protocol_manager(get_ssh(server), proto)
+            # Flood-мониторинг остаётся там же, где был: только AWG.
+            if proto.split('__', 1)[0] in ('awg', 'awg2', 'awg3'):
+                try:
+                    manager.collect_conn_stats(proto)
+                except Exception as e:                  # noqa: BLE001
+                    logger.warning(
+                        f"conn monitor: {server.get('host')} {proto}: {e}")
+            if not guard_on:
+                return
+            guard_factory = getattr(manager, 'torrent_guard', None)
+            if not callable(guard_factory):
+                return
+            result = torrent_plugin.collect(server, proto,
+                                            guard_factory(proto))
+            if result.get('error'):
+                logger.warning(
+                    f"torrent guard: {server.get('host')} {proto}: "
+                    f"{result['error']}")
+            elif result.get('events'):
+                torrent_plugin.record_events(
+                    server, proto, result['events'],
+                    lambda: _manager_call(manager, 'get_clients', proto))
+        except Exception as e:                          # noqa: BLE001
+            if guard_on:
+                torrent_plugin.set_health(server, proto, {'error': str(e)})
+            logger.warning(
+                f"conn monitor: {server.get('host')} {proto}: {e}")
+
+    if tasks:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(work, tasks))
+
+
+def _subscriptions_monitor_loop():
+    while True:
+        time.sleep(SUBSCRIPTION_MONITOR_INTERVAL)
+        try:
+            data = load_data()
+            if subscription_settings(data)['enabled']:
+                auto_push_subscriptions(data)
+        except Exception as e:
+            logger.warning(f"subscription monitor loop: {e}")
+
+
+def _start_subscriptions_monitor():
+    global _subscription_monitor_started
+    if _subscription_monitor_started:
+        return
+    _subscription_monitor_started = True
+    threading.Thread(target=_subscriptions_monitor_loop, daemon=True,
+                     name='subscriptions-monitor').start()
+    logger.info(f"Subscription monitor started (every {SUBSCRIPTION_MONITOR_INTERVAL}s)")
 
 
 def _conn_monitor_loop():
-    from managers.awg_manager import AWGManager
     while True:
         try:
-            data = load_data()
-            for server in data.get('servers', []):
-                protocols = server.get('protocols', {}) or {}
-                for proto in list(protocols):
-                    if protocol_base(proto) not in ('awg', 'awg2', 'awg3'):
-                        continue
-                    try:
-                        AWGManager(get_ssh(server)).collect_conn_stats(proto)
-                    except Exception as e:
-                        logger.warning(
-                            f"conn monitor: {server.get('host')} {proto}: {e}")
+            _conn_monitor_once(load_data())
         except Exception as e:
             logger.warning(f"conn monitor loop: {e}")
+        try:
+            _torrent_prune_marks()
+        except Exception as e:
+            logger.warning(f"torrent journal prune: {e}")
         time.sleep(CONN_MONITOR_INTERVAL)
 
 
@@ -2880,23 +3725,16 @@ async def startup():
     _panel_lease = PanelLease(DATA_FILE, runtime=True)
     _panel_lease.acquire()
     data = load_data()
+    _refresh_panel_access(data)
     if data.get(DISASTER_HOLD):
         raise RuntimeError('Disaster recovery requires independent node reconciliation before startup')
     _start_conn_monitor()
     _start_duckdns_monitor()
+    _start_subscriptions_monitor()
     changed = False
-    if not data.get('users'):
-        data['users'] = [{
-            'id': str(uuid.uuid4()),
-            'username': 'admin',
-            'password_hash': hash_password('admin'),
-            'role': 'admin',
-            'enabled': True,
-            'created_at': datetime.now().isoformat(),
-        }]
-        changed = True
-        logger.info("Default admin created (admin / admin)")
-    
+    # No fixed credentials are created. A fresh installation stays at the
+    # first-run setup form until an administrator is explicitly registered.
+
     # Migration for sharing fields and traffic reset strategy
     for u in data['users']:
         migrated = False
@@ -2962,22 +3800,58 @@ async def startup():
 
     if changed:
         save_data(data)
+    # Cheburcheck (block checks from Russia) settings.
+    # Only a real, name-keyed block is migrated here; missing keys are defaulted
+    # on read instead of written at startup, so a fresh install stays untouched
+    # until an administrator actually saves the settings.
+    if _cheburcheck_migrate_settings(data):
+        changed = True
+        logger.info('Cheburcheck: per-server flags moved from names to uids')
+
+    if migrate_recovery_snapshots(DATA_FILE):
+        logger.info('Encrypted legacy recovery snapshots')
+
+    # A Docker restart or a rebuild that was running when the panel died
+    # cannot be finished or verified: report it as interrupted.
+    try:
+        _op_store().mark_interrupted()
+    except Exception:
+        logger.warning("Could not mark stale IPv6 operations", exc_info=True)
 
     # Start periodic background tasks
+    try:
+        _cheburcheck_startup_cache(data)
+    except Exception:
+        logger.warning('Cheburcheck: cache load/migration failed', exc_info=True)
     asyncio.create_task(periodic_background_tasks())
     asyncio.create_task(exit_failover_background_loop())
+    asyncio.create_task(cheburcheck_background_loop())
 
     # Re-apply public-port forwards on the fleet: hand-made iptables rules do
     # not survive reboots on their own, and only some hosts persist them.
     asyncio.create_task(restore_public_port_forwards())
     # ... and keep re-applying: a VPS can reboot while the panel keeps running.
     asyncio.create_task(restore_public_port_forwards_loop())
+    # Smart Route lives in the container network namespace and is wiped by any
+    # container restart; the panel re-applies it instead of trusting the host
+    # timer to catch up "within an hour" (or never, if that timer is stuck).
+    asyncio.create_task(smartroute_reconcile_loop())
+    # One-shot: the timer unit of every existing installation carries the old
+    # monotonic schedule; rewrite it so the hourly re-apply stays armed.
+    asyncio.create_task(smartroute_timer_migration())
+    # One-shot: old RKN installs have no [Install] in the unit and lose their
+    # rules at reboot. Runs in the background, never blocks startup.
+    asyncio.create_task(rkn_boot_restore_migration())
+    # One-shot: older panels dropped ICMP echo-request on INPUT, which made
+    # hosts unpingable and hid tunnel ICMP. New installs are fixed; this
+    # clears the rule on hosts provisioned before the fix.
+    asyncio.create_task(icmp_echo_unblock_migration())
 
     # Start Telegram bot if enabled
     tg_cfg = data.get('settings', {}).get('telegram', {})
     if tg_cfg.get('enabled') and tg_cfg.get('token'):
         logger.info("Starting Telegram bot from saved settings...")
-        tg_bot.launch_bot(tg_cfg['token'], load_data, generate_vpn_link, save_data, self_service_svc=self_service_connections)
+        tg_bot.launch_bot(tg_cfg['token'], load_data, generate_vpn_link, save_data, self_service_svc=self_service_connections, credential_resolver=lambda server: _credential_store().resolve(server))
 
 
 def _auto_backup_due(auto_backup: dict, now: Optional[datetime] = None) -> bool:
@@ -3179,6 +4053,510 @@ async def sync_user_traffic_and_state():
             await asyncio.gather(*(perform_toggle_user({}, uid, False) for uid in pending))
 
 
+CHEBURCHECK_CACHE = {}                  # uid -> {target: record}
+CHEBURCHECK_CACHE_LOCK = asyncio.Lock()
+_CHEBURCHECK_TASK = None
+# server uid -> asyncio.Task for one-shot runs started from the UI
+_CHEBURCHECK_RUNNING = {}
+_CHEBURCHECK_SPACING = 13               # seconds between any two checks
+# Прогресс пакетного прогона для интерфейса настроек: сколько серверов уже
+# проверено из запущенных. Пишется только в _cheburcheck_run_batch.
+_CHEBURCHECK_PROGRESS = {'running': False, 'done': 0, 'total': 0, 'current': ''}
+
+# Client-facing protocols whose public endpoints are worth checking. Infrastructure
+# protocols (nginx/adguard/dns/exit, ...) never enter the automatic resolution.
+CHEBURCHECK_CLIENT_PROTOCOLS = ('awg', 'awg2', 'awg3', 'awg_legacy', 'xray',
+                                'wireguard', 'telemt', 'socks5')
+
+
+def _cheburcheck_cache_path():
+    # Resolved at call time: tests and operators repoint DATA_FILE.
+    return DATA_FILE + '.cheburcheck_cache.json'
+
+
+def _cheburcheck_legacy_path():
+    return os.path.join(os.path.dirname(DATA_FILE), 'state', 'cheburcheck.json')
+
+
+def _cheburcheck_normalize_targets(values):
+    """Validated, deduplicated, sorted target list. Raises ValueError."""
+    out = set()
+    for value in values:
+        host = normalize_public_host(value)
+        if not host:
+            raise ValueError('empty target')
+        out.add(host)
+    return sorted(out)
+
+
+def _cheburcheck_override(cfg, uid):
+    if uid is None:
+        return None
+    override = (cfg.get('targets') or {}).get(uid)
+    return list(override) if override else None
+
+
+def cheburcheck_targets(server, cfg=None):
+    """Addresses to check for one server.
+
+    Always includes the server's own (SSH) address and the public endpoint of
+    every installed client protocol instance. A per-server extra list adds
+    domains on top of that set; it does not replace it.
+    """
+    if cfg is None:
+        cfg = (load_data().get('settings') or {}).get('cheburcheck') or {}
+    out = set()
+    host = str(server.get('host') or '').strip()
+    if host:
+        out.add(host)
+    protocols = server.get('protocols')
+    if isinstance(protocols, dict):
+        for proto, record in protocols.items():
+            if not isinstance(record, dict):
+                continue
+            if not record.get('installed', True):
+                continue
+            if protocol_base(str(proto)) not in CHEBURCHECK_CLIENT_PROTOCOLS:
+                continue
+            target, _port = protocol_public_endpoint(server, proto)
+            target = str(target or '').strip()
+            if target:
+                out.add(target)
+    override = _cheburcheck_override(cfg, server.get('uid'))
+    if override:
+        try:
+            out.update(_cheburcheck_normalize_targets(override))
+        except ValueError as exc:
+            # A hand-edited data.json must not break the whole page/API.
+            logger.warning("Cheburcheck: ignoring invalid extra addresses for %s: %s",
+                           server.get('uid'), exc)
+    return sorted(out)
+
+
+def _cheburcheck_enabled_servers(cfg=None, require_master=True):
+    """Server dicts whose cheburcheck checkbox is on.
+
+    Keyed by server uid: renaming a server must not lose its setting.
+    """
+    data = load_data()
+    if cfg is None:
+        cfg = (data.get('settings') or {}).get('cheburcheck') or {}
+    if require_master and not cfg.get('enabled'):
+        return []
+    flags = cfg.get('servers') or {}
+    out = []
+    for srv in data.get('servers', []):
+        uid = srv.get('uid')
+        if uid is not None and flags.get(uid):
+            out.append(srv)
+    return out
+
+
+def _cheburcheck_reserve(uid):
+    """Atomically claim a server. Must run synchronously before create_task."""
+    if uid is None:
+        return True
+    if uid in _CHEBURCHECK_RUNNING:
+        return False
+    _CHEBURCHECK_RUNNING[uid] = None
+    return True
+
+
+def _cheburcheck_release(uid):
+    if uid is not None:
+        _CHEBURCHECK_RUNNING.pop(uid, None)
+
+
+async def _cheburcheck_wait_out_quiet_hours():
+    """Sleep while the quiet window is open.
+
+    Returns True when the loop should restart (settings changed or the window
+    is still open after one sleep chunk) and False when checks may run.
+    """
+    for _ in range(6):                      # 6 x 5 min = one chunk
+        cfg = (load_data().get('settings') or {}).get('cheburcheck') or {}
+        if not cfg.get('enabled'):
+            return True
+        if not cheburcheck.in_quiet_hours(cfg):
+            return False
+        await asyncio.sleep(300)
+    return True
+
+
+async def cheburcheck_background_loop():
+    """Periodically check servers enabled in settings.cheburcheck from Russia."""
+    await asyncio.sleep(120)
+    while True:
+        try:
+            data = load_data()
+            cfg = (data.get('settings') or {}).get('cheburcheck') or {}
+            if not cfg.get('enabled'):
+                await asyncio.sleep(300)
+                continue
+            interval = max(1, int(cfg.get('interval_hours') or 1)) * 3600
+            if await _cheburcheck_wait_out_quiet_hours():
+                continue        # the window just changed; re-read settings
+            for srv in _cheburcheck_enabled_servers(cfg):
+                targets = cheburcheck_targets(srv, cfg)
+                if not targets:
+                    continue
+                if not _cheburcheck_reserve(srv.get('uid')):
+                    continue
+                await _cheburcheck_run_server(srv, targets)
+                await asyncio.sleep(_CHEBURCHECK_SPACING)
+            await asyncio.sleep(interval)
+        except Exception as e:
+            logger.error(f"cheburcheck_background_loop error: {e}")
+            await asyncio.sleep(300)
+
+
+async def _cheburcheck_run_batch(prepared):
+    """Проверить зарезервированные серверы по очереди, ведя прогресс для UI.
+
+    ``prepared`` — список пар (srv, targets); uid уже зарезервирован
+    вызывающим кодом. Прогресс читается из /api/servers/cheburcheck_flags.
+    """
+    total = len(prepared)
+    _CHEBURCHECK_PROGRESS.update({'running': True, 'done': 0, 'total': total,
+                                  'current': ''})
+    try:
+        for index, (srv, targets) in enumerate(prepared):
+            _CHEBURCHECK_PROGRESS['current'] = srv.get('name') or ''
+            try:
+                await _cheburcheck_run_server(srv, targets)
+            except Exception as e:
+                # Один сбойный сервер не должен обрывать пакетный прогон.
+                logger.error(f"Cheburcheck batch failed for {srv.get('name')}: {e}")
+            finally:
+                # Счётчик растёт даже при ошибке: иначе прогресс застрянет.
+                _CHEBURCHECK_PROGRESS['done'] = index + 1
+            if index < total - 1:
+                await asyncio.sleep(_CHEBURCHECK_SPACING)
+    finally:
+        _CHEBURCHECK_PROGRESS.update({'running': False, 'current': ''})
+
+
+async def _cheburcheck_run_server(srv, targets):
+    """Check every target of one server sequentially.
+
+    The caller reserved the uid synchronously before starting this coroutine;
+    it only releases the reservation, so two tasks can never race for a server.
+    """
+    uid = srv.get('uid')
+    try:
+        for index, target in enumerate(targets):
+            try:
+                await _run_cheburcheck_one(srv, target, targets)
+            except Exception as e:
+                logger.error(f"Cheburcheck run failed for {srv.get('name')} "
+                             f"({target}): {e}")
+            if index < len(targets) - 1:
+                await asyncio.sleep(_CHEBURCHECK_SPACING)
+    finally:
+        _cheburcheck_release(uid)
+
+
+async def _run_cheburcheck_one(srv, target, targets=None):
+    """Check one target and always store a record, even when the check fails.
+
+    Without this a transient 429 leaves yesterday's verdict on screen and the
+    UI cannot tell "clean" from "check broken". `targets` is the server's full
+    resolved list as of the run start; it is passed to the persister so a
+    settings change mid-run cannot prune targets that are still being checked.
+    """
+    uid = srv.get('uid')
+    target = str(target or '').strip()
+    if not target:
+        # Runners never pass an empty target; readers synthesise the "" record
+        # (C2). The cache itself must not keep the service key (A4).
+        logger.warning("Cheburcheck: empty target for %s skipped", srv.get('name'))
+        return
+    logger.info(f"cheburcheck: {target} for {srv.get('name')} started")
+    error = None
+    static = None
+    try:
+        static = await cheburcheck.fetch_check(target)
+    except Exception as e:
+        error = f"check failed: {e}"
+    probe = None
+    if static and static.get('id'):
+        try:
+            # Сканеры cheburcheck требуют API-токен: берём его из настроек
+            # (в памяти процесса, не в логах) и передаём в модуль.
+            cfg = (load_data().get('settings') or {}).get('cheburcheck') or {}
+            cheburcheck.set_api_token(cfg.get('api_token'))
+            probe = await cheburcheck.fetch_probe(static['id'])
+        except cheburcheck.CheburcheckApiError as e:
+            # Человекочитаемый текст вместо «probe failed: HTTP 403».
+            error = e.user_message
+        except Exception as e:
+            error = f"probe failed: {e}"
+    # Режим проверки: без проб (нет токена, 429, сеть) доступны только списки.
+    online = (probe or {}).get('online_probes')
+    answered = int((probe or {}).get('response_count') or 0)
+    if static is None:
+        scan_mode = 'failed'
+    elif probe is None:
+        scan_mode = 'static_only'
+    elif online and answered < int(online):
+        scan_mode = 'partial'
+    else:
+        scan_mode = 'full'
+    summary = cheburcheck.build_summary(target, static, probe, error=error)
+    summary['scan_mode'] = scan_mode
+    async with CHEBURCHECK_CACHE_LOCK:
+        CHEBURCHECK_CACHE.setdefault(uid, {})[target] = summary
+    logger.info(f"cheburcheck: {target} for {srv.get('name')} finished "
+                f"({summary.get('status')})")
+    try:
+        _cheburcheck_persist(uid, targets)
+    except Exception as e:
+        logger.warning(f"Cheburcheck persist failed: {e}")
+
+
+def _cheburcheck_migrate_settings(data):
+    """Move settings.cheburcheck.servers from server names to uids."""
+    cfg = (data.get('settings') or {}).get('cheburcheck')
+    if not cfg:
+        return False
+    flags = cfg.get('servers') or {}
+    if not flags:
+        return False
+    by_name = {s.get('name'): s for s in data.get('servers', [])}
+    if all(k in [s.get('uid') for s in data.get('servers', [])] for k in flags):
+        return False            # already uid-keyed
+    changed = False
+    new_flags = {}
+    for key, value in flags.items():
+        srv = by_name.get(key)
+        if srv is not None:
+            new_flags[srv.get('uid')] = bool(value)
+            changed = True
+        # unknown names are dropped: the server is gone
+    cfg['servers'] = new_flags
+    return changed
+
+
+def _cheburcheck_startup_cache(data):
+    """Load the persisted cache at startup and migrate the legacy layout.
+
+    Records whose target changed stay until the next real check for that uid,
+    so the reader can still tell "target changed" from "not checked yet". A
+    consumed legacy file is always written back to the sibling path, otherwise
+    a restart before the next check would lose the cache.
+    """
+    had_legacy = os.path.exists(_cheburcheck_legacy_path())
+    # API-токен для сканеров: кладём в память модуля при старте, чтобы
+    # фоновый цикл и ручной запуск работали без открытия настроек.
+    cheburcheck.set_api_token(
+        ((data.get('settings') or {}).get('cheburcheck') or {}).get('api_token'))
+    loaded = _cheburcheck_load_cache()
+    uids = {s.get('uid') for s in data.get('servers', []) if s.get('uid')}
+    clean = {uid: records for uid, records in loaded.items()
+             if uid in uids and isinstance(records, dict)}
+    if len(clean) != len(loaded):
+        logger.info('Cheburcheck: dropped %d orphaned cache records' %
+                    (len(loaded) - len(clean)))
+    CHEBURCHECK_CACHE.update(clean)
+    if clean != loaded or had_legacy:
+        _cheburcheck_persist()
+
+
+def _cheburcheck_synthetic(target, error):
+    """Unsaved placeholder for a target that has no record yet (C2)."""
+    return {
+        'target': target,
+        'status': 'unknown',
+        'checked_at': None,
+        'error': error,
+        'static': {'blocked': False, 'blocked_subnets': [], 'cdn_providers': [],
+                   'geo': {}, 'whitelist': None, 'complaints_14d': 0,
+                   'reverse_lookup': []},
+        'probe': {'online_probes': None, 'response_count': 0,
+                  'verdict_counts': {}, 'blocking_regions': 0,
+                  'restricted_regions': 0, 'static_hit': False,
+                  'clear_regions': 0},
+        'partial': False,
+        # Записи ещё нет: режим проверки неизвестен (UI не показывает бейдж).
+        'scan_mode': None,
+    }
+
+
+def _cheburcheck_persist(uid=None, targets=None):
+    """Persist the cache atomically; prune targets outside `targets` for `uid`.
+
+    Pruning happens only when both the uid and its resolved targets are given,
+    so the startup write (no arguments) never drops records that C2 still
+    needs to tell "target changed" from "not checked yet".
+    """
+    if uid is not None and targets is not None:
+        entries = CHEBURCHECK_CACHE.get(uid)
+        if isinstance(entries, dict):
+            keep = set(targets)
+            for stale in [t for t in entries if t not in keep]:
+                entries.pop(stale, None)
+    tmp = _cheburcheck_cache_path() + '.tmp'
+    os.makedirs(os.path.dirname(_cheburcheck_cache_path()), exist_ok=True)
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(CHEBURCHECK_CACHE, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, _cheburcheck_cache_path())
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _cheburcheck_load_cache():
+    """Read the cache from the sibling file, migrating legacy layouts.
+
+    New file wins over `<data dir>/state/cheburcheck.json`. Both the legacy
+    flat ``{uid: record}`` shape and the nested one are accepted; a record
+    without a target is dropped (it cannot be matched to a resolved target).
+    """
+    source = None
+    cache_path = _cheburcheck_cache_path()
+    legacy_path = _cheburcheck_legacy_path()
+    raw = None
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, encoding='utf-8') as f:
+                raw = json.load(f)
+        except Exception:
+            logger.warning('Cheburcheck: sibling cache is corrupt, trying legacy',
+                           exc_info=True)
+            raw = None
+        if raw is not None:
+            source = cache_path
+    if raw is None and os.path.exists(legacy_path):
+        try:
+            with open(legacy_path, encoding='utf-8') as f:
+                raw = json.load(f)
+            source = legacy_path
+        except Exception:
+            logger.warning('Cheburcheck: legacy cache is corrupt, starting empty',
+                           exc_info=True)
+            return {}
+    if raw is None or not isinstance(raw, dict):
+        return {}
+    nested = {}
+    for uid, value in raw.items():
+        if not isinstance(value, dict):
+            continue
+        if 'target' in value and 'status' in value:
+            target = str(value.get('target') or '')
+            if target:
+                nested.setdefault(uid, {})[target] = value
+            else:
+                logger.info('Cheburcheck: dropped a cache record without target')
+            continue
+        nested[uid] = {}
+        dropped = 0
+        for target, rec in value.items():
+            if not isinstance(rec, dict) or not rec.get('target'):
+                dropped += 1
+                continue
+            nested[uid][str(target)] = rec
+        if dropped:
+            logger.info('Cheburcheck: dropped %d nested cache records without target',
+                        dropped)
+    if source == legacy_path:
+        try:
+            os.remove(legacy_path)
+        except OSError:
+            pass
+    elif os.path.exists(legacy_path):
+        # Sibling file is the source of truth; drop the migrated legacy copy.
+        try:
+            os.remove(legacy_path)
+        except OSError:
+            pass
+    return nested
+
+
+def _cheburcheck_records_for(server, cfg, cache):
+    """Per-target records for one server, with synthetic entries (C2)."""
+    uid = server.get('uid')
+    resolved = cheburcheck_targets(server, cfg)
+    stored = cache.get(uid) or {}
+    if not isinstance(stored, dict):
+        stored = {}
+    if not resolved:
+        return {'': _cheburcheck_synthetic('', 'no target configured')}
+    records = {}
+    for target in resolved:
+        record = stored.get(target)
+        if isinstance(record, dict):
+            records[target] = record
+        else:
+            error = ('target changed, re-check required' if stored
+                     else 'not checked yet')
+            records[target] = _cheburcheck_synthetic(target, error)
+    return records
+
+
+def _cheburcheck_aggregate(records):
+    """One summary for a server: worst verdict wins, probe counters sum up."""
+    if not records:
+        records = {'': _cheburcheck_synthetic('', 'no target configured')}
+    rank = {'banned': 3, 'unknown': 2, 'clean': 1}
+    statuses = [record.get('status') or 'unknown' for record in records.values()]
+    if 'banned' in statuses:
+        status = 'banned'
+    elif 'unknown' in statuses:
+        status = 'unknown'
+    else:
+        status = 'clean'
+    worst = sorted(records.items(),
+                   key=lambda item: (-rank.get(item[1].get('status'), 0), item[0]))[0]
+    blocking = sum(int((record.get('probe') or {}).get('blocking_regions') or 0)
+                   for record in records.values())
+    restricted = sum(int((record.get('probe') or {}).get('restricted_regions') or 0)
+                     for record in records.values())
+    clear = sum(int((record.get('probe') or {}).get('clear_regions') or 0)
+                for record in records.values())
+    response = sum(int((record.get('probe') or {}).get('response_count') or 0)
+                   for record in records.values())
+    errors = []
+    for record in records.values():
+        error = record.get('error')
+        if error and str(error) not in errors:
+            errors.append(str(error))
+    checked = [record.get('checked_at') for record in records.values()
+               if record.get('checked_at')]
+    static_hit = any(
+        bool((record.get('static') or {}).get('blocked'))
+        or bool((record.get('static') or {}).get('cdn_providers'))
+        for record in records.values())
+    # Режим агрегата: полный отчёт только если пробы отработали у всех целей.
+    modes = [record.get('scan_mode') or 'failed' for record in records.values()]
+    if all(mode == 'full' for mode in modes):
+        scan_mode = 'full'
+    elif all(mode == 'static_only' for mode in modes):
+        scan_mode = 'static_only'
+    elif all(mode == 'failed' for mode in modes):
+        scan_mode = 'failed'
+    else:
+        scan_mode = 'partial'
+    return {
+        'checked_at': max(checked) if checked else None,
+        'status': status,
+        'target': worst[0],
+        'static_hit': static_hit,
+        'scan_mode': scan_mode,
+        # A static list hit counts as one more remark beside the probe
+        # restrictions, so the card can show "замечания (N)".
+        'remarks': restricted + (1 if static_hit else 0),
+        'probe': {'response_count': response,
+                  'blocking_regions': blocking,
+                  'restricted_regions': restricted,
+                  'clear_regions': clear},
+        'error': '; '.join(errors) if errors else None,
+    }
+
+
 async def periodic_background_tasks():
     """Background task to sync traffic limits and Remnawave every 10 minutes"""
     while True:
@@ -3236,7 +4614,7 @@ async def exit_failover_background_loop():
 def login_page(request: Request):
     if get_current_user(request):
         return RedirectResponse(url='/', status_code=302)
-    return tpl(request, 'login.html')
+    return tpl(request, 'login.html', setup_required=not load_data().get('users'))
 
 
 @app.get("/set_lang/{lang}", tags=["System Templates"])
@@ -3277,7 +4655,14 @@ def index(request: Request):
     if user['role'] not in ('admin', 'support'):
         return RedirectResponse(url='/my', status_code=302)
     data = load_data()
-    return tpl(request, 'index.html', servers=data['servers'])
+    servers = data['servers']
+    # Плагин «Защита от торрентов»: плитки и опрос флагов рендерятся только
+    # для серверов, где он установлен. Нет ни одного — на странице нет ни
+    # разметки плиток, ни JS опроса.
+    return tpl(request, 'index.html', servers=servers,
+               torrent_plugin_any=torrent_plugin.installed_any(servers),
+               torrent_plugin_servers=[torrent_plugin.installed(server)
+                                       for server in servers])
 
 
 @app.get('/servers/new', response_class=HTMLResponse, tags=["System Templates"])
@@ -3312,6 +4697,8 @@ async def server_detail(request: Request, server_id: int):
                        if record.get('installed') and protocol_base(proto) in
                        ('awg', 'awg2', 'awg3', 'awg_legacy', 'wireguard', 'xray', 'telemt')]
     return tpl(request, 'server.html', server=server, server_id=server_id, users=users_list,
+               copy_targets=_instance_copy_targets(data, server_id),
+               torrent_plugin=torrent_plugin.status(server),
                saved_protocols=saved_protocols,
                dashboard_status=display_cache.peek('status', observation_key(DATA_FILE, data, server)))
 
@@ -3352,6 +4739,68 @@ def my_connections_page(request: Request):
 
 # ======================== AUTH API ========================
 
+def _same_origin_request(request):
+    headers = getattr(request, 'headers', {}) or {}
+    origin = headers.get('origin')
+    fetch_site = headers.get('sec-fetch-site')
+    base_url = str(getattr(request, 'base_url', '') or '')
+    if origin and fetch_site != 'same-origin' and \
+            origin.rstrip('/') != base_url.rstrip('/'):
+        return False
+    return fetch_site not in ('cross-site', 'same-site')
+
+
+@app.post('/api/auth/setup', tags=["Authentication"])
+async def api_initial_setup(request: Request, req: InitialSetupRequest):
+    """One-time creation of the first administrator; never a public signup."""
+    if not _same_origin_request(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    lang = request.cookies.get('lang', 'en')
+    username = req.username.strip()
+    if not username or len(username) > 64:
+        return JSONResponse({'error': _t('setup_username_invalid', lang)}, status_code=400)
+    if len(req.password) < 12 or len(req.password) > 256:
+        return JSONResponse({'error': _t('setup_password_short', lang)}, status_code=400)
+    if req.password != req.password_confirm:
+        return JSONResponse({'error': _t('setup_password_mismatch', lang)}, status_code=400)
+
+    password_hash = await asyncio.to_thread(hash_password, req.password)
+    async with DATA_LOCK:
+        data = load_data()
+        # Any existing record (including disabled/external/none) closes setup.
+        if data.get('users'):
+            return JSONResponse({'error': _t('setup_already_completed', lang)},
+                                status_code=409)
+        now = datetime.now().isoformat()
+        user = {
+            'id': str(uuid.uuid4()),
+            'username': username,
+            'password_hash': password_hash,
+            'role': 'admin',
+            'telegramId': None,
+            'email': None,
+            'description': '',
+            'traffic_limit': 0,
+            'traffic_reset_strategy': 'never',
+            'traffic_used': 0,
+            'traffic_total': 0,
+            'last_reset_at': now,
+            'expiration_date': None,
+            'enabled': True,
+            'created_at': now,
+            'remnawave_uuid': None,
+            'share_enabled': False,
+            'share_token': secrets.token_urlsafe(16),
+            'share_password_hash': None,
+        }
+        data['users'].append(user)
+        save_data(data)
+
+    request.session.clear()
+    request.session['user_id'] = user['id']
+    return JSONResponse({'status': 'success', 'role': 'admin'}, status_code=201)
+
+
 @app.get('/api/auth/captcha', tags=["Authentication"])
 def api_captcha(request: Request):
     if not CaptchaGenerator:
@@ -3369,6 +4818,82 @@ def api_captcha(request: Request):
     img_bytes.seek(0)
     
     return StreamingResponse(img_bytes, media_type="image/png")
+
+
+def _verify_telegram_webapp_init_data(init_data: str, bot_token: str, now: Optional[int] = None) -> dict:
+    """Validate Telegram Mini App initData and return its authenticated user."""
+    if not isinstance(init_data, str) or not init_data or len(init_data) > 16384:
+        raise ValueError('invalid_init_data')
+    try:
+        pairs = urllib.parse.parse_qsl(init_data, keep_blank_values=True, strict_parsing=True)
+    except (ValueError, UnicodeError):
+        raise ValueError('invalid_init_data')
+    values = {}
+    for key, value in pairs:
+        if key in values:
+            raise ValueError('invalid_init_data')
+        values[key] = value
+    received_hash = values.pop('hash', '')
+    if not re.fullmatch(r'[0-9a-fA-F]{64}', received_hash):
+        raise ValueError('invalid_init_data')
+    auth_date_raw = values.get('auth_date', '')
+    try:
+        auth_date = int(auth_date_raw)
+    except (TypeError, ValueError):
+        raise ValueError('invalid_init_data')
+    current_time = int(time.time()) if now is None else int(now)
+    if auth_date > current_time + 60 or current_time - auth_date > 86400:
+        raise ValueError('expired_init_data')
+    user_raw = values.get('user', '')
+    try:
+        telegram_user = json.loads(user_raw)
+    except (TypeError, ValueError):
+        raise ValueError('invalid_init_data')
+    if not isinstance(telegram_user, dict) or not str(telegram_user.get('id') or '').isdigit():
+        raise ValueError('invalid_init_data')
+    data_check_string = '\n'.join(f'{key}={values[key]}' for key in sorted(values))
+    secret_key = hmac.new(b'WebAppData', bot_token.encode('utf-8'), hashlib.sha256).digest()
+    calculated_hash = hmac.new(secret_key, data_check_string.encode('utf-8'), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(calculated_hash, received_hash.lower()):
+        raise ValueError('invalid_init_data')
+    return telegram_user
+
+
+@app.post('/api/auth/telegram-webapp', tags=["Authentication"])
+async def api_telegram_webapp_auth(request: Request, req: TelegramWebAppAuthRequest):
+    lang = request.cookies.get('lang', 'en')
+    data = load_data()
+    telegram_settings = (data.get('settings') or {}).get('telegram') or {}
+    bot_token = str(telegram_settings.get('token') or '').strip()
+    if telegram_settings.get('webapp_initdata_auth') is not True or not bot_token:
+        return JSONResponse({'error': _t('telegram_webapp_auth_unavailable', lang)}, status_code=403)
+    try:
+        telegram_user = _verify_telegram_webapp_init_data(req.init_data, bot_token)
+    except ValueError as exc:
+        key = 'telegram_webapp_auth_invalid'
+        if str(exc) == 'expired_init_data':
+            key = 'telegram_webapp_auth_invalid'
+        return JSONResponse({'error': _t(key, lang)}, status_code=401)
+
+    telegram_id = str(telegram_user['id'])
+    async with DATA_LOCK:
+        data = load_data()
+        users = data.get('users', [])
+        user = next((item for item in users
+                     if str(item.get('telegramId') or '').strip() == telegram_id), None)
+        if user is None and (data.get('settings', {}).get('telegram') or {}).get('auto_create_users') is True:
+            created = tg_bot._auto_create_telegram_user(data, telegram_user, save_data)
+            if created:
+                user = created[0]
+        if user is None:
+            return JSONResponse({'error': _t('telegram_webapp_account_not_found', lang)}, status_code=403)
+        if user.get('role') == 'none':
+            return JSONResponse({'error': _t('telegram_webapp_account_not_found', lang)}, status_code=403)
+        if not user.get('enabled', True):
+            return JSONResponse({'error': _t('account_disabled', lang)}, status_code=403)
+        request.session.clear()
+        request.session['user_id'] = user['id']
+    return {'status': 'success', 'role': user.get('role', 'user')}
 
 
 @app.post('/api/auth/login', tags=["Authentication"])
@@ -3429,6 +4954,73 @@ def _check_admin(request):
     return None
 
 
+def _panel_host_allowlist(request):
+    """Return a set of hostnames that are allowed for this panel.
+
+    Includes the panel's base URL host, the client IP, PANEL_HOST env var,
+    and loopback names. Hostnames are lowercased, ports are ignored.
+    """
+    allowed = set()
+    # Host from the panel's own base URL
+    try:
+        base_host = urllib.parse.urlparse(str(request.base_url)).hostname
+        if base_host:
+            allowed.add(base_host.lower())
+    except Exception:
+        pass
+    # Client IP as a hostname (for direct IP access)
+    if request.client and request.client.host:
+        allowed.add(request.client.host.lower())
+    # PANEL_HOST env var (comma-separated, whitespace stripped)
+    panel_host_env = os.environ.get('PANEL_HOST', '')
+    for h in panel_host_env.split(','):
+        h = h.strip().lower()
+        if h:
+            allowed.add(h)
+    # Loopback names are always safe
+    allowed.update({'localhost', '127.0.0.1', '::1', '0.0.0.0'})
+    return allowed
+
+
+def _require_admin_strict(request):
+    """Admin only, same-origin only. Support may read but may not write.
+
+    Mirrors _ssh_trust_admin: session/Bearer authorization stays, but a
+    cross-origin browser write is refused.
+    Host header must match the panel allowlist (DNS rebinding protection).
+    PANEL_STRICT_HOST=0 disables the Host allowlist check only.
+    """
+    # Host header check (DNS rebinding protection)
+    strict_host = os.environ.get('PANEL_STRICT_HOST', '1') not in ('0', 'false', 'no', 'off', '')
+    if strict_host:
+        host_header = request.headers.get('host')
+        if not host_header:
+            return None
+        # Extract hostname, ignore port. An IPv6 literal arrives bracketed,
+        # e.g. [2001:db8::1]:5000, so a plain split(':')[0] would read '['.
+        if host_header.startswith('['):
+            close = host_header.find(']')
+            host_hostname = (host_header[1:close] if close != -1
+                             else host_header[1:]).lower()
+        else:
+            host_hostname = host_header.split(':')[0].lower()
+        allowlist = _panel_host_allowlist(request)
+        if host_hostname not in allowlist:
+            return None
+
+    origin = request.headers.get('origin')
+    fetch_site = request.headers.get('sec-fetch-site')
+    if origin and fetch_site != 'same-origin' and \
+            origin.rstrip('/') != str(request.base_url).rstrip('/'):
+        return None
+    if fetch_site in ('cross-site', 'same-site'):
+        return None
+    user = _check_admin(request)
+    if user and user['role'] == 'admin':
+        return user
+    return None
+
+
 def _request_user(request):
     """Resolve the caller for handlers that apply their own role checks.
 
@@ -3485,6 +5077,35 @@ def _ssh_onboarding_endpoint(req):
     return endpoint
 
 
+_TRUST_ERROR_CODES = (
+    (ssh_trust.SystemTrustConflict, 'system_trust_conflict', 'system_conflict'),
+    (ssh_trust.TrustFileReadOnly, 'trust_file_readonly', 'trust_readonly'),
+    (ssh_trust.TrustChanged, 'trust_changed', ''),
+)
+
+
+def _trust_error_response(exc, server=None, status_code=409):
+    """409 body for a trust write the panel refuses to do on its own.
+
+    ``remediation`` carries copy-ready console commands, built from this
+    installation's real paths, so the same hint works for any host and port.
+    ``server`` is None when the request failed before the endpoint was
+    resolved; then only the error code is reported.
+    """
+    error_code = 'trust_error'
+    remediation = None
+    for kind, code, reason in _TRUST_ERROR_CODES:
+        if isinstance(exc, kind):
+            error_code = code
+            if reason and server is not None:
+                remediation = ssh_trust.remediation(server, reason)
+            break
+    payload = {'error': str(exc), 'error_code': error_code}
+    if remediation:
+        payload['remediation'] = remediation
+    return JSONResponse(payload, status_code=status_code)
+
+
 @app.post('/api/ssh-trust/onboarding/inspect', tags=["Servers"])
 async def api_ssh_onboarding_inspect(request: Request, req: SSHOnboardingEndpoint):
     if not _ssh_trust_admin(request):
@@ -3507,6 +5128,7 @@ async def api_ssh_onboarding_confirm(request: Request, req: SSHOnboardingConfirm
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     if not req.confirmed:
         return JSONResponse({'error': 'Explicit confirmation required'}, status_code=400)
+    endpoint = None
     try:
         async with DATA_LOCK:
             endpoint = _ssh_onboarding_endpoint(req)
@@ -3517,7 +5139,7 @@ async def api_ssh_onboarding_confirm(request: Request, req: SSHOnboardingConfirm
             lambda: endpoint == _ssh_onboarding_endpoint(req), reset_server)
         return dict(result, ssh_authenticated=False)
     except Exception as exc:
-        return JSONResponse({'error': str(exc)}, status_code=409)
+        return _trust_error_response(exc, endpoint)
 
 
 def _ssh_trust_admin(request):
@@ -3620,7 +5242,7 @@ async def api_ssh_trust_confirm(request: Request, server_id: int, req: SSHTrustC
                        for s in current)
         return await _save_ssh_confirmation(server, req.token, key, unchanged, server)
     except Exception as exc:
-        return JSONResponse({'error': str(exc)}, status_code=409)
+        return _trust_error_response(exc, server)
 
 
 def _server_identity(server_id, server_uid=None):
@@ -3662,11 +5284,23 @@ def _classify_ssh_error(exc):
     the two host-key states Paramiko reports as generic SSHException.
     """
     import paramiko as _paramiko
+    # Imported here, not at module level, so this function stays usable when it
+    # is extracted on its own (tests exec it with a reduced globals namespace).
+    from managers import ssh_trust as _ssh_trust
 
     if isinstance(exc, _paramiko.AuthenticationException):
         return 'authentication_failed'
     if isinstance(exc, _paramiko.BadHostKeyException):
         return 'host_key_changed'
+    # Trust write refusals carry their own codes. They subclass
+    # ValueError/PermissionError, so they must be checked before the generic
+    # OSError branch turns a read-only trust file into "network_error".
+    if isinstance(exc, _ssh_trust.SystemTrustConflict):
+        return 'system_trust_conflict'
+    if isinstance(exc, _ssh_trust.TrustFileReadOnly):
+        return 'trust_file_readonly'
+    if isinstance(exc, _ssh_trust.TrustChanged):
+        return 'trust_changed'
     if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
         return 'network_error'
     if isinstance(exc, _paramiko.SSHException):
@@ -3845,6 +5479,8 @@ async def api_edit_server(request: Request, server_id: int, req: EditServerReque
     if error is not None:
         return error
     uid = selected['uid']
+    from credential_store import CredentialStore, default_key_path
+    store = CredentialStore(default_key_path(DATA_FILE))
 
     async def edit():
         async with SERVER_MUTATION_LOCK:
@@ -3863,7 +5499,7 @@ async def api_edit_server(request: Request, server_id: int, req: EditServerReque
                 elif req.password:
                     new_pass, new_key = req.password, ''
                 else:
-                    new_pass, new_key = server.get('password', ''), server.get('private_key', '')
+                    new_pass, new_key = store.resolve(server)
                 if not new_pass and not new_key:
                     return JSONResponse({'error': 'Password or SSH key is required'}, status_code=400)
 
@@ -3883,11 +5519,16 @@ async def api_edit_server(request: Request, server_id: int, req: EditServerReque
                     data = load_data()
                     _, current = find_server_by_uid(data, uid)
                     if current is None or any(current.get(k) != server.get(k) for k in
-                                              ('host', 'ssh_port', 'username', 'password', 'private_key')):
+                                              ('host', 'ssh_port', 'username', 'password', 'private_key', 'ssh_credentials')):
                         return JSONResponse({'error': 'Server changed during verification'}, status_code=409)
                     current.update(name=new_name, host=new_host, ssh_port=new_port,
-                                   username=new_user, password=new_pass, private_key=new_key,
-                                   server_info=server_info)
+                                   username=new_user, server_info=server_info)
+                    current.pop('password', None)
+                    current.pop('private_key', None)
+                    # Re-seal under the new endpoint AAD after successful SSH
+                    # verification; ciphertext cannot be replayed to another host.
+                    current['ssh_credentials'] = store.seal(
+                        current, new_pass, new_key)
                     if req.self_service_enabled is not None:
                         current['self_service_enabled'] = bool(req.self_service_enabled)
                     save_data(data)
@@ -3985,8 +5626,11 @@ async def api_reorder_servers(request: Request, req: ReorderServersRequest):
 @app.post('/api/servers/{server_id}/delete', tags=["Servers"])
 @serialize_peer_lifecycle
 async def api_delete_server(request: Request, server_id: int, server_uid: Optional[str] = None,
-                            archive_blocking: bool = False):
+                            archive_blocking: bool = False, panel_only: bool = False):
     """Remove a server from the panel inventory.
+
+    ``panel_only`` removes only local panel state and never contacts the remote
+    server. Leftover connection rows are archived with unverified final counters.
 
     A leftover ``user_connections`` row is accounting ownership and normally
     blocks deletion (possibly forever, when its peer no longer exists). With
@@ -4003,7 +5647,7 @@ async def api_delete_server(request: Request, server_id: int, server_uid: Option
     uid = selected['uid']
     data = load_data()
     guard = _traffic_removal_guard(data, server_id=server_id)
-    if guard is not None and not archive_blocking:
+    if guard is not None and not archive_blocking and not panel_only:
         return guard
 
     async def delete():
@@ -4015,6 +5659,60 @@ async def api_delete_server(request: Request, server_id: int, server_uid: Option
                     index, server = find_server_by_uid(load_data(), uid)
                     if server is None:
                         return {'status': 'success', 'already_deleted': True}
+                if panel_only:
+                    async with DATA_LOCK:
+                        before = pathlib_read_data_bytes() if os.path.exists(DATA_FILE) else b''
+                        data = load_data()
+                        index, current = find_server_by_uid(data, uid)
+                        if current is None:
+                            return {'status': 'success', 'already_deleted': True}
+                        blocked = ownership_rows(data, server_id=index)
+                        operation_id = uuid.uuid4().hex
+                        actor = _actor_id(request, authorized)
+                        for conn in list(blocked):
+                            finalize_connection_record(
+                                data, conn, current, None, time.time(),
+                                'server_panel_remove_unverified', operation_id, False)
+
+                        # Links on other inventory entries cannot be cleaned on
+                        # the removed exit node. Retain their metadata as stale
+                        # so the panel can show and repair the orphaned route.
+                        for other in data.get('servers', []):
+                            if other.get('uid') == uid:
+                                continue
+                            for record in (other.get('protocols') or {}).values():
+                                link = record.get('exit_link') or {}
+                                if link.get('exit_uid') == uid:
+                                    link['stale'] = 'exit_server_removed_from_panel'
+
+                        data['servers'].pop(index)
+                        for conn in data.get('user_connections', []):
+                            if isinstance(conn.get('server_id'), int) and conn['server_id'] > index:
+                                conn['server_id'] -= 1
+
+                        settings = data.setdefault('settings', {})
+                        exit_settings = settings.setdefault('exit_nodes', {})
+                        if exit_settings.get('default_exit_uid') == uid:
+                            exit_settings['default_exit_uid'] = ''
+                        sync = settings.setdefault('sync', {})
+                        sync_server_id = sync.get('remnawave_server_id')
+                        if sync_server_id == index:
+                            sync['remnawave_server_id'] = 0
+                            sync['remnawave_create_conns'] = False
+                        elif isinstance(sync_server_id, int) and sync_server_id > index:
+                            sync['remnawave_server_id'] = sync_server_id - 1
+
+                        result = await asyncio.to_thread(
+                            commit_finalize, DATA_FILE, operation_id, actor,
+                            'server_panel_remove',
+                            recovery_digest({'server_uid': uid, 'mode': 'panel_only'}),
+                            before, data)
+                    deletion_committed = True
+                    await _finish_locked_worker(lambda: drop_ssh(server))
+                    return {
+                        'status': 'success', 'panel_only': True,
+                        'archived': len(blocked),
+                    }
                 results = []
                 if (server.get('protocols') or {}).get('exit'):
                     results.extend(await exit_link_svc.detach_entries_for_exit(uid, 'exit_server_deleted'))
@@ -4064,7 +5762,9 @@ async def api_delete_server(request: Request, server_id: int, server_uid: Option
                     if current_blocked:
                         before = pathlib_read_data_bytes()
                         operation_id = uuid.uuid4().hex
-                        actor = _actor_id(request, authorized)
+                        # Bearer callers have no session; _actor_id resolves the
+                        # token owner and falls back to 'admin'.
+                        actor = _actor_id(request, True)
                         for conn in current_blocked:
                             finalize_connection_record(
                                 data, conn, current, archive_states.get(conn.get('id')),
@@ -4281,14 +5981,68 @@ async def api_server_stats(request: Request, server_id: int, response: Response 
 RKN_RAW_BASE = ('https://raw.githubusercontent.com/PRVTPRO/Amnezia-Web-Panel/'
                 'main/scripts/rknblock')
 
-RKN_INSTALL_CMD = (
-    'tmp_dir=$(mktemp -d /tmp/amnezia-rkn.XXXXXXXXXX) || exit $?; '
-    'trap \'rm -rf -- "$tmp_dir"\' EXIT; '
-    f'curl -fsSL {RKN_RAW_BASE}/install-rkn-extra.sh '
-    '-o "$tmp_dir/rkn-install.sh" && bash "$tmp_dir/rkn-install.sh"'
-)
+# The installer ships with this panel checkout, not from GitHub main: the
+# phased install must work immediately without waiting for an upstream merge.
+RKN_INSTALL_CMD = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'scripts', 'rknblock', 'install-rkn-extra.sh')
 
 RKN_SCRIPT_URL = f'{RKN_RAW_BASE}/rkn-extra-block.sh'
+
+# Repair ships the files bundled with this panel checkout, not a GitHub fetch:
+# a host whose boot restore is broken may also be unable to reach the internet.
+RKN_BLOCK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             'scripts', 'rknblock')
+RKN_REPAIR_FILES = (
+    ('rkn-extra-block.sh', '/usr/local/sbin/rkn-extra-block', '0755'),
+    ('rkn-extra-block.service', '/etc/systemd/system/rkn-extra-block.service', '0644'),
+    ('rkn-extra-block.timer', '/etc/systemd/system/rkn-extra-block.timer', '0644'),
+)
+
+
+def _rkn_repair_script():
+    """Remote script: back up, install bundled units/script, enable, restore.
+
+    Files are embedded as base64 so the same payload works over both root and
+    sudo SSH (run_sudo_script) without extra SFTP privileges for /etc.
+    """
+    payload = []
+    for name, dest, mode in RKN_REPAIR_FILES:
+        with open(os.path.join(RKN_BLOCK_DIR, name), 'r', encoding='utf-8') as fh:
+            content = fh.read().replace('\r\n', '\n')
+        encoded = base64.b64encode(content.encode('utf-8')).decode('ascii')
+        payload.append(f"printf '%s' '{encoded}' | base64 -d > '{dest}.amnezia-tmp'")
+        payload.append(f"chmod {mode} '{dest}.amnezia-tmp'")
+        payload.append(f"mv -f '{dest}.amnezia-tmp' '{dest}'")
+    install = '\n'.join(payload)
+    return f"""set -eu
+ts=$(date -u +%Y%m%d-%H%M%S)
+bak="/root/backups-rkn-repair-$ts"
+mkdir -p "$bak"
+for f in /usr/local/sbin/rkn-extra-block /etc/systemd/system/rkn-extra-block.service /etc/systemd/system/rkn-extra-block.timer; do
+    if [ -f "$f" ]; then cp -a "$f" "$bak"/; fi
+done
+{install}
+systemctl daemon-reload
+systemctl enable rkn-extra-block.timer
+systemctl enable --now rkn-extra-block.timer
+systemctl enable rkn-extra-block.service
+/usr/local/sbin/rkn-extra-block repair
+"""
+
+
+def _rkn_install_script(phase='all'):
+    """Remote command that runs one phase of the bundled installer.
+
+    The installer is embedded as base64 for the same reason as the repair
+    script: it works over both root and sudo SSH without SFTP access to /etc.
+    """
+    with open(RKN_INSTALL_CMD, 'r', encoding='utf-8') as fh:
+        content = fh.read().replace('\r\n', '\n')
+    encoded = base64.b64encode(content.encode('utf-8')).decode('ascii')
+    return ('tmp_dir=$(mktemp -d /tmp/amnezia-rkn.XXXXXXXXXX) || exit $?; '
+            'trap \'rm -rf -- "$tmp_dir"\' EXIT; '
+            f'printf \'%s\' \'{encoded}\' | base64 -d > "$tmp_dir/install-rkn-extra.sh" '
+            f'&& bash "$tmp_dir/install-rkn-extra.sh" {phase}')
 
 
 def _rkn_run_cmd(subcommand):
@@ -4321,7 +6075,7 @@ def _rkn_server_index(data, server_id, server_uid, expected=None):
         return None
     idx = matches[0]
     if expected is not None and any(servers[idx].get(k) != expected.get(k)
-                                   for k in ('uid', 'host', 'ssh_port', 'username', 'password', 'private_key')):
+                                   for k in ('uid', 'host', 'ssh_port', 'username', 'password', 'private_key', 'ssh_credentials')):
         return None
     return idx
 
@@ -4386,7 +6140,11 @@ async def _rkn_ssh_run(server, cmd, timeout):
 @app.post('/api/servers/{server_id}/rknblock/install', tags=["Servers"])
 @serialize_peer_lifecycle
 async def api_rknblock_install(request: Request, server_id: int, server_uid: str | None = None):
-    """Install the RKN/VK network blocking app (rkn-extra-block contour)."""
+    """Install the RKN/VK network blocking app (rkn-extra-block contour).
+
+    The installer runs phase by phase over one SSH session in the background;
+    the page polls ``/rknblock/install/{operation_id}`` for staged progress.
+    """
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     data = load_data()
@@ -4396,21 +6154,132 @@ async def api_rknblock_install(request: Request, server_id: int, server_uid: str
     server = dict(data['servers'][server_id])
     if _rkn_record(server).get('installed'):
         return JSONResponse({'error': 'App is already installed; refresh its status'}, status_code=409)
+    if (server_id, 'rknblock') in _INSTALL_ACTIVE:
+        return JSONResponse(
+            {'error': 'RKN Block installation is already running',
+             'code': 'install_in_progress'},
+            status_code=409)
     server_uid = server.get('uid')
-    err = await _rkn_ssh_run(server, RKN_INSTALL_CMD, 420)
-    if err is not None:
-        return err
+    op = op_create(server_id, 'rknblock', RKNBLOCK_INSTALL_TOTAL)
+    asyncio.create_task(_run_rknblock_install(op['id'], server_id, server_uid))
+    return {'operation_id': op['id']}
 
-    def mark(rec):
-        rec['installed'] = True
-        rec['enabled'] = True
-        rec['last_error'] = None
 
-    rec = await _rkn_store_record(server_id, server_uid, mark, server)
-    if rec is None:
-        return JSONResponse({'error': 'Server not found'}, status_code=404)
-    RKN_FLAG_CACHE.clear()
-    return {'status': 'success', 'installed': True, 'enabled': True}
+async def _rkn_install_phases(server, phases, timeout, on_phase=None, on_start=None):
+    """Run installer phases one by one over a single SSH session.
+
+    Auth/sudo behaviour is exactly what the other RKN endpoints use (the same
+    get_ssh + run_sudo_script pair). Returns None on success or a JSONResponse
+    describing the failure, like _rkn_ssh_run.
+    """
+    ssh = await asyncio.to_thread(get_ssh, server)
+    try:
+        await asyncio.to_thread(ssh.connect)
+        if _rkn_server_index(load_data(), None, server.get('uid'), server) is None:
+            return JSONResponse({'error': 'Server identity changed; refresh the inventory',
+                                 'code': 'server_changed'},
+                                status_code=409)
+        for phase in phases:
+            if on_start is not None:
+                on_start(phase)
+            out, err, code = await asyncio.to_thread(
+                ssh.run_sudo_script, _rkn_install_script(phase), timeout)
+            if on_phase is not None:
+                on_phase(phase, out, err, code)
+            if code != 0:
+                detail = (err or out or '').strip()
+                hint = ''
+                if ('dpkg is in an inconsistent state' in detail
+                        or 'dpkg returned an error code' in detail):
+                    hint = " Run 'sudo dpkg --configure -a' on the server, then retry."
+                return JSONResponse(
+                    {'error': f'command failed: {detail[-1500:]}{hint}'},
+                    status_code=500)
+    finally:
+        try:
+            ssh.disconnect()
+        except Exception:
+            pass
+    if _rkn_server_index(load_data(), None, server.get('uid'), server) is None:
+        return JSONResponse({'error': 'Server identity changed; refresh the inventory',
+                             'code': 'server_changed'},
+                            status_code=409)
+    return None
+
+
+async def _run_rknblock_install(op_id, server_id, server_uid):
+    """Background worker: phases -> staged lines -> record only on success."""
+    op = _INSTALL_OPS.get(op_id)
+    if not op:
+        return
+    data = load_data()
+    idx = _rkn_server_index(data, server_id, server_uid)
+    if idx is None:
+        op_finish(op, 'failed', error={'code': 'server_changed',
+                                       'message': 'Server not found; refresh the inventory'})
+        return
+    server = dict(data['servers'][idx])
+    server_id = idx
+
+    def report(phase, out, err, code):
+        for line in (out or '').splitlines():
+            if line.strip():
+                op_log(op, phase, line)
+        if code != 0:
+            for line in (err or '').splitlines():
+                if line.strip():
+                    op_log(op, phase, line)
+
+    try:
+        op_log(op, 'start', 'RKN Block installation started')
+        failure = await _rkn_install_phases(
+            server, RKN_INSTALL_PHASES, 420, report,
+            on_start=lambda phase: op_log(op, phase, f'phase start: {phase}'))
+        if failure is not None:
+            try:
+                body = json.loads(failure.body)
+            except Exception:
+                body = {}
+            detail = body.get('error') or 'install failed'
+            code = body.get('code') or 'install_failed'
+            op_log(op, 'error', f"installation stopped: {detail}")
+            op_finish(op, 'failed',
+                      error={'code': code, 'message': detail[:1500]})
+            return
+
+        def mark(rec):
+            rec['installed'] = True
+            rec['enabled'] = True
+            rec['last_error'] = None
+
+        rec = await _rkn_store_record(server_id, server_uid, mark, server)
+        if rec is None:
+            op_finish(op, 'failed', error={'code': 'server_changed',
+                                           'message': 'Server not found; refresh the inventory'})
+            return
+        RKN_FLAG_CACHE.clear()
+        op_log(op, 'done', 'RKN Block installed and enabled')
+        op_finish(op, 'success',
+                  result={'status': 'success', 'installed': True, 'enabled': True})
+    except Exception as e:
+        logger.exception("RKN Block install failed")
+        op_finish(op, 'failed', error={'code': 'internal_error', 'message': str(e)})
+
+
+@app.get('/api/servers/{server_id}/rknblock/install/{op_id}', tags=["Servers"])
+def api_rknblock_install_status(request: Request, server_id: int, op_id: str):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    _install_ops_load()
+    op = _install_op_of_server(op_id, server_id)
+    if not op:
+        return JSONResponse({'error': 'Operation not found', 'code': 'not_found'},
+                            status_code=404)
+    try:
+        offset = max(0, int(request.query_params.get('offset', 0)))
+    except (TypeError, ValueError):
+        offset = 0
+    return _install_op_payload(op, offset)
 
 
 @app.post('/api/servers/{server_id}/rknblock/uninstall', tags=["Servers"])
@@ -4488,6 +6357,79 @@ async def api_rknblock_update(request: Request, server_id: int, server_uid: str 
     return {'status': 'success', 'updated': True}
 
 
+def _rkn_status_after_repair(out, installed=True):
+    """Parse a post-repair probe and derive the boot fields the UI needs."""
+    parsed = _parse_rkn_scan_output(out, installed)
+    parsed['boot_enabled'] = parsed.get('boot_restore') == 'enabled'
+    parsed['repair_available'] = bool(
+        installed and (not parsed['boot_enabled'] or parsed.get('unit') == 'legacy'))
+    return parsed
+
+
+@app.post('/api/servers/{server_id}/rknblock/repair', tags=["Servers"])
+@serialize_peer_lifecycle
+async def api_rknblock_repair(request: Request, server_id: int, server_uid: str | None = None):
+    """Restore boot restore on a host: bundled units/script, enable, rules.
+
+    Idempotent. Only touches rkn-extra-block files and systemd state; VPN
+    containers, docker and data.json secrets are left alone.
+    """
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    server_id = _rkn_server_index(data, server_id, server_uid)
+    if server_id is None:
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = dict(data['servers'][server_id])
+    if not _rkn_record(server).get('installed'):
+        return JSONResponse({'error': 'App is not installed'}, status_code=409)
+    server_uid = server.get('uid')
+
+    try:
+        script = _rkn_repair_script()
+    except OSError as e:
+        logger.error(f"RKN repair payload unavailable: {e}")
+        return JSONResponse({'error': f'repair payload unavailable: {e}'},
+                            status_code=500)
+    err = await _rkn_ssh_run(server, script, 300)
+    now = datetime.now(timezone.utc).isoformat()
+    if err is not None:
+        detail = ''
+        try:
+            detail = json.loads(err.body).get('error', '')[:500]
+        except Exception:
+            pass
+
+        def mark_fail(rec):
+            rec['last_repair_at'] = now
+            rec['last_repair_error'] = detail or 'repair failed'
+
+        await _rkn_store_record(server_id, server_uid, mark_fail, server)
+        RKN_FLAG_CACHE.pop(server_id, None)
+        return err
+
+    out = ''
+    try:
+        out = await _fetch_rkn_scan_output(server)
+    except Exception as e:
+        logger.warning(f"RKN repair status probe failed on {server.get('host')}: {e}")
+    parsed = _rkn_status_after_repair(out, True)
+
+    def mark(rec):
+        rec['boot_restore'] = parsed.get('boot_restore') or 'unknown'
+        rec['last_repair_at'] = now
+        rec['last_repair_error'] = None
+
+    rec = await _rkn_store_record(server_id, server_uid, mark, server)
+    if rec is None:
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    RKN_FLAG_CACHE.pop(server_id, None)
+    parsed['status'] = 'success'
+    parsed['last_repair_at'] = now
+    parsed['last_repair_error'] = None
+    return parsed
+
+
 RKN_OPTION_FLAGS = ('block_in', 'block_out', 'log_in', 'log_out')
 
 
@@ -4530,7 +6472,7 @@ async def api_rknblock_options(request: Request, server_id: int, req: RknBlockOp
     return {'status': 'success', 'flags': values}
 
 
-RKN_SCAN_SSH_CMD = ("rkn-extra-block status 2>/dev/null | head -10; "
+RKN_SCAN_SSH_CMD = ("rkn-extra-block status 2>/dev/null | head -30; "
                       "echo '===LOG==='; tail -n 2000 /var/log/rkn-scans.json 2>/dev/null")
 
 
@@ -4568,6 +6510,17 @@ def _parse_rkn_scan_output(out, flag_enabled):
     m = re.search(r'health:\s*(\w+)', status_part)
     if m:
         health = m.group(1).lower()
+    # boot_restore: enabled|disabled|unknown — will systemd run `boot` after a
+    # reboot. unit: ok when the service file carries [Install], legacy for the
+    # 2026-10 installs whose unit had none (is-enabled=static -> disabled).
+    boot_restore = None
+    m = re.search(r'boot_restore:\s*(\w+)', status_part)
+    if m:
+        boot_restore = m.group(1).lower()
+    unit = None
+    m = re.search(r'unit:\s*(\w+)', status_part)
+    if m:
+        unit = m.group(1).lower()
     events = []
     for line in (log_part or '').splitlines():
         line = line.strip()
@@ -4614,6 +6567,8 @@ def _parse_rkn_scan_output(out, flag_enabled):
         'flag_enabled': bool(flag_enabled),
         'agent_state': agent_state,
         'health': health,
+        'boot_restore': boot_restore,
+        'unit': unit,
         'sets_ok': sets_ok,
         'problems': problems,
         'sets': sets,
@@ -4686,6 +6641,13 @@ async def api_rkn_scans(request: Request, server_id: int, server_uid: str | None
                              and parsed.get('sets_ok')
                              and parsed.get('health') != 'failed')
     parsed['last_error'] = record.get('last_error')
+    # Older scripts do not print boot_restore/unit at all: absence of the lines
+    # is itself a signal to offer the repair (the host predates the fix).
+    boot_enabled = parsed.get('boot_restore') == 'enabled'
+    parsed['boot_enabled'] = bool(installed and boot_enabled)
+    parsed['repair_available'] = bool(
+        installed and available and parsed.get('agent_state') in ('on', 'off')
+        and (not boot_enabled or parsed.get('unit') == 'legacy'))
     return parsed
 
 
@@ -4706,6 +6668,359 @@ async def api_rkn_scans_clear(request: Request, server_id: int, server_uid: str 
         return error
     RKN_FLAG_CACHE.pop(server_id, None)
     return {'status': 'cleared'}
+
+
+# ===== WARP: server app + per-instance egress (issue #277, S3a MVP) =====
+#
+# HTTP contract only: identity/XOR/ToS guards run synchronously, the SSH work
+# is queued as one in-memory job per server uid. State lives in the dedicated
+# .srv_warp_state.json store, never in a data.json snapshot.
+
+def _warp_awg_protocols(server):
+    return [proto for proto in (server.get('protocols') or {})
+            if protocol_base(proto) in ('awg', 'awg2', 'awg3')]
+
+
+def _warp_named_protocol(req, server=None, required=False):
+    protocol = (req.protocol or '').strip()
+    if not protocol and server is not None:
+        candidates = _warp_awg_protocols(server)
+        protocol = candidates[0] if candidates else ''
+    if not protocol:
+        if required:
+            protocol = 'awg'
+        else:
+            return None
+    if protocol_base(protocol) not in ('awg', 'awg2', 'awg3'):
+        raise SrvWarpError('srv_warp_protocol_unsupported', 409)
+    return protocol
+
+
+def _warp_registers(server, state, uid):
+    warp = server.get('warp') or {}
+    registers = warp.get('registers_ts')
+    if registers is None:
+        registers = warp.get('registers')
+    if registers is None:
+        record = (state.get('servers') or {}).get(str(uid)) or {}
+        registers = record.get('registers_ts') or record.get('registers') or []
+    return registers or []
+
+
+def _warp_status_payload(server, state):
+    uid = server.get('uid') or ''
+    protocols = list(_warp_awg_protocols(server))
+    server_state = (state.get('servers') or {}).get(str(uid)) or {}
+    for proto in (server_state.get('protocols') or {}):
+        if proto not in protocols and protocol_base(proto) in ('awg', 'awg2', 'awg3'):
+            protocols.append(proto)
+
+    registers = _warp_registers(server, state, uid)
+    rate_limited = quota_exhausted(registers)
+    instances = []
+    budgets = []
+    for proto in protocols:
+        record = proto_record(state, uid, proto)
+        warp_record = record.get('warp') or {}
+        link = warp_link(record)
+        # No live SSH probes in the status endpoint: the projection is the
+        # authoritative signal until the supervisor supplies handshake data.
+        installed = bool(warp_record.get('registered'))
+        instance_state = classify_instance_state(
+            installed=installed, link_active=bool(link),
+            rate_limited=rate_limited)
+        client_mtu = record.get('client_mtu_warp')
+        if client_mtu:
+            budgets.append(int(client_mtu))
+        instances.append({
+            'protocol': proto,
+            'state': instance_state,
+            'installed': installed,
+            'registered': bool(warp_record.get('registered')),
+            'link_active': bool(link),
+            'client_mtu': client_mtu,
+            'dns_via_warp': bool((link or {}).get('dns_via_warp')),
+            'quarantine': bool(warp_record.get('quarantine')),
+            'state_stale': bool((link or {}).get('stale')),
+        })
+
+    active_job = _WARP_JOBS.get(str(uid))
+    return {
+        'aggregate': aggregate_state([item['state'] for item in instances]),
+        'instances': instances,
+        'budget': min(budgets) if budgets else WARP_CLIENT_MTU_CAP,
+        'orphans': [],
+        'quota': {
+            'used': len(register_timestamps(registers, now=time.time())),
+            'limit': WARP_REGISTER_LIMIT,
+        },
+        'jobs': [dict(active_job)] if active_job else [],
+    }
+
+
+async def _warp_store_tos(uid):
+    async with DATA_LOCK:
+        data = load_data()
+        idx = _rkn_server_index(data, None, uid)
+        if idx is None:
+            return
+        warp = data['servers'][idx].setdefault('warp', {})
+        warp['tos_ack'] = {'version': WARP_TOS_VERSION, 'ts': int(time.time())}
+        save_data(data)
+
+
+async def _warp_require_tos(server, accept):
+    ack = (server.get('warp') or {}).get('tos_ack') or {}
+    if isinstance(ack, dict) and ack.get('version') == WARP_TOS_VERSION:
+        return
+    if not accept:
+        raise SrvWarpError('srv_warp_tos_required', 409)
+    await _warp_store_tos(server.get('uid'))
+
+
+def _warp_install_guard(server, uid, protocol):
+    state = warp_state_store.load()
+    protocols = [protocol] if protocol else _warp_awg_protocols(server)
+    for proto in protocols:
+        record = proto_record(state, uid, proto)
+        if (record.get('warp') or {}).get('registered') or warp_link(record):
+            raise SrvWarpError('srv_warp_registered_unlink_first', 409)
+
+
+def _warp_link_preflight(data, server_id, server, uid, protocol):
+    record = (server.get('protocols') or {}).get(protocol) or {}
+    if record.get('exit_link'):
+        raise SrvWarpError('srv_warp_xor_conflict', 409)
+    if split_instances(data, server_id):
+        raise SrvWarpError('srv_warp_xor_conflict', 409)
+    if warp_link(proto_record(warp_state_store.load(), uid, protocol)):
+        raise SrvWarpError('srv_warp_xor_conflict', 409)
+
+
+async def _warp_post(actor, request, server_id, req, kind, runner, *, tos=False,
+                     install_guard=False, link_preflight=False):
+    """Shared POST pre-flight: auth -> identity -> registry -> ToS -> XOR -> 202."""
+    if not actor or actor.get('role') not in ('admin', 'support'):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        idx = _rkn_server_index(data, server_id, req.server_uid)
+        if idx is None:
+            raise SrvWarpError('srv_warp_identity_mismatch', 409)
+        server = data['servers'][idx]
+        uid = server.get('uid') or ''
+        if not uid:
+            raise SrvWarpError('srv_warp_identity_mismatch', 409)
+        if _warp_job_active(uid):
+            raise SrvWarpError('srv_warp_job_busy', 409)
+
+        if kind in ('install', 'uninstall', 'repair'):
+            protocol = _warp_named_protocol(req, server=server, required=False)
+        elif kind == 'exit-egress':
+            protocol = None
+        else:
+            protocol = _warp_named_protocol(req, server=server, required=True)
+
+        if tos:
+            await _warp_require_tos(server, bool(req.accept_tos))
+        if install_guard:
+            _warp_install_guard(server, uid, protocol)
+        if link_preflight:
+            _warp_link_preflight(data, idx, server, uid, protocol)
+
+        job_id = _warp_job_begin(uid, kind)
+        task = asyncio.create_task(runner(server_id, uid, protocol, job_id))
+        _WARP_TASKS.add(task)
+        task.add_done_callback(_WARP_TASKS.discard)
+        return JSONResponse({'job_id': job_id, 'status': 'queued'},
+                            status_code=202)
+    except SrvWarpError as exc:
+        return JSONResponse({'error': exc.code, 'code': exc.code},
+                            status_code=exc.http_status)
+
+
+@app.get('/api/servers/{server_id}/warp/status', tags=["Servers"])
+async def api_srv_warp_status(request: Request, server_id: int,
+                              server_uid: str | None = None):
+    """Aggregate + per-instance warp state, quota and active jobs."""
+    actor = _request_user(request)
+    if not actor or actor.get('role') not in ('admin', 'support'):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    idx = _rkn_server_index(data, server_id, server_uid)
+    if idx is None:
+        return JSONResponse(
+            {'error': 'Server not found', 'code': 'srv_warp_identity_mismatch'},
+            status_code=404)
+    return _warp_status_payload(data['servers'][idx], warp_state_store.load())
+
+
+@app.post('/api/servers/{server_id}/warp/install', tags=["Servers"])
+async def api_srv_warp_install(request: Request, server_id: int, req: SrvWarpRequest):
+    """Queue a WARP install as a store operation with staged progress."""
+    actor = _request_user(request)
+    if not actor or actor.get('role') not in ('admin', 'support'):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        idx = _rkn_server_index(data, server_id, req.server_uid)
+        if idx is None:
+            raise SrvWarpError('srv_warp_identity_mismatch', 409)
+        server = data['servers'][idx]
+        uid = server.get('uid') or ''
+        if not uid:
+            raise SrvWarpError('srv_warp_identity_mismatch', 409)
+        if _warp_job_active(uid):
+            raise SrvWarpError('srv_warp_job_busy', 409)
+        protocol = _warp_named_protocol(req, server=server, required=False)
+        await _warp_require_tos(server, bool(req.accept_tos))
+        _warp_install_guard(server, uid, protocol)
+        _install_ops_load()
+        if (idx, 'warp') in _INSTALL_ACTIVE:
+            return JSONResponse(
+                {'error': 'Cloudflare WARP installation is already running',
+                 'code': 'install_in_progress'},
+                status_code=409)
+        op = op_create(idx, 'warp', WARP_INSTALL_TOTAL)
+        asyncio.create_task(_run_warp_install(op['id'], idx, uid, protocol))
+        return {'operation_id': op['id']}
+    except SrvWarpError as exc:
+        return JSONResponse({'error': exc.code, 'code': exc.code},
+                            status_code=exc.http_status)
+
+
+async def _run_warp_install(op_id, server_id, uid, protocol):
+    """Background worker: one WARP install with store-style staged lines."""
+    op = _INSTALL_OPS.get(op_id)
+    if not op:
+        return
+    try:
+        job_id = _warp_job_begin(uid, 'install')
+        op_log(op, 'start', 'Cloudflare WARP installation started')
+        await warp_runtime.install(
+            server_id, uid, protocol=protocol, job_id=job_id,
+            progress=lambda stage, msg: op_log(op, stage, msg))
+        op_log(op, 'done', 'Cloudflare WARP installed')
+        op_finish(op, 'success',
+                  result={'status': 'success', 'installed': True})
+    except SrvWarpError as exc:
+        op_finish(op, 'error',
+                  error={'code': exc.code,
+                         'message': str(exc) or exc.code})
+    except Exception as exc:
+        logger.exception("Cloudflare WARP install failed")
+        op_finish(op, 'error',
+                  error={'code': 'install_failed',
+                         'message': str(exc)[:500]})
+
+
+@app.post('/api/servers/{server_id}/warp/uninstall', tags=["Servers"])
+async def api_srv_warp_uninstall(request: Request, server_id: int, req: SrvWarpRequest):
+    return await _warp_post(
+        _request_user(request), request, server_id, req, 'uninstall',
+        lambda sid, uid, protocol, job_id: warp_runtime.uninstall(
+            sid, uid, protocol=protocol, job_id=job_id))
+
+
+@app.post('/api/servers/{server_id}/warp/repair', tags=["Servers"])
+async def api_srv_warp_repair(request: Request, server_id: int, req: SrvWarpRequest):
+    return await _warp_post(
+        _request_user(request), request, server_id, req, 'repair',
+        lambda sid, uid, protocol, job_id: warp_runtime.repair(
+            sid, uid, protocol=protocol, job_id=job_id))
+
+
+@app.post('/api/servers/{server_id}/warp/link', tags=["Servers"])
+async def api_srv_warp_link(request: Request, server_id: int, req: SrvWarpRequest):
+    return await _warp_post(
+        _request_user(request), request, server_id, req, 'link',
+        lambda sid, uid, protocol, job_id: warp_runtime.link(
+            sid, uid, protocol, dns_via_warp=bool(req.dns_on), job_id=job_id),
+        tos=True, link_preflight=True)
+
+
+@app.post('/api/servers/{server_id}/warp/unlink', tags=["Servers"])
+async def api_srv_warp_unlink(request: Request, server_id: int, req: SrvWarpRequest):
+    return await _warp_post(
+        _request_user(request), request, server_id, req, 'unlink',
+        lambda sid, uid, protocol, job_id: warp_runtime.unlink(
+            sid, uid, protocol, job_id=job_id))
+
+
+@app.post('/api/servers/{server_id}/warp/force-unlink', tags=["Servers"])
+async def api_srv_warp_force_unlink(request: Request, server_id: int,
+                                    req: SrvWarpRequest):
+    return await _warp_post(
+        _request_user(request), request, server_id, req, 'force-unlink',
+        lambda sid, uid, protocol, job_id: warp_runtime.force_unlink(
+            sid, uid, protocol, job_id=job_id))
+
+
+@app.post('/api/servers/{server_id}/warp/switch', tags=["Servers"])
+async def api_srv_warp_switch(request: Request, server_id: int, req: SrvWarpRequest):
+    return await _warp_post(
+        _request_user(request), request, server_id, req, 'switch',
+        lambda sid, uid, protocol, job_id: warp_runtime.switch_egress(
+            sid, uid, protocol, job_id=job_id))
+
+
+@app.post('/api/servers/{server_id}/warp/dns', tags=["Servers"])
+async def api_srv_warp_dns(request: Request, server_id: int, req: SrvWarpRequest):
+    return await _warp_post(
+        _request_user(request), request, server_id, req, 'dns',
+        lambda sid, uid, protocol, job_id: warp_runtime.set_dns(
+            sid, uid, protocol, dns_on=bool(req.dns_on), job_id=job_id))
+
+
+@app.post('/api/servers/{server_id}/warp/reissue', tags=["Servers"])
+async def api_srv_warp_reissue(request: Request, server_id: int, req: SrvWarpRequest):
+    return await _warp_post(
+        _request_user(request), request, server_id, req, 'reissue',
+        lambda sid, uid, protocol, job_id: warp_runtime.reissue(
+            sid, uid, protocol, job_id=job_id))
+
+
+@app.post('/api/servers/{server_id}/warp/exit-egress', tags=["Servers"])
+async def api_srv_warp_exit_egress(request: Request, server_id: int,
+                                   req: SrvWarpRequest):
+    return await _warp_post(
+        _request_user(request), request, server_id, req, 'exit-egress',
+        lambda sid, uid, protocol, job_id: warp_runtime.exit_egress(
+            sid, uid, enable=bool(req.enable), job_id=job_id),
+        tos=True)
+
+
+@app.post('/api/servers/{server_id}/warp/failover', tags=["Servers"])
+async def api_srv_warp_failover(request: Request, server_id: int,
+                                req: SrvWarpRequest):
+    """Failover policy is configuration, not SSH: applied synchronously."""
+    actor = _request_user(request)
+    if not actor or actor.get('role') not in ('admin', 'support'):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        idx = _rkn_server_index(data, server_id, req.server_uid)
+        if idx is None:
+            raise SrvWarpError('srv_warp_identity_mismatch', 409)
+        uid = data['servers'][idx].get('uid') or ''
+        if _warp_job_active(uid):
+            raise SrvWarpError('srv_warp_job_busy', 409)
+        policy = {
+            'primary_uid': (req.primary_uid or '').strip(),
+            'backup_uids': [str(item) for item in (req.backup_uids or [])],
+        }
+        async with DATA_LOCK:
+            data = load_data()
+            idx = _rkn_server_index(data, server_id, uid)
+            if idx is None:
+                raise SrvWarpError('srv_warp_identity_mismatch', 409)
+            warp = data['servers'][idx].setdefault('warp', {})
+            warp['failover'] = policy
+            save_data(data)
+        return {'status': 'success', 'failover': policy}
+    except SrvWarpError as exc:
+        return JSONResponse({'error': exc.code, 'code': exc.code},
+                            status_code=exc.http_status)
 
 
 RKN_FLAG_CACHE = {}
@@ -4753,6 +7068,526 @@ async def api_rkn_scan_flags(request: Request):
     results = await asyncio.gather(
         *[collect(i, s) for i, s in enumerate(data['servers'])])
     return {str(i): s for i, s in results if s}
+
+
+# --- Cheburcheck (block check from Russia) ----------------------------------
+
+def _cheburcheck_server_index(server_id, data):
+    servers = data.get('servers', [])
+    if 0 <= server_id < len(servers):
+        return server_id
+    for i, s in enumerate(servers):
+        if str(s.get('uid')) == str(server_id):
+            return i
+    return None
+
+
+def _cheburcheck_targets_context(data):
+    """uid -> resolved targets for every server (settings page, A6)."""
+    cfg = (data.get('settings') or {}).get('cheburcheck') or {}
+    return {srv.get('uid'): cheburcheck_targets(srv, cfg)
+            for srv in data.get('servers', [])}
+
+
+def _cheburcheck_flagged(server, cfg):
+    return bool((cfg.get('servers') or {}).get(server.get('uid')))
+
+
+def _cheburcheck_summary_for(server, cfg, cache):
+    """Aggregate + per-target records for one server (C2 synthetic included)."""
+    records = _cheburcheck_records_for(server, cfg, cache)
+    return _cheburcheck_aggregate(records), records
+
+
+@app.post('/api/servers/cheburcheck/run_all', tags=["Servers"])
+async def api_cheburcheck_run_all(request: Request):
+    global _CHEBURCHECK_TASK
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    cfg = (data.get('settings') or {}).get('cheburcheck') or {}
+    if not cfg.get('enabled'):
+        return {'ok': True, 'started': 0, 'reason': 'disabled'}
+    if _CHEBURCHECK_TASK is not None and not _CHEBURCHECK_TASK.done():
+        return {'ok': True, 'already_running': True}
+    flagged = [srv for srv in data.get('servers', [])
+               if _cheburcheck_flagged(srv, cfg)]
+    if not flagged:
+        return {'ok': True, 'started': 0, 'reason': 'no_servers'}
+    prepared = []
+    for srv in flagged:
+        targets = cheburcheck_targets(srv, cfg)
+        if targets:
+            prepared.append((srv, targets))
+    if not prepared:
+        return {'ok': True, 'started': 0, 'reason': 'no_targets'}
+    reserved = []
+    for srv, targets in prepared:
+        if _cheburcheck_reserve(srv.get('uid')):
+            reserved.append((srv, targets))
+    if not reserved:
+        return {'ok': True, 'started': 0, 'reason': 'nothing_started'}
+
+    async def runner():
+        await _cheburcheck_run_batch(reserved)
+
+    _CHEBURCHECK_TASK = asyncio.create_task(runner())
+    return {'ok': True, 'started': len(reserved)}
+
+
+@app.get('/api/servers/cheburcheck_flags', tags=["Servers"])
+async def api_cheburcheck_flags(request: Request):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    cfg = (data.get('settings') or {}).get('cheburcheck') or {}
+    enabled = bool(cfg.get('enabled'))
+    async with CHEBURCHECK_CACHE_LOCK:
+        cache = {uid: dict(records) for uid, records in CHEBURCHECK_CACHE.items()
+                 if isinstance(records, dict)}
+    out = {}
+    for i, srv in enumerate(data.get('servers', [])):
+        if not _cheburcheck_flagged(srv, cfg):
+            continue          # synthetic entries are for enabled servers only
+        summary, _records = _cheburcheck_summary_for(srv, cfg, cache)
+        out[str(i)] = {'status': summary['status'],
+                       'probe': summary['probe'],
+                       'remarks': summary['remarks'],
+                       'static_hit': summary['static_hit'],
+                       'scan_mode': summary['scan_mode'],
+                       'enabled': True}
+    return {'enabled': enabled,
+            'running': bool(_CHEBURCHECK_TASK is not None and not _CHEBURCHECK_TASK.done()),
+            'progress': dict(_CHEBURCHECK_PROGRESS),
+            'flags': out}
+
+
+@app.get('/api/servers/{server_id}/cheburcheck', tags=["Servers"])
+async def api_cheburcheck_get(request: Request, server_id: int):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    idx = _cheburcheck_server_index(server_id, data)
+    if idx is None:
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    srv = data['servers'][idx]
+    uid = srv.get('uid')
+    cfg = (data.get('settings') or {}).get('cheburcheck') or {}
+    async with CHEBURCHECK_CACHE_LOCK:
+        cache = {key: dict(records) for key, records in CHEBURCHECK_CACHE.items()
+                 if isinstance(records, dict)}
+    summary, records = _cheburcheck_summary_for(srv, cfg, cache)
+    return {
+        'enabled_for_server': _cheburcheck_flagged(srv, cfg),
+        'global_enabled': bool(cfg.get('enabled')),
+        'interval_hours': cfg.get('interval_hours', 1),
+        'running': uid in _CHEBURCHECK_RUNNING,
+        'checked_at': summary['checked_at'],
+        'status': summary['status'],
+        'target': summary['target'],
+        'probe': summary['probe'],
+        'remarks': summary['remarks'],
+        'static_hit': summary['static_hit'],
+        'scan_mode': summary['scan_mode'],
+        'error': summary['error'],
+        'targets': records,
+    }
+
+
+@app.post('/api/servers/{server_id}/cheburcheck/run', tags=["Servers"])
+async def api_cheburcheck_run(request: Request, server_id: int):
+    """Start a one-shot check of every target of the server in the background.
+
+    A full check takes 15-60s (static + 40 probes). Holding the HTTP request
+    for that long lets a proxy or the browser abort it, which looks like
+    "nothing happened". The caller polls the GET endpoint instead.
+    """
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    idx = _cheburcheck_server_index(server_id, data)
+    if idx is None:
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    srv = data['servers'][idx]
+    uid = srv.get('uid')
+    cfg = (data.get('settings') or {}).get('cheburcheck') or {}
+    if not cfg.get('enabled'):
+        return {'ok': True, 'started': 0, 'reason': 'disabled'}
+    if uid in _CHEBURCHECK_RUNNING:
+        return {'ok': True, 'already_running': True}
+    targets = cheburcheck_targets(srv, cfg)
+    if not targets:
+        return {'ok': True, 'started': 0, 'reason': 'no_targets'}
+    if not _cheburcheck_reserve(uid):
+        return {'ok': True, 'already_running': True}
+    _CHEBURCHECK_RUNNING[uid] = asyncio.create_task(
+        _cheburcheck_run_server(srv, targets))
+    return {'ok': True, 'started': 1}
+
+
+@app.get('/api/settings/cheburcheck', tags=["Settings"])
+async def api_cheburcheck_settings_get(request: Request):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    cfg = (data.get('settings') or {}).get('cheburcheck') or {}
+    srv_map = dict(cfg.get('servers') or {})
+    known = set()
+    resolved = {}
+    for s in data.get('servers', []):
+        uid = s.get('uid')
+        if uid is None:
+            continue
+        known.add(uid)
+        srv_map.setdefault(uid, False)
+        resolved[uid] = cheburcheck_targets(s, cfg)
+    targets = {uid: list(values)
+               for uid, values in (cfg.get('targets') or {}).items()
+               if uid in known and values}
+    token = str(cfg.get('api_token') or '')
+    return {
+        'enabled': bool(cfg.get('enabled')),
+        'interval_hours': int(cfg.get('interval_hours') or 1),
+        'quiet_enabled': bool(cfg.get('quiet_enabled')),
+        'quiet_start': cfg.get('quiet_start', 0),
+        'quiet_end': cfg.get('quiet_end', 0),
+        'servers': srv_map,
+        'targets': targets,
+        'targets_resolved': resolved,
+        # Только признак и хвост токена: сам токен не отдаём ни в каком виде.
+        'api_token_set': bool(token),
+        'api_token_hint': ('••••' + token[-4:]) if token else '',
+    }
+
+
+class CheburcheckSettingsRequest(BaseModel):
+    enabled: Optional[bool] = None
+    interval_hours: Optional[int] = None
+    quiet_enabled: Optional[bool] = None
+    quiet_start: Optional[int] = None
+    quiet_end: Optional[int] = None
+    servers: Optional[dict] = None
+    targets: Optional[object] = None
+    # None / отсутствие поля — «не менять»; "" — удалить; иначе — сохранить.
+    api_token: Optional[str] = None
+
+
+class CheburcheckTokenCheckRequest(BaseModel):
+    api_token: Optional[str] = None
+
+
+@app.post('/api/settings/cheburcheck', tags=["Settings"])
+async def api_cheburcheck_settings_set(request: Request, req: CheburcheckSettingsRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    cfg = data.setdefault('settings', {}).setdefault('cheburcheck', {})
+    known = {s.get('uid') for s in data.get('servers', []) if s.get('uid')}
+    # Validate the override map before touching anything: a bad payload must
+    # leave data.json unchanged (the typed Optional[Dict[str, List[str]]] model
+    # gives 422 and accepts null, so this field is validated by hand).
+    targets_supplied = 'targets' in getattr(req, 'model_fields_set', set())
+    normalized_targets = None
+    if targets_supplied:
+        raw_targets = req.targets
+        if raw_targets is None or not isinstance(raw_targets, dict):
+            return JSONResponse({'error': 'targets must be an object'},
+                                status_code=400)
+        normalized_targets = {}
+        try:
+            for key, values in raw_targets.items():
+                if key not in known:
+                    continue
+                if not isinstance(values, list):
+                    raise ValueError('each value must be a list')
+                addresses = _cheburcheck_normalize_targets(values)
+                if addresses:
+                    normalized_targets[key] = addresses
+        except (TypeError, ValueError) as exc:
+            return JSONResponse({'error': f'invalid targets: {exc}'},
+                                status_code=400)
+    # API-токен: None/отсутствие поля — «не менять», "" — «удалить»,
+    # непустая строка — сохранить. Длина проверяется до любых изменений.
+    token_supplied = ('api_token' in getattr(req, 'model_fields_set', set())
+                      and req.api_token is not None)
+    new_token = None
+    if token_supplied:
+        candidate = str(req.api_token).strip()
+        if candidate and not (8 <= len(candidate) <= 512):
+            return JSONResponse({'error': 'api_token must be 8..512 characters'},
+                                status_code=400)
+        new_token = candidate or None
+    if req.enabled is not None:
+        cfg['enabled'] = bool(req.enabled)
+    if req.interval_hours is not None:
+        cfg['interval_hours'] = max(1, min(24, int(req.interval_hours)))
+    if req.quiet_enabled is not None:
+        cfg['quiet_enabled'] = bool(req.quiet_enabled)
+    if req.quiet_start is not None:
+        cfg['quiet_start'] = max(0, min(23, int(req.quiet_start)))
+    if req.quiet_end is not None:
+        cfg['quiet_end'] = max(0, min(23, int(req.quiet_end)))
+    # An empty window (start == end) is not "always quiet"; drop the flag
+    # instead of blocking every check.
+    if cfg.get('quiet_enabled') and cfg.get('quiet_start') == cfg.get('quiet_end'):
+        cfg['quiet_enabled'] = False
+    cfg.setdefault('servers', {})
+    if req.servers is not None:
+        cur = cfg['servers']
+        for k, v in req.servers.items():
+            # Accept only uids of servers that exist: a stale name from an old
+            # tab must not resurrect a flag for a server that was renamed.
+            if k in known:
+                cur[k] = bool(v)
+    # keep the list in sync with the current fleet (new servers unchecked)
+    for uid in known:
+        cfg['servers'].setdefault(uid, False)
+    if targets_supplied:
+        merged = {key: value
+                  for key, value in (cfg.get('targets') or {}).items()
+                  if key in known and value}
+        for key, values in normalized_targets.items():
+            merged[key] = values
+        for key, values in raw_targets.items():
+            if key in known and isinstance(values, list) and not values:
+                merged.pop(key, None)       # explicit [] removes the override
+        cfg['targets'] = merged
+    if token_supplied:
+        if new_token:
+            cfg['api_token'] = new_token
+        else:
+            cfg.pop('api_token', None)
+    save_data(data)
+    # Применяем сразу, без рестарта: следующий прогон уже видит новый токен.
+    cheburcheck.set_api_token(cfg.get('api_token'))
+    return {'ok': True}
+
+
+@app.post('/api/settings/cheburcheck/token_check', tags=["Settings"])
+async def api_cheburcheck_token_check(request: Request,
+                                      req: Optional[CheburcheckTokenCheckRequest] = None):
+    """Проверить API-токен через GET /api/v1/credits (только админ).
+
+    Токен из тела запроса не сохраняется и в ответ не попадает: наружу уходит
+    только остаток кредитов либо текст ошибки сервиса.
+    """
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    cfg = (load_data().get('settings') or {}).get('cheburcheck') or {}
+    token = None
+    if req is not None and req.api_token is not None:
+        token = str(req.api_token).strip() or None
+    if not token:
+        token = str(cfg.get('api_token') or '').strip() or None
+    if not token:
+        return {'ok': False, 'error': cheburcheck.NO_TOKEN_MESSAGE}
+    try:
+        credits = await cheburcheck.fetch_credits(token)
+    except cheburcheck.CheburcheckApiError as exc:
+        return {'ok': False, 'error': exc.user_message}
+    except Exception as exc:
+        # Сетевой сбой или неожиданный ответ: панель не роняем.
+        logger.warning('cheburcheck token_check failed: %s', exc)
+        return {'ok': False,
+                'error': 'не удалось проверить токен: {}'.format(exc)[:300]}
+    return {'ok': True, 'credits': credits}
+
+
+# --- one-shot boot-restore migration ----------------------------------------
+# Hosts installed before the unit gained [Install] report is-enabled=static and
+# never run `boot`, so their iptables rules vanish at reboot. New installs are
+# already correct; this runs once after a panel upgrade and repairs the old
+# ones without apt, VPN reinstall or manual steps.
+RKN_AUTO_REPAIR = os.environ.get('RKN_AUTO_REPAIR', '1').lower() not in (
+    '0', 'false', 'no', 'off')
+RKN_AUTO_REPAIR_DELAY = 15  # let the panel start serving first; tests patch to 0
+RKN_AUTO_REPAIR_TIMEOUT = 300
+RKN_MIGRATION_KEY = 'rkn_boot_restore_v1'
+
+
+def _rkn_migration_record(data):
+    return (data.setdefault('panel_migrations', {})
+            .setdefault(RKN_MIGRATION_KEY, {}))
+
+
+async def _rkn_note_boot_state(uid, boot_restore, error=None):
+    """Persist only boot/repair fields of one server's rknblock record."""
+    async with DATA_LOCK:
+        data = load_data()
+        idx = _rkn_server_index(data, None, uid)
+        if idx is None:
+            return False
+        rec = dict(data['servers'][idx].get('rknblock') or {})
+        if boot_restore is not None:
+            rec['boot_restore'] = boot_restore
+        if error is not None:
+            rec['last_repair_error'] = error
+        elif error is None and boot_restore == 'enabled':
+            rec['last_repair_error'] = None
+        data['servers'][idx]['rknblock'] = rec
+        save_data(data)
+        return True
+
+
+async def rkn_boot_restore_migration():
+    """Repair legacy RKN installs once, after the panel has started.
+
+    Never raises: one unreachable host must not affect the others or the
+    panel. A failed host leaves the migration incomplete, so the next panel
+    restart retries it; fixed hosts are skipped by the status probe.
+    """
+    if not RKN_AUTO_REPAIR:
+        logger.info("RKN boot-restore migration disabled by RKN_AUTO_REPAIR")
+        return
+    await asyncio.sleep(RKN_AUTO_REPAIR_DELAY)
+    try:
+        data = load_data()
+    except Exception as e:
+        logger.warning(f"RKN boot-restore migration: cannot read data: {e}")
+        return
+    if _rkn_migration_record(data).get('done_at'):
+        return
+    targets = [srv for srv in data.get('servers', [])
+               if (srv.get('rknblock') or {}).get('installed')]
+    if not targets:
+        await _rkn_migration_finish(0)
+        return
+
+    pending = 0
+    for srv in targets:
+        uid = srv.get('uid')
+        label = srv.get('name') or srv.get('host') or uid
+        try:
+            out = await _fetch_rkn_scan_output(srv)
+            parsed = _parse_rkn_scan_output(out, True)
+            boot = parsed.get('boot_restore')
+            unit = parsed.get('unit')
+            if boot is None or unit is None:
+                # Old script (no status fields) or an empty probe: repair is
+                # still safe and installs the current script first.
+                if not out.strip():
+                    raise RuntimeError('empty status probe')
+            if boot == 'enabled' and unit == 'ok':
+                await _rkn_note_boot_state(uid, 'enabled')
+                continue
+
+            err = await _rkn_ssh_run(srv, _rkn_repair_script(), RKN_AUTO_REPAIR_TIMEOUT)
+            if err is not None:
+                detail = 'repair failed'
+                try:
+                    detail = json.loads(err.body).get('error', detail)[:500]
+                except Exception:
+                    pass
+                await _rkn_note_boot_state(uid, boot or 'unknown', detail)
+                logger.warning(f"RKN boot-restore repair failed on {label}: {detail}")
+                pending += 1
+                continue
+
+            out = await _fetch_rkn_scan_output(srv)
+            parsed = _parse_rkn_scan_output(out, True)
+            boot = parsed.get('boot_restore') or 'unknown'
+            await _rkn_note_boot_state(uid, boot)
+            if boot != 'enabled':
+                pending += 1
+                logger.warning(f"RKN boot-restore still not enabled on {label}")
+            else:
+                logger.info(f"RKN boot-restore repaired on {label}")
+        except Exception as e:
+            pending += 1
+            try:
+                await _rkn_note_boot_state(uid, None, str(e)[:500])
+            except Exception:
+                pass
+            logger.warning(f"RKN boot-restore migration failed on {label}: {e}")
+
+    await _rkn_migration_finish(pending)
+
+
+async def _rkn_migration_finish(pending):
+    async with DATA_LOCK:
+        data = load_data()
+        rec = _rkn_migration_record(data)
+        rec['last_attempt_at'] = datetime.now(timezone.utc).isoformat()
+        rec['pending'] = pending
+        if pending == 0:
+            rec['done_at'] = rec['last_attempt_at']
+        save_data(data)
+
+
+# --- one-shot ICMP echo-unblock migration -----------------------------------
+# Older panels added `-p icmp --icmp-type echo-request -j DROP` to INPUT in
+# setup_firewall(). The host itself stopped answering ping, and ICMP that
+# arrived through a tunnel died after decryption, so diagnostics lied. New
+# installs remove the rule instead; this clears it on hosts provisioned by an
+# older panel after a panel upgrade.
+AWP_ICMP_ECHO_MIGRATION = os.environ.get(
+    'AWP_ICMP_ECHO_MIGRATION', '1').lower() not in ('0', 'false', 'no', 'off')
+AWP_ICMP_ECHO_DELAY = 15  # let the panel start serving first; tests patch to 0
+AWP_ICMP_ECHO_TIMEOUT = 120
+AWP_ICMP_ECHO_KEY = 'icmp_echo_unblock_v1'
+
+
+def _icmp_echo_migration_record(data):
+    return (data.setdefault('panel_migrations', {})
+            .setdefault(AWP_ICMP_ECHO_KEY, {}))
+
+
+async def icmp_echo_unblock_migration():
+    """Remove the legacy ICMP echo DROP rule on every host, once.
+
+    Never raises: one unreachable host must not affect the others or the
+    panel. A failed host leaves the migration incomplete, so the next panel
+    restart retries it; the script itself is idempotent, so hosts that are
+    already clean are a no-op.
+    """
+    if not AWP_ICMP_ECHO_MIGRATION:
+        logger.info("ICMP echo migration disabled by AWP_ICMP_ECHO_MIGRATION")
+        return
+    await asyncio.sleep(AWP_ICMP_ECHO_DELAY)
+    try:
+        data = load_data()
+    except Exception as e:
+        logger.warning(f"ICMP echo migration: cannot read data: {e}")
+        return
+    if _icmp_echo_migration_record(data).get('done_at'):
+        return
+    servers = list(data.get('servers') or [])
+    if not servers:
+        await _icmp_echo_migration_finish(0)
+        return
+
+    pending = 0
+    for srv in servers:
+        label = srv.get('name') or srv.get('host') or srv.get('uid')
+        try:
+            err = await _rkn_ssh_run(srv, ICMP_ECHO_ALLOW_SCRIPT,
+                                     AWP_ICMP_ECHO_TIMEOUT)
+            if err is not None:
+                detail = 'unblock failed'
+                try:
+                    detail = json.loads(err.body).get('error', detail)[:500]
+                except Exception:
+                    pass
+                pending += 1
+                logger.warning(f"ICMP echo migration failed on {label}: {detail}")
+                continue
+            logger.info(f"ICMP echo rule cleared on {label}")
+        except Exception as e:
+            pending += 1
+            logger.warning(f"ICMP echo migration failed on {label}: {e}")
+
+    await _icmp_echo_migration_finish(pending)
+
+
+async def _icmp_echo_migration_finish(pending):
+    async with DATA_LOCK:
+        data = load_data()
+        rec = _icmp_echo_migration_record(data)
+        rec['last_attempt_at'] = datetime.now(timezone.utc).isoformat()
+        rec['pending'] = pending
+        if pending == 0:
+            rec['done_at'] = rec['last_attempt_at']
+        save_data(data)
 
 
 def _collect_dashboard_status(data, server):
@@ -4808,6 +7643,8 @@ def _collect_dashboard_status(data, server):
                 for key in ('domain', 'email', 'site_url'):
                     if db_proto.get(key) not in (None, ''):
                         merged[key] = db_proto[key]
+            if protocol_base(proto) == 'xray' and db_proto.get('fingerprint'):
+                merged['fingerprint'] = db_proto['fingerprint']
             if protocol_base(proto) == 'exit':
                 for key in ('subnet', 'public_key', 'obfuscation'):
                     if db_proto.get(key) not in (None, ''):
@@ -4854,6 +7691,19 @@ def _collect_dashboard_status(data, server):
                 return proto, merge_saved_protocol_status(proto, {}, str(e)), str(e)
 
         protocols_to_check = list(dict.fromkeys(BASE_PROTOCOLS + list(server.get('protocols', {}).keys())))
+        # Снимок docker ps -a: если контейнера протокола нет ни в снимке, ни в
+        # data.json, отдельная SSH-команда всё равно вернёт "не установлен".
+        # Раньше на каждый такой протокол уходил круг SSH, и /check держал
+        # первую отрисовку несколько секунд. Команду берём только когда есть
+        # что пропускать: на полностью укомплектованном сервере она лишняя.
+        docker_snapshot = None
+        if any(p not in server.get('protocols', {}) for p in protocols_to_check):
+            try:
+                docker_snapshot = ssh.docker_ps_snapshot()
+            except Exception:
+                docker_snapshot = None
+            if not isinstance(docker_snapshot, dict):
+                docker_snapshot = None
         # One batched round trip for all AWG containers (ps snapshot + configs
         # + clientsTables) instead of 3-5 SSH commands per instance - this is
         # what made /check take seconds on high-latency servers.
@@ -4867,6 +7717,14 @@ def _collect_dashboard_status(data, server):
         # checking them in parallel through one SSH object can produce false
         # negatives and previously caused dynamic AWG instances to be removed.
         for proto in protocols_to_check:
+            container_name = protocol_container_name(proto)
+            if (docker_snapshot is not None
+                    and container_name
+                    and container_name not in docker_snapshot
+                    and proto not in server.get('protocols', {})):
+                status['protocols'][proto] = merge_saved_protocol_status(
+                    proto, {'container_exists': False, 'container_running': False})
+                continue
             proto, result, err = check_proto(proto)
             status['protocols'][proto] = result
             if err:
@@ -4960,7 +7818,7 @@ async def _refresh_dashboard_status(data, original):
 
 @app.post('/api/servers/{server_id}/check', tags=["Servers"])
 async def api_check_server(request: Request, server_id: int, response: Response = None,
-                           server_uid: Optional[str] = None):
+                           server_uid: Optional[str] = None, boot: bool = False):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
@@ -4975,6 +7833,10 @@ async def api_check_server(request: Request, server_id: int, response: Response 
                 if server_uid is not None and original['uid'] != server_uid:
                     return JSONResponse({'error': 'Inventory changed; refresh and retry'}, status_code=409)
                 key = observation_key(DATA_FILE, data, original)
+        if boot:
+            cached = display_cache.peek('status', key)
+            if cached:
+                return dict(cached['data'], cached=True, cached_age=cached['metadata']['age_seconds'])
         status, metadata = await display_cache.observe('status', key,
             lambda: _refresh_dashboard_status(data, original), force=True)
         if response is not None:
@@ -4986,6 +7848,12 @@ async def api_check_server(request: Request, server_id: int, response: Response 
         return e.status
     except ObservationInvalidated as e:
         return JSONResponse({'error': str(e), 'connection': 'changed'}, status_code=409)
+    except (peer_lifecycle_lock.PeerLifecycleBusy,
+            peer_lifecycle_lock.PeerLifecycleUncertain):
+        # Штатные обработчики этих двух состояний отдают 503 с машинным кодом.
+        # Перехватывать их общим except нельзя: пользователь увидит «сервер
+        # недоступен» вместо «требуется восстановление администратором».
+        raise
     except Exception as e:
         logger.exception("Error checking server")
         return JSONResponse({'error': str(e), 'connection': 'failed'}, status_code=500)
@@ -5026,6 +7894,7 @@ INSTALL_PORT_TRANSPORT = {
     'awg': 'udp', 'awg2': 'udp', 'awg3': 'udp', 'awg_legacy': 'udp',
     'wireguard': 'udp', 'exit': 'udp',
     'xray': 'tcp', 'telemt': 'tcp', 'socks5': 'tcp', 'nginx': 'tcp',
+    'haproxy': 'tcp',
 }
 
 
@@ -5045,17 +7914,926 @@ def api_used_ports(request: Request, server_id: int):
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
-@app.post('/api/servers/{server_id}/install', tags=["Protocols"])
-@serialize_peer_lifecycle(wait_for_completion=True)
-async def api_install_protocol(request: Request, server_id: int, req: InstallProtocolRequest):
+# ===== Xray self-steal: mask under the local NGINX site =====
+
+class XraySelfstealRequest(BaseModel):
+    protocol: str = 'xray'
+    nginx_protocol: str = 'nginx'
+
+
+def _docker_networks(ssh, container):
+    out, _, code = ssh.run_sudo_command(
+        f"docker inspect {shlex.quote(str(container))} "
+        f"--format '{{{{json .NetworkSettings.Networks}}}}' 2>/dev/null")
+    if code != 0:
+        return {}
+    try:
+        networks = json.loads(out.strip() or '{}')
+    except ValueError:
+        return {}
+    return networks if isinstance(networks, dict) else {}
+
+
+SELFSTEAL_NET = 'amnezia-selfsteal-net'
+
+
+def _ensure_selfsteal_network(ssh, containers):
+    """Attach the containers to a dedicated user-defined network: docker's
+    embedded DNS then resolves the NGINX name, which survives container
+    re-creation (default-bridge IPs do not). Idempotent and live - no
+    container restart needed."""
+    out, _, code = ssh.run_sudo_command("docker network ls --format '{{.Name}}'")
+    existing = set((out or '').split())
+    if SELFSTEAL_NET not in existing:
+        ssh.run_sudo_command(f"docker network create {SELFSTEAL_NET}")
+    for container in containers:
+        if container and SELFSTEAL_NET not in _docker_networks(ssh, container):
+            ssh.run_sudo_command(
+                f"docker network connect {SELFSTEAL_NET} {shlex.quote(str(container))}")
+
+
+def _selfsteal_dest(xray_networks, nginx_networks, nginx_container):
+    """Container-to-container Reality target. On a shared user-defined
+    docker network the NGINX name resolves via embedded DNS and survives
+    container re-creation. The default bridge has no embedded DNS —
+    there the current IP is the only working target, so fall back to it."""
+    resolvable = (set(xray_networks) & set(nginx_networks)) - {'bridge'}
+    if resolvable:
+        return f"{nginx_container}:443"
+    for networks in (nginx_networks, xray_networks):
+        for info in networks.values():
+            ip = (info or {}).get('IPAddress')
+            if ip:
+                return f"{ip}:443"
+    return None
+
+
+@app.get('/api/servers/{server_id}/xray/selfsteal/plan', tags=["Protocols"])
+def api_xray_selfsteal_plan(request: Request, server_id: int, protocol: str = 'xray'):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
         data = load_data()
         if server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        protocols = server.get('protocols') or {}
+        if protocol_base(protocol) != 'xray' or protocol not in protocols:
+            return JSONResponse({'error': 'Xray instance not found'}, status_code=404)
+        ssh = get_ssh(server)
+        ssh.connect()
+        manager = get_protocol_manager(ssh, protocol)
+        xray_running = manager.check_container_running()
+        state = manager.get_reality_state() if xray_running else None
+
+        xray_container = (protocols.get(protocol) or {}).get('container_name') \
+            or manager.container_name
+        nginx_statuses = []
+        for key in protocols:
+            if protocol_base(key) != 'nginx':
+                continue
+            nginx = get_protocol_manager(ssh, key)
+            status = nginx.get_server_status(key)
+            if not status.get('domain') or not status.get('container_running'):
+                continue
+            nginx_statuses.append((key, status))
+        # The apply provisions a shared user-defined network before it
+        # writes anything; preview the dests it will produce.
+        if nginx_statuses and xray_running:
+            _ensure_selfsteal_network(
+                ssh, [xray_container] + [status['container_name']
+                                         for _, status in nginx_statuses])
+        xray_networks = _docker_networks(ssh, xray_container) if xray_running else {}
+        options = []
+        for key, status in nginx_statuses:
+            dest = _selfsteal_dest(
+                xray_networks,
+                _docker_networks(ssh, status['container_name']),
+                status['container_name'])
+            options.append({
+                'protocol': key,
+                'domain': status['domain'],
+                'container_name': status['container_name'],
+                'port': int(status.get('port') or 443),
+                'dest': dest,
+            })
+        return {
+            'xray_running': xray_running,
+            'network': (state or {}).get('network'),
+            'current_dest': (state or {}).get('dest'),
+            'current_sni': (state or {}).get('sni'),
+            'options': options,
+        }
+    except Exception as e:
+        logger.exception("Error building the xray selfsteal plan")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/xray/selfsteal', tags=["Protocols"])
+def api_xray_selfsteal_apply(request: Request, server_id: int, req: XraySelfstealRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        protocols = server.get('protocols') or {}
+        if protocol_base(req.protocol) != 'xray' or req.protocol not in protocols:
+            return JSONResponse({'error': 'Xray instance not found'}, status_code=404)
+        if protocol_base(req.nginx_protocol) != 'nginx' or req.nginx_protocol not in protocols:
+            return JSONResponse({'error': 'NGINX instance not found'}, status_code=404)
+        ssh = get_ssh(server)
+        ssh.connect()
+        manager = get_protocol_manager(ssh, req.protocol)
+        if not manager.check_container_running():
+            return JSONResponse({'error': 'The Xray container is not running'},
+                                status_code=409)
+        nginx = get_protocol_manager(ssh, req.nginx_protocol)
+        status = nginx.get_server_status(req.nginx_protocol)
+        domain = status.get('domain')
+        if not domain or not status.get('container_running'):
+            return JSONResponse({'error': 'The NGINX site is not ready'},
+                                status_code=409)
+        xray_container = (protocols.get(req.protocol) or {}).get('container_name') \
+            or manager.container_name
+        dest = _selfsteal_dest(
+            _docker_networks(ssh, xray_container),
+            _docker_networks(ssh, status['container_name']),
+            status['container_name'])
+        if not dest:
+            return JSONResponse({'error': 'No route from the Xray container to NGINX'},
+                                status_code=409)
+        result = manager.apply_selfsteal(domain, dest)
+        result['protocol'] = req.protocol
+        return result
+    except Exception as e:
+        logger.exception("Error applying the xray selfsteal")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+# ===== server IPv4 policy: egress SNAT + ingress binding =====
+# Egress: one SNAT rule per docker bridge subnet on the host sends all
+# container traffic out through a second public IP (entry != exit per
+# the Reality setup guidance). Each rule mirrors docker's own masquerade
+# shape (-s <subnet> ! -o <that bridge>) and covers every subnet the
+# traffic can originate from - with docker 28+ the default gateway may
+# end up on any attached network, e.g. the self-steal one. sendThrough
+# cannot do this from a bridge container - the public IP is not visible
+# in its network namespace.
+# The rules are written to every installed iptables backend (nft and
+# legacy) - a plain `iptables` lookup may resolve differently for the
+# panel's non-login SSH shell than for a root shell.
+# The apply is verified end-to-end: a curl from inside the VPN container
+# must report the egress address, otherwise the rules are rolled back.
+# Ingress: pins the published ports to one host address at container
+# (re)creation, so the egress address stops exposing the VPN listener.
+
+def _ipv4_assigned(ssh, ip):
+    """Is the IPv4 address assigned to an interface of this server?"""
+    out, _, code = ssh.run_sudo_command("ip -4 addr show")
+    return code == 0 and f"{ip}/" in (out or '')
+
+
+def _egress_verify(ssh, ip):
+    """Does the address actually egress? A curl bound to it must report
+    it back - this catches providers that accept the assignment but
+    filter foreign sources, and revoked/undelivered addresses."""
+    out, _, code = ssh.run_command(
+        f"curl -4 -s --interface {shlex.quote(ip)} --max-time 8 "
+        f"https://api.ipify.org")
+    return code == 0 and (out or '').strip() == ip
+
+
+def _docker_subnets(ssh):
+    """(subnet, bridge iface) for every bridge network on the host. The
+    SNAT must cover each subnet container traffic can originate from -
+    with docker 28+ the default gateway (and so the source address) may
+    end up on any attached network, e.g. the self-steal one."""
+    out, _, code = ssh.run_sudo_command(
+        "docker network ls --format '{{.Name}} {{.Driver}}'")
+    if code != 0:
+        return []
+    names = [parts[0] for parts in
+             (p.split() for p in (out or '').split('\n'))
+             if len(parts) == 2 and parts[1] == 'bridge']
+    subnets = []
+    for name in names:
+        out, _, code = ssh.run_sudo_command(
+            "docker network inspect " + shlex.quote(name)
+            + " --format '{{(index .IPAM.Config 0).Subnet}}|"
+            "{{index .Options \"com.docker.network.bridge.name\"}}|{{.Id}}'")
+        if code != 0 or '|' not in (out or ''):
+            continue
+        subnet, opt, net_id = out.strip().split('|', 2)
+        if opt in ('<no value>', 'nil'):
+            opt = ''
+        try:
+            net = ipaddress.ip_network(subnet, strict=False)
+        except ValueError:
+            continue
+        if net.version != 4:
+            continue
+        iface = opt or ('docker0' if name == 'bridge'
+                        else 'br-' + net_id[:12])
+        subnets.append((subnet, iface))
+    return subnets
+
+
+def _egress_probe_containers(server):
+    """VPN containers whose traffic the egress IP must serve."""
+    vpn_bases = ('xray', 'awg', 'awg2', 'awg3', 'awg_legacy', 'wireguard')
+    names = []
+    for key, info in (server.get('protocols') or {}).items():
+        if protocol_base(key) in vpn_bases \
+                and isinstance(info, dict) and info.get('container_name'):
+            names.append(info['container_name'])
+    return names
+
+
+def _egress_container_probe(ssh, containers):
+    """The only honest egress check: plain curl from inside a VPN
+    container. With the SNAT rule in place it reports the egress
+    address; without it, the main one. Images without curl are probed
+    via nsenter (the host's curl inside the container's network
+    namespace). Returns the observed IP or None when no container
+    answers (probe impossible)."""
+    for container in containers:
+        out, _, code = ssh.run_sudo_command(
+            f"docker exec {shlex.quote(str(container))} "
+            f"curl -4 -s --max-time 8 https://api.ipify.org")
+        observed = (out or '').strip()
+        if code == 0 and observed:
+            return observed
+        pid_out, _, pid_code = ssh.run_sudo_command(
+            f"docker inspect -f '{{{{.State.Pid}}}}' "
+            f"{shlex.quote(str(container))} 2>/dev/null")
+        pid = (pid_out or '').strip()
+        if pid_code != 0 or not pid.isdigit():
+            continue
+        out, _, code = ssh.run_sudo_command(
+            f"nsenter -n -t {pid} curl -4 -s --max-time 8 "
+            f"https://api.ipify.org")
+        observed = (out or '').strip()
+        if code == 0 and observed:
+            return observed
+    return None
+
+
+def _iptables_bins(ssh):
+    """Explicit iptables backend binaries. A plain `iptables` lookup can
+    resolve to a different backend for the panel's non-login SSH shell
+    than for an interactive root shell; naming the backends removes the
+    guesswork. Both are written when present - the kernel consults both
+    and the first NAT decision wins, so the rule works either way."""
+    out, _, code = ssh.run_command(
+        'command -v iptables-nft || true; command -v iptables-legacy || true')
+    bins = [line.strip() for line in (out or '').split('\n') if line.strip()]
+    return bins or ['iptables']
+
+
+def _snat_rules_for(ssh, subnets):
+    """Managed POSTROUTING SNAT rules: those sourced from inside any
+    docker subnet, across every installed iptables backend. The panel
+    owns the egress policy for container traffic, so a stale manual rule
+    like -s 172.17.0.0/24 inside docker0's /16 is picked up too. Rules
+    without -s (host-wide) are never touched. Live spec strings, usable
+    for -D deletion."""
+    pools = [ipaddress.ip_network(s) for s, _ in subnets]
+    specs = set()
+    for bin_name in _iptables_bins(ssh):
+        out, _, code = ssh.run_sudo_command(
+            f'{bin_name} -t nat -S POSTROUTING')
+        if code != 0:
+            continue
+        for line in (out or '').split('\n'):
+            line = line.strip()
+            if not line.startswith('-A POSTROUTING') \
+                    or '-j SNAT' not in line:
+                continue
+            match = re.search(r'-s (\S+) ', line)
+            if not match:
+                continue
+            try:
+                src = ipaddress.ip_network(match.group(1), strict=False)
+            except ValueError:
+                continue
+            if any(src.subnet_of(pool) for pool in pools):
+                specs.add(line[len('-A POSTROUTING '):].strip())
+    return sorted(specs)
+
+
+def _persist_egress(ssh, subnets, ip):
+    """Boot-persistent re-application via a script + systemd oneshot unit
+    on the server (netfilter-persistent may only save one iptables
+    backend; the script is deterministic)."""
+    rules = []
+    for bin_name in _iptables_bins(ssh):
+        for subnet, iface in subnets:
+            rules.append(
+                f'{bin_name} -t nat -C POSTROUTING -s {subnet} ! -o {iface} '
+                f'-j SNAT --to-source {ip} 2>/dev/null || '
+                f'{bin_name} -t nat -I POSTROUTING -s {subnet} ! -o {iface} '
+                f'-j SNAT --to-source {ip}')
+    script = ('#!/bin/sh' + chr(10)
+              + '# Managed by Amnezia Web Panel: re-applies the egress SNAT'
+              + chr(10) + (chr(10).join(rules) or 'true') + chr(10))
+    unit = ('[Unit]' + chr(10)
+            + 'Description=Amnezia Web Panel egress SNAT' + chr(10)
+            + 'After=network-online.target' + chr(10)
+            + 'Wants=network-online.target' + chr(10)
+            + chr(10) + '[Service]' + chr(10)
+            + 'Type=oneshot' + chr(10)
+            + 'ExecStart=/opt/amnezia/egress-snat.sh' + chr(10)
+            + chr(10) + '[Install]' + chr(10)
+            + 'WantedBy=multi-user.target' + chr(10))
+    ssh.run_sudo_command(
+        'systemctl disable --now amnezia-egress-snat 2>/dev/null || true')
+    ssh.upload_file_sudo(script, '/opt/amnezia/egress-snat.sh')
+    ssh.run_sudo_command('chmod +x /opt/amnezia/egress-snat.sh')
+    ssh.upload_file_sudo(unit, '/etc/systemd/system/amnezia-egress-snat.service')
+    ssh.run_sudo_command('systemctl daemon-reload')
+    ssh.run_sudo_command('systemctl enable amnezia-egress-snat')
+
+
+def _clear_egress(ssh, subnets):
+    """Remove the managed SNAT rules and the boot persistence."""
+    bins = _iptables_bins(ssh)
+    for spec in _snat_rules_for(ssh, subnets):
+        for bin_name in bins:
+            ssh.run_sudo_command(
+                f'{bin_name} -t nat -D POSTROUTING ' + spec)
+    ssh.run_sudo_command(
+        'systemctl disable --now amnezia-egress-snat 2>/dev/null || true')
+    ssh.run_sudo_command('rm -f /opt/amnezia/egress-snat.sh '
+                         '/etc/systemd/system/amnezia-egress-snat.service')
+    ssh.run_sudo_command('systemctl daemon-reload 2>/dev/null || true')
+
+
+class Ipv4EgressRequest(BaseModel):
+    ip: str = ''
+
+
+class Ipv4IngressRequest(BaseModel):
+    ip: str = ''
+
+
+@app.get('/api/servers/{server_id}/ipv4/status', tags=["Servers"])
+def api_ipv4_status(request: Request, server_id: int):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        ssh = get_ssh(server)
+        ssh.connect()
+        try:
+            subnets = _docker_subnets(ssh)
+            egress_ip = server.get('egress_ip') or ''
+            probe_ip = _egress_container_probe(
+                ssh, _egress_probe_containers(server))
+            state = {
+                'ingress_ip': server.get('ingress_ip') or '',
+                'egress_ip': egress_ip,
+                'subnets': [s for s, _ in subnets],
+                'snat_rules': _snat_rules_for(ssh, subnets),
+                'assigned': bool(egress_ip) and _ipv4_assigned(ssh, egress_ip),
+                'egress_verified': bool(egress_ip) and _egress_verify(ssh, egress_ip),
+                'container_egress_ip': probe_ip,
+                'container_ok': bool(egress_ip) and probe_ip == egress_ip,
+            }
+        finally:
+            ssh.disconnect()
+        return state
+    except Exception as e:
+        logger.exception("Error reading the server IPv4 policy")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/ipv4/egress', tags=["Servers"])
+async def api_ipv4_egress(request: Request, server_id: int,
+                          req: Ipv4EgressRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        _install_ops_load()
+        if _install_running(server_id):
+            return JSONResponse(
+                {'error': 'Another operation is running on this server',
+                 'code': 'operation_in_progress'}, status_code=409)
+        server = data['servers'][server_id]
+        ip = (req.ip or '').strip()
+        ssh = get_ssh(server)
+        ssh.connect()
+        try:
+            subnets = _docker_subnets(ssh)
+            if not subnets:
+                return JSONResponse(
+                    {'error': 'no docker bridge networks found on this '
+                              'server'}, status_code=409)
+            if ip:
+                try:
+                    ipaddress.IPv4Address(ip)
+                except ValueError:
+                    return JSONResponse({'error': 'Invalid IPv4 address'},
+                                        status_code=400)
+                if not _ipv4_assigned(ssh, ip):
+                    return JSONResponse(
+                        {'error': f'{ip} is not assigned to any interface '
+                                  'of this server - the provider must '
+                                  'deliver it first'}, status_code=409)
+                if not _egress_verify(ssh, ip):
+                    return JSONResponse(
+                        {'error': f'{ip} does not egress: a curl bound to it '
+                                  'did not report it back. Check with the '
+                                  'provider that the address is routed'},
+                        status_code=409)
+            bins = _iptables_bins(ssh)
+            for spec in _snat_rules_for(ssh, subnets):
+                for bin_name in bins:
+                    ssh.run_sudo_command(
+                        f'{bin_name} -t nat -D POSTROUTING ' + spec)
+            if ip:
+                errors = []
+                for bin_name in bins:
+                    for subnet, iface in subnets:
+                        _, err, code = ssh.run_sudo_command(
+                            f'{bin_name} -t nat -I POSTROUTING -s {subnet} '
+                            f'! -o {iface} -j SNAT --to-source {ip}')
+                        if code != 0:
+                            errors.append(
+                                f'{bin_name} {subnet}: '
+                                f'{(err or "").strip() or "iptables failed"}')
+                landed = _snat_rules_for(ssh, subnets)
+                if errors or not landed:
+                    # A silently skipped rule would leave the exit policy
+                    # half-applied - undo whatever landed and say so.
+                    for spec in landed:
+                        for bin_name in bins:
+                            ssh.run_sudo_command(
+                                f'{bin_name} -t nat -D POSTROUTING ' + spec)
+                    return JSONResponse(
+                        {'error': 'Failed to insert the SNAT rules: '
+                                  + '; '.join(errors
+                                              or ['rules did not persist'])},
+                        status_code=409)
+                observed = _egress_container_probe(
+                    ssh, _egress_probe_containers(server))
+                if observed is not None and observed != ip:
+                    # The rules exist but the container path does not go
+                    # through them - leave the server as it was.
+                    for spec in _snat_rules_for(ssh, subnets):
+                        for bin_name in bins:
+                            ssh.run_sudo_command(
+                                f'{bin_name} -t nat -D POSTROUTING ' + spec)
+                    return JSONResponse(
+                        {'error': f'The SNAT rules were inserted, but the '
+                                  f'container still egresses as '
+                                  f'{observed} instead of {ip} - rolled '
+                                  'back. Check the host routing and '
+                                  'docker networks'},
+                        status_code=409)
+                _persist_egress(ssh, subnets, ip)
+            else:
+                _clear_egress(ssh, subnets)
+        finally:
+            ssh.disconnect()
+        server['egress_ip'] = ip or None
+        save_data(data)
+        return {'status': 'success', 'egress_ip': ip or None}
+    except Exception as e:
+        logger.exception("Error applying the egress IP")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/ipv4/ingress', tags=["Servers"])
+async def api_ipv4_ingress(request: Request, server_id: int,
+                           req: Ipv4IngressRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        ip = (req.ip or '').strip()
+        if ip:
+            try:
+                ipaddress.IPv4Address(ip)
+            except ValueError:
+                return JSONResponse({'error': 'Invalid IPv4 address'},
+                                    status_code=400)
+            ssh = get_ssh(server)
+            ssh.connect()
+            try:
+                if not _ipv4_assigned(ssh, ip):
+                    return JSONResponse(
+                        {'error': f'{ip} is not assigned to any interface '
+                                  'of this server - the provider must '
+                                  'deliver it first'}, status_code=409)
+            finally:
+                ssh.disconnect()
+        server['ingress_ip'] = ip or None
+        save_data(data)
+        return {'status': 'success', 'ingress_ip': ip or None,
+                'applied': False}
+    except Exception as e:
+        logger.exception("Error saving the ingress IP")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/ipv4/ingress/recreate', tags=["Servers"])
+async def api_ipv4_ingress_recreate(request: Request, server_id: int):
+    """Recreate the xray containers now, publishing their ports on the
+    saved ingress address. Brief downtime."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        _install_ops_load()
+        if _install_running(server_id):
+            return JSONResponse(
+                {'error': 'Another operation is running on this server',
+                 'code': 'operation_in_progress'}, status_code=409)
+        server = data['servers'][server_id]
+        ingress_ip = (server.get('ingress_ip') or '').strip() or None
+        ssh = get_ssh(server)
+        ssh.connect()
+        if ingress_ip and not _ipv4_assigned(ssh, ingress_ip):
+            ssh.disconnect()
+            return JSONResponse(
+                {'error': f'{ingress_ip} is not assigned to any interface '
+                          'of this server - the provider must deliver it '
+                          'first'}, status_code=409)
+        recreated = []
+        try:
+            awg_bases = ('awg', 'awg2', 'awg3', 'awg_legacy')
+            for key in (server.get('protocols') or {}):
+                base = protocol_base(key)
+                if base == 'xray':
+                    manager = get_protocol_manager(ssh, key)
+                    await asyncio.to_thread(manager.recreate_container,
+                                            ingress_ip=ingress_ip)
+                    recreated.append(key)
+                elif base in awg_bases:
+                    manager = get_protocol_manager(ssh, key)
+                    await asyncio.to_thread(manager.recreate_container,
+                                            protocol_type=key,
+                                            ingress_ip=ingress_ip)
+                    recreated.append(key)
+            if recreated:
+                # A fresh xray container loses the panel-managed network
+                # attachments - restore them (self-steal dest depends on
+                # the shared network). AWG has no self-steal attachment.
+                xray_containers = []
+                for key in recreated:
+                    if protocol_base(key) != 'xray':
+                        continue
+                    record = (server.get('protocols') or {}).get(key, {})
+                    xray_containers.append(record.get('container_name')
+                                           or get_protocol_manager(
+                                               ssh, key).container_name)
+                if xray_containers:
+                    _ensure_selfsteal_network(ssh, xray_containers)
+        finally:
+            ssh.disconnect()
+        return {'status': 'success', 'recreated': recreated,
+                'ingress_ip': ingress_ip}
+    except Exception as e:
+        logger.exception("Error recreating containers for the ingress IP")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+# ===== staged install operations (marketplace apps and protocols) =====
+#
+# Every long install (protocol, Smart Route, RKN Block) runs as a background
+# task and reports the same staged progress the AWG plugin updater reports.
+# There is deliberately no cancel: an interrupted install leaves the server in
+# an unknown state, so it always runs to the end.
+#
+# Explicit step numbers per flow: the UI shows "step N of TOTAL" and the bar
+# only moves when a stage boundary is crossed, never backwards.
+
+PROTOCOL_INSTALL_STAGES = {'start': 1, 'docker': 2, 'host': 3, 'build': 4,
+                           'run': 6, 'config': 8, 'firewall': 9, 'done': 10}
+PROTOCOL_INSTALL_TOTAL = 10
+
+SMARTROUTE_INSTALL_STAGES = {'start': 1, 'prepare': 2, 'script': 3,
+                             'units': 4, 'activate': 5, 'download': 6,
+                             'verify': 7, 'done': 8}
+SMARTROUTE_INSTALL_TOTAL = 8
+
+# The bundled installer runs these phases one by one over the same SSH session.
+RKN_INSTALL_PHASES = ('preflight', 'packages', 'download', 'files',
+                      'services', 'blocking', 'verify')
+RKNBLOCK_INSTALL_STAGES = {'start': 1, 'preflight': 2, 'packages': 3,
+                           'download': 4, 'files': 5, 'services': 6,
+                           'blocking': 7, 'verify': 8, 'done': 9}
+RKNBLOCK_INSTALL_TOTAL = 9
+
+WARP_INSTALL_STAGES = {'start': 1, 'arch': 2, 'download': 3, 'register': 4,
+                       'profile': 5, 'startsh': 6, 'done': 7}
+WARP_INSTALL_TOTAL = 7
+
+XRAY_UPDATE_STAGES = {'start': 1, 'host': 2, 'version': 3, 'arch': 4,
+                      'build': 5, 'verify': 6, 'swap': 7, 'check': 8, 'done': 9}
+XRAY_UPDATE_TOTAL = 9
+
+FLOW_STAGES = {
+    'protocol': PROTOCOL_INSTALL_STAGES,
+    'smartroute': SMARTROUTE_INSTALL_STAGES,
+    'rknblock': RKNBLOCK_INSTALL_STAGES,
+    'warp': WARP_INSTALL_STAGES,
+    'xray_update': XRAY_UPDATE_STAGES,
+}
+FLOW_TOTALS = {
+    'protocol': PROTOCOL_INSTALL_TOTAL,
+    'smartroute': SMARTROUTE_INSTALL_TOTAL,
+    'rknblock': RKNBLOCK_INSTALL_TOTAL,
+    'warp': WARP_INSTALL_TOTAL,
+    'xray_update': XRAY_UPDATE_TOTAL,
+}
+
+INSTALL_OP_TTL = 60 * 60
+INSTALL_OP_KEEP = 20
+_INSTALL_OPS = {}
+_INSTALL_ACTIVE = {}
+_INSTALL_OPS_LOADED = {'done': False}
+_INSTALL_OPS_IO_LOCK = threading.Lock()
+
+
+def _install_stage_step(flow, stage):
+    """(step, total) for a stage of this flow, or None for unknown stages."""
+    steps = FLOW_STAGES.get(flow) or {}
+    step = steps.get(stage)
+    if step is None:
+        return None
+    return step, FLOW_TOTALS.get(flow) or max(steps.values())
+
+
+def _install_ops_store_path():
+    """Journal next to data.json; an install outlives a panel restart."""
+    return os.path.join(os.path.dirname(DATA_FILE), 'install_ops.json')
+
+
+def _install_ops_save():
+    path = _install_ops_store_path()
+    tmp = path + '.tmp'
+    try:
+        with _INSTALL_OPS_IO_LOCK:
+            with open(tmp, 'w', encoding='utf-8') as handle:
+                json.dump(list(_INSTALL_OPS.values()), handle, ensure_ascii=False)
+            os.replace(tmp, path)
+    except Exception:
+        # Persistence is a convenience: never fail an install because the
+        # journal file cannot be written.
+        logger.warning("Cannot persist install operations", exc_info=True)
+
+
+def _install_ops_load():
+    """Load the journal once, after the process that owned the SSH is gone.
+
+    A stored 'running' operation is reported as failed/interrupted: the panel
+    never claims an install finished when it did not.
+    """
+    if _INSTALL_OPS_LOADED['done']:
+        return
+    _INSTALL_OPS_LOADED['done'] = True
+    path = _install_ops_store_path()
+    try:
+        with open(path, encoding='utf-8') as handle:
+            stored = json.load(handle)
+    except Exception:
+        return
+    if not isinstance(stored, list):
+        return
+    for op in stored:
+        if not isinstance(op, dict) or not op.get('id'):
+            continue
+        if op.get('state') == 'running':
+            op['state'] = 'failed'
+            op['error'] = {
+                'code': 'interrupted',
+                'message': 'the panel restarted during the installation; '
+                           'check the server state',
+            }
+            op.setdefault('lines', []).append({
+                'ts': datetime.now().isoformat(timespec='seconds'),
+                'stage': 'error',
+                'text': 'panel restarted before the installation finished',
+            })
+            op['stage'] = 'error'
+            op['finished_at'] = datetime.now().isoformat(timespec='seconds')
+            op['finished_ts'] = datetime.now().timestamp()
+        _INSTALL_OPS[op['id']] = op
+    _install_ops_prune()
+
+
+def _install_ops_prune():
+    now = datetime.now().timestamp()
+    for op_id, op in list(_INSTALL_OPS.items()):
+        if op.get('finished_ts') and now - op['finished_ts'] > INSTALL_OP_TTL:
+            _INSTALL_OPS.pop(op_id, None)
+    if len(_INSTALL_OPS) > INSTALL_OP_KEEP:
+        finished = sorted(
+            (op for op in _INSTALL_OPS.values() if op.get('finished_ts')),
+            key=lambda op: op['finished_ts'],
+        )
+        for op in finished[:max(0, len(_INSTALL_OPS) - INSTALL_OP_KEEP)]:
+            _INSTALL_OPS.pop(op['id'], None)
+
+
+def op_create(server_id, flow, total=None):
+    """Register a running install and persist it before any work starts."""
+    _install_ops_load()
+    _install_ops_prune()
+    op = {
+        'id': uuid.uuid4().hex,
+        'server_id': server_id,
+        'flow': flow,
+        'state': 'running',
+        'stage': 'start',
+        'lines': [],
+        'result': None,
+        'error': None,
+        'step': 0,
+        'total': total or FLOW_TOTALS.get(flow) or 10,
+        'percent': 0,
+        'started_at': datetime.now().isoformat(timespec='seconds'),
+    }
+    _INSTALL_OPS[op['id']] = op
+    _INSTALL_ACTIVE[(server_id, flow)] = op['id']
+    _install_ops_save()
+    return op
+
+
+def op_log(op, stage, message):
+    """Append a detail line, advance the stage and mirror it to the panel log."""
+    text = str(message)[-2000:]
+    op.setdefault('lines', []).append({
+        'ts': datetime.now().isoformat(timespec='seconds'),
+        'stage': stage,
+        'text': text,
+    })
+    mapped = _install_stage_step(op.get('flow'), stage)
+    if mapped:
+        step, total = mapped
+        op['stage'] = stage
+        if step > op.get('step', 0):
+            op['step'] = step
+            op['total'] = total
+            op['percent'] = int(round(step * 100.0 / total))
+    logger.info("install %s server %s stage %s: %s",
+                op.get('flow'), op.get('server_id'), stage, text[:300])
+    _install_ops_save()
+
+
+def op_finish(op, state, result=None, error=None):
+    op['state'] = state
+    op['result'] = result
+    op['error'] = error
+    op['finished_at'] = datetime.now().isoformat(timespec='seconds')
+    op['finished_ts'] = datetime.now().timestamp()
+    if state == 'success':
+        op['percent'] = 100
+        op['step'] = op.get('total', 0)
+        op['stage'] = 'done'
+    else:
+        op['stage'] = 'error'
+    active_key = (op.get('server_id'), op.get('flow'))
+    if _INSTALL_ACTIVE.get(active_key) == op.get('id'):
+        _INSTALL_ACTIVE.pop(active_key, None)
+    _install_ops_save()
+
+
+def _install_op_for_protocol(server_id, protocol):
+    """Newest operation of a protocol on one server.
+
+    A concrete instance key ("awg3__2") matches only itself. A base request
+    ("awg3") also matches instances derived from it: a new instance is
+    polled by the base name, because the panel only learns its key
+    ("awg3__6") from the install response, not from the request.
+    """
+    allow_base = '__' not in str(protocol or '')
+    base = protocol_base(protocol)
+    for op in reversed(list(_INSTALL_OPS.values())):
+        if op.get('server_id') != server_id:
+            continue
+        op_protocol = op.get('protocol')
+        if not op_protocol:
+            continue
+        if op_protocol == protocol:
+            return op
+        if allow_base and protocol_base(op_protocol) == base:
+            return op
+    return None
+
+
+def _install_op_payload(op, offset=0):
+    """Poll payload shared by every install flow."""
+    lines = op.get('lines') or []
+    offset = max(0, offset)
+    return {
+        'operation_id': op['id'],
+        'flow': op.get('flow'),
+        'state': op.get('state'),
+        'step': op.get('step', 0),
+        'total': op.get('total', 0),
+        'percent': op.get('percent', 0),
+        'result': op.get('result'),
+        'error': op.get('error'),
+        'started_at': op.get('started_at'),
+        'finished_at': op.get('finished_at'),
+        'lines': lines[offset:],
+        'next_offset': len(lines),
+    }
+
+
+def _install_op_of_server(op_id, server_id):
+    """Operation by id, only when it belongs to this server."""
+    op = _INSTALL_OPS.get(op_id)
+    if not op or op.get('server_id') != server_id:
+        return None
+    return op
+
+
+def _install_running(server_id):
+    """True while an install or an AWG plugin update holds this server.
+
+    Registries are process-local: this guard stops the common case, not a
+    host whose install was started by another panel process.
+    """
+    _install_ops_load()
+    for op in list(_INSTALL_OPS.values()):
+        if (op.get('server_id') == server_id
+                and op.get('state') in ('running', 'starting')):
+            return True
+    for (active_server, _flow) in list(_INSTALL_ACTIVE):
+        if active_server == server_id:
+            return True
+    for key in list(_awg_plugin_active):
+        if key[0] == server_id:
+            return True
+    return False
+
+
+@app.get('/api/servers/{server_id}/install/progress', tags=["Protocols"])
+def api_install_progress(request: Request, server_id: int,
+                         protocol: str | None = None,
+                         operation_id: str | None = None, offset: int = 0):
+    """Poll one install operation by id, or the last one of a protocol."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    _install_ops_load()
+    if operation_id:
+        op = _install_op_of_server(operation_id, server_id)
+        if not op:
+            return JSONResponse({'error': 'Installation not found',
+                                 'code': 'install_not_found'},
+                                status_code=404)
+        payload = _install_op_payload(op, offset)
+        payload['stage'] = op.get('stage')
+        if op.get('protocol'):
+            payload['protocol'] = op.get('protocol')
+        return payload
+    if not protocol:
+        return JSONResponse({'error': 'protocol or operation_id is required'},
+                            status_code=400)
+    op = _install_op_for_protocol(server_id, protocol)
+    if not op:
+        return JSONResponse({'error': 'Installation not found', 'code': 'install_not_found'},
+                            status_code=404)
+    payload = _install_op_payload(op, offset)
+    payload['protocol'] = protocol
+    payload['stage'] = op.get('stage')
+    return payload
+
+
+@app.post('/api/servers/{server_id}/install', tags=["Protocols"])
+@serialize_peer_lifecycle(wait_for_completion=True)
+async def api_install_protocol(request: Request, server_id: int, req: InstallProtocolRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    op = None
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
         if not is_valid_protocol(req.protocol):
             return JSONResponse({'error': 'Invalid protocol type'}, status_code=400)
+        _install_ops_load()
+        if (server_id, 'protocol') in _INSTALL_ACTIVE:
+            return JSONResponse(
+                {'error': 'A protocol installation is already running on this server',
+                 'code': 'install_in_progress'},
+                status_code=409)
 
         server = data['servers'][server_id]
         if 'protocols' not in server:
@@ -5068,6 +8846,13 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
         else:
             install_protocol = req.protocol
         install_base = protocol_base(install_protocol)
+        warp_record = warp_proto_record(warp_state_store.load(), server.get('uid'),
+                                        install_protocol)
+        if (warp_record.get('warp') or {}).get('registered') \
+                or warp_link(warp_record):
+            # A registered/linked instance must be unlinked before reinstall:
+            # a fresh container would silently lose its WARP state.
+            raise SrvWarpError('srv_warp_registered_unlink_first', 409)
         # A reinstalled entry keeps its exit link and is re-linked below
         previous_link = None
         # Where an instance is published is a property of the network, not
@@ -5090,6 +8875,16 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
                 normalize_special_junk(awg_special_junk)
             except ValueError as e:
                 return JSONResponse({'error': str(e)}, status_code=400)
+        # Masking domain of the generated I1. Empty means "pick at random":
+        # the manager still generates a per-instance packet, so an install
+        # that never opened the I1 block cannot inherit the shared default.
+        i1_domain = None
+        if install_base in AWG_PROTOCOLS:
+            try:
+                i1_domain = awg_i1_domain_from(req.awg_i1_domain, req.awg_i1_pool)
+            except ValueError as e:
+                return JSONResponse({'error': str(e), 'code': 'bad_i1_domain'},
+                                    status_code=400)
 
         ssh = await asyncio.to_thread(get_ssh, server)
         await asyncio.to_thread(ssh.connect)
@@ -5106,8 +8901,57 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
                               f'Choose another port.'},
                     status_code=400)
 
+        op = op_create(server_id, 'protocol', PROTOCOL_INSTALL_TOTAL)
+        op['protocol'] = install_protocol
+        op_log(op, 'start', f"installing {protocol_display_name(install_protocol)} "
+                            f"on {server.get('name') or server.get('host') or server_id}")
+        op_log(op, 'docker', 'checking Docker on the server')
         docker_install_log = await asyncio.to_thread(ensure_docker_installed, ssh)
+        if docker_install_log:
+            for line in str(docker_install_log).splitlines():
+                op_log(op, 'docker', line)
+        else:
+            op_log(op, 'docker', 'Docker is already installed')
         manager = get_protocol_manager(ssh, install_protocol)
+
+        # IPv6 for the new instance: AWG_IPV6 overrides the server preference,
+        # otherwise the preference and auto-detection keep the legacy
+        # behaviour. An instance that is about to be linked to the default
+        # exit node must stay IPv4-only.
+        default_uid = ((data.get('settings', {}).get('exit_nodes') or {}).get('default_exit_uid') or '').strip()
+        will_link_default = install_base in AWG_PROTOCOLS and should_link_default_exit(
+            default_uid, server.get('uid'), True, reinstall, previous_link)
+        ipv6_pref = server.get('ipv6_new_instances')
+        env_pref = (os.environ.get('AWG_IPV6') or 'auto').strip().lower()
+        if env_pref == 'off':
+            ipv6_pref = False
+        elif env_pref == 'on':
+            ipv6_pref = True
+        # An exit link cannot carry IPv6: exit0.conf allows only 0.0.0.0/0 and
+        # its kill-switch blackholes ::/0. A reinstall that inherits a link
+        # must therefore inherit IPv4-only too, even with AWG_IPV6=on.
+        carries_exit_link = bool(previous_link) and install_base in AWG_PROTOCOLS
+        forced_ipv6_off = False
+        if (will_link_default or carries_exit_link) and ipv6_pref is not False:
+            ipv6_pref = False
+            forced_ipv6_off = True
+        # IPv6 is an AWG-only instance property: the preference never reaches
+        # the install call of any other protocol, and only AWGManager knows how
+        # to probe Docker for it. Probing unconditionally crashed installs of
+        # telemt / socks5 / xray / exit nodes with
+        # "'<Manager>' object has no attribute '_docker_ipv6_info'" whenever the
+        # server preference was "on" or AWG_IPV6=on.
+        if ipv6_pref is True and env_pref != 'off' and install_base in AWG_PROTOCOLS:
+            docker_info = await asyncio.to_thread(manager._docker_ipv6_info)
+            if not docker_info.get('ipv6_enabled'):
+                ssh.disconnect()
+                message = ('Docker IPv6 is not enabled on this host. '
+                           'Apply the Docker IPv6 settings first.')
+                op_log(op, 'docker', message)
+                op_finish(op, 'failed', error={'code': 'docker_pending',
+                                               'message': message})
+                return JSONResponse({'error': message, 'code': 'docker_pending'},
+                                    status_code=409)
 
         # Pass parameters to installer
         install_kwargs = None
@@ -5124,7 +8968,12 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
             )
         elif install_base == 'xray':
             install_args = ()
-            install_kwargs = dict(port=req.port)
+            install_kwargs = dict(
+                port=req.port,
+                transport=req.xray_transport or 'tcp',
+                site_name=(req.xray_domain or '').strip() or 'yahoo.com',
+                ingress_ip=(server.get('ingress_ip') or None),
+            )
         elif install_base == 'wireguard':
             install_args = ()
             install_kwargs = dict(port=req.port)
@@ -5165,6 +9014,8 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
                 port=req.port,
                 subnet=req.exit_subnet,
                 obfuscation=bool(req.exit_obfuscation),
+                # None = auto: 3.1 when the kernel module supports it.
+                awg3=req.exit_awg3,
             )
         elif install_base in AWG_PROTOCOLS:
             install_args = (install_protocol,)
@@ -5174,21 +9025,35 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
                 dns=join_dns(req.awg_dns1, req.awg_dns2),
                 special_junk=awg_special_junk,
                 dns6=req.awg_dns6,
+                ipv6_preference=ipv6_pref,
+                i1_domain=i1_domain,
+                i1_pool=(req.awg_i1_pool or '').strip().lower() or None,
             )
         else:
             install_args = (install_protocol,)
             install_kwargs = dict(port=req.port)
+        op_log(op, 'host', 'preparing the host and building the container')
+        if install_base in AWG_PROTOCOLS:
+            install_kwargs['progress'] = (
+                lambda stage, message, percent=None: op_log(op, stage, message))
         result = await asyncio.to_thread(manager.install_protocol, *install_args, **install_kwargs)
 
         if not isinstance(result, dict):
             result = {'status': 'success', 'message': str(result)}
+        if forced_ipv6_off and server.get('ipv6_new_instances') is not False:
+            result.setdefault('log', []).append(
+                "! IPv6 is off for this instance: it will be linked to the default exit node.")
         if docker_install_log:
             result.setdefault('log', [])
             result['log'].insert(0, docker_install_log)
         if result.get('status') == 'error' or result.get('error'):
             ssh.disconnect()
-            return JSONResponse({'error': result.get('message') or result.get('error') or 'Installation failed'}, status_code=400)
+            message = result.get('message') or result.get('error') or 'Installation failed'
+            op_log(op, 'build', f"installation failed: {message}")
+            op_finish(op, 'failed', error={'code': 'install_failed', 'message': message})
+            return JSONResponse({'error': message}, status_code=400)
 
+        op_log(op, 'run', 'the container is running')
         proto_record = {
             'installed': True,
             'port': req.port,
@@ -5213,6 +9078,7 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
             proto_record['subnet'] = result.get('subnet')
             proto_record['public_key'] = result.get('public_key')
             proto_record['obfuscation'] = result.get('obfuscation')
+            proto_record['protocol_version'] = result.get('protocol_version')
         proto_record['base_protocol'] = install_base
         proto_record['instance'] = protocol_instance(install_protocol)
         proto_record['display_name'] = protocol_display_name(install_protocol)
@@ -5225,13 +9091,21 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
         result['base_protocol'] = install_base
         result['display_name'] = proto_record['display_name']
         result['container_name'] = proto_record['container_name']
+        op_log(op, 'config', 'saving the panel record')
         save_data(data)
+        _invalidate_ip_status(server.get('uid'))
         ssh.disconnect()
+        if install_base not in AWG_PROTOCOLS:
+            # Other installers do not stream; publish their collected log now.
+            for line in (result.get('log') or []):
+                if docker_install_log and line == docker_install_log:
+                    continue
+                op_log(op, 'config', line)
+        op_log(op, 'firewall', 'finalizing exit-node links')
+        link_log_len = len(result.get('log') or [])
 
         # A new AWG instance joins the default exit node, when one is set.
-        default_uid = ((data.get('settings', {}).get('exit_nodes') or {}).get('default_exit_uid') or '').strip()
-        if should_link_default_exit(default_uid, server.get('uid'), install_base in AWG_PROTOCOLS,
-                                    reinstall, previous_link):
+        if will_link_default:
             try:
                 linked = await exit_link_svc.link(server_id, install_protocol, default_uid)
                 result.setdefault('log', []).append(
@@ -5260,9 +9134,19 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
                     save_data(fresh)
                 result.setdefault('log', []).append(
                     f"! Could not re-link to exit node {previous_link.get('exit_name')}: {e}")
+        for line in (result.get('log') or [])[link_log_len:]:
+            op_log(op, 'firewall', line)
+        op_log(op, 'done', 'installation complete')
+        op_finish(op, 'success', {'protocol': install_protocol,
+                                  'display_name': proto_record['display_name']})
         return result
+    except SrvWarpError:
+        raise
     except Exception as e:
         logger.exception("Error installing protocol")
+        if op is not None:
+            op_log(op, 'error', f"internal error: {e}")
+            op_finish(op, 'failed', error={'code': 'internal_error', 'message': str(e)})
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
@@ -5425,6 +9309,7 @@ def api_exit_nodes(request: Request):
 
 
 @app.post('/api/servers/{server_id}/exit-link', tags=["Protocols"])
+@serialize_peer_lifecycle
 async def api_exit_link(request: Request, server_id: int, req: ExitLinkRequest):
     """Route all clients of an AWG instance through an exit node (by its
     server uid). Rolled back unless the exit answers within 15 s; `force`
@@ -5432,7 +9317,15 @@ async def api_exit_link(request: Request, server_id: int, req: ExitLinkRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
-        return await exit_link_svc.link(server_id, req.protocol, req.exit_uid.strip(), force=bool(req.force))
+        data = load_data()
+        server = data['servers'][server_id] if 0 <= server_id < len(data['servers']) else None
+        if server is not None and srv_warp_ctx(server, req.protocol).get('active'):
+            raise SrvWarpError('srv_warp_xor_conflict', 409)
+        result = await exit_link_svc.link(server_id, req.protocol, req.exit_uid.strip(), force=bool(req.force))
+        _invalidate_ip_status_for_server(server_id)
+        return result
+    except SrvWarpError:
+        raise
     except ExitLinkError as e:
         return _exit_link_error(e)
     except Exception as e:
@@ -5440,13 +9333,38 @@ async def api_exit_link(request: Request, server_id: int, req: ExitLinkRequest):
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
+class ExitTransitVersionRequest(BaseModel):
+    awg3: bool = True
+
+
+@app.post('/api/exit-nodes/{exit_uid}/transit-version', tags=["Protocols"])
+@serialize_peer_lifecycle
+async def api_exit_transit_version(request: Request, exit_uid: str,
+                                   req: ExitTransitVersionRequest):
+    """Switch an exit and every entry linked to it between the AWG 3.1 and 2.0
+    transit parameter sets in place. Keys, PSKs, transit addresses and the peer
+    list are preserved, so nothing has to be re-linked."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await exit_link_svc.set_transit_version(exit_uid.strip(), bool(req.awg3))
+    except ExitLinkError as e:
+        return _exit_link_error(e)
+    except Exception as e:
+        logger.exception("Error switching the transit AWG version")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
 @app.post('/api/servers/{server_id}/exit-link/remove', tags=["Protocols"])
+@serialize_peer_lifecycle
 async def api_exit_unlink(request: Request, server_id: int, req: ProtocolRequest):
     """Restore direct egress for an AWG instance and drop its peer on the exit."""
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
-        return await exit_link_svc.unlink(server_id, req.protocol)
+        result = await exit_link_svc.unlink(server_id, req.protocol)
+        _invalidate_ip_status_for_server(server_id)
+        return result
     except ExitLinkError as e:
         return _exit_link_error(e)
     except Exception as e:
@@ -5455,12 +9373,15 @@ async def api_exit_unlink(request: Request, server_id: int, req: ProtocolRequest
 
 
 @app.post('/api/servers/{server_id}/exit-link/relink', tags=["Protocols"])
+@serialize_peer_lifecycle
 async def api_exit_relink(request: Request, server_id: int, req: ProtocolRequest):
     """Re-establish an existing link (after a reinstall or a stale state)."""
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
-        return await exit_link_svc.relink_entry(server_id, req.protocol)
+        result = await exit_link_svc.relink_entry(server_id, req.protocol)
+        _invalidate_ip_status_for_server(server_id)
+        return result
     except ExitLinkError as e:
         return _exit_link_error(e)
     except Exception as e:
@@ -5475,7 +9396,13 @@ async def api_exit_link_dns(request: Request, server_id: int, req: ExitDnsReques
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
+        data = load_data()
+        server = data['servers'][server_id] if 0 <= server_id < len(data['servers']) else None
+        if server is not None and srv_warp_ctx(server, req.protocol).get('active'):
+            raise SrvWarpError('srv_warp_xor_conflict', 409)
         return await exit_link_svc.set_dns_via_exit(server_id, req.protocol, req.enabled)
+    except SrvWarpError:
+        raise
     except ExitLinkError as e:
         return _exit_link_error(e)
     except Exception as e:
@@ -5522,6 +9449,7 @@ async def api_exit_link_check_egress(request: Request, server_id: int, req: Prot
 
 
 @app.post('/api/servers/{server_id}/exit-link/failover', tags=["Protocols"])
+@serialize_peer_lifecycle
 async def api_exit_link_failover(request: Request, server_id: int, req: ExitFailoverRequest):
     """Opt-in automatic failover for an AWG instance already linked to an
     exit node. Disabled by default; backups are addressed by server uid."""
@@ -5532,7 +9460,9 @@ async def api_exit_link_failover(request: Request, server_id: int, req: ExitFail
         protocol = payload.pop('protocol')
         fields = {key: value for key, value in payload.items()
                   if value is not None or key == 'enabled'}
-        return await exit_link_svc.configure_failover(server_id, protocol, **fields)
+        result = await exit_link_svc.configure_failover(server_id, protocol, **fields)
+        _invalidate_ip_status_for_server(server_id)
+        return result
     except ExitLinkError as e:
         return _exit_link_error(e)
     except Exception as e:
@@ -5566,16 +9496,74 @@ async def api_exit_link_failover_check(request: Request, server_id: int, req: Pr
 
 @app.post('/api/servers/{server_id}/smartroute/install', tags=["Protocols"])
 async def api_smartroute_install(request: Request, server_id: int):
-    """Install the host-side Smart Route updater (lists + systemd timer)."""
+    """Install the host-side Smart Route updater (lists + systemd timer).
+
+    The install is phased and long, so it runs in the background and the page
+    polls ``/smartroute/install/{operation_id}``.
+    """
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
-        return await smartroute_svc.install(server_id)
+        data = load_data()
+        servers = data.get('servers') or []
+        if not isinstance(server_id, int) or not 0 <= server_id < len(servers):
+            return _smartroute_error(SmartRouteError('server_not_found',
+                                                     'Server not found', 404))
+        if (servers[server_id].get('smartroute') or {}).get('installed'):
+            return JSONResponse(
+                {'error': 'App is already installed; refresh its status',
+                 'code': 'already_installed'},
+                status_code=409)
+        if (server_id, 'smartroute') in _INSTALL_ACTIVE:
+            return JSONResponse(
+                {'error': 'Smart Route installation is already running',
+                 'code': 'install_in_progress'},
+                status_code=409)
+        op = op_create(server_id, 'smartroute', SMARTROUTE_INSTALL_TOTAL)
+        asyncio.create_task(_run_smartroute_install(op['id'], server_id))
+        return {'operation_id': op['id']}
     except SmartRouteError as e:
         return _smartroute_error(e)
     except Exception as e:
         logger.exception("Error installing Smart Route")
         return JSONResponse({'error': str(e)}, status_code=500)
+
+
+async def _run_smartroute_install(op_id, server_id):
+    """Background worker: every phase line becomes a progress line + log line."""
+    op = _INSTALL_OPS.get(op_id)
+    if not op:
+        return
+    try:
+        op_log(op, 'start', 'Smart Route installation started')
+        await smartroute_svc.install(
+            server_id,
+            progress=lambda stage, line: op_log(op, stage, line),
+        )
+        op_finish(op, 'success', result={'status': 'success'})
+    except SmartRouteError as e:
+        logger.warning("Smart Route install failed: %s (%s)", e, e.code)
+        op_finish(op, 'failed', error={'code': e.code, 'message': str(e)})
+    except Exception as e:
+        logger.exception("Smart Route install failed")
+        op_finish(op, 'failed',
+                  error={'code': 'internal_error', 'message': str(e)})
+
+
+@app.get('/api/servers/{server_id}/smartroute/install/{op_id}', tags=["Protocols"])
+def api_smartroute_install_status(request: Request, server_id: int, op_id: str):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    _install_ops_load()
+    op = _install_op_of_server(op_id, server_id)
+    if not op:
+        return JSONResponse({'error': 'Operation not found', 'code': 'not_found'},
+                            status_code=404)
+    try:
+        offset = max(0, int(request.query_params.get('offset', 0)))
+    except (TypeError, ValueError):
+        offset = 0
+    return _install_op_payload(op, offset)
 
 
 @app.post('/api/servers/{server_id}/smartroute/uninstall', tags=["Protocols"])
@@ -5698,6 +9686,11 @@ async def api_smartroute_status(request: Request, server_id: int):
         return await smartroute_svc.status(server_id)
     except SmartRouteError as e:
         return _smartroute_error(e)
+    except (peer_lifecycle_lock.PeerLifecycleBusy,
+            peer_lifecycle_lock.PeerLifecycleUncertain):
+        # Не маскировать жизненный цикл в generic 500: штатный обработчик
+        # отдаёт 503 + code, и UI показывает реальную причину.
+        raise
     except Exception as e:
         logger.exception("Error reading Smart Route status")
         return JSONResponse({'error': str(e)}, status_code=500)
@@ -5820,6 +9813,10 @@ async def api_awg_plugin_status(request: Request, server_id: int):
         return result
     except PluginUpdateError as e:
         return _awg_plugin_error(e, 502)
+    except (peer_lifecycle_lock.PeerLifecycleBusy,
+            peer_lifecycle_lock.PeerLifecycleUncertain):
+        # См. /smartroute/status: штатный 503 + code вместо generic 500.
+        raise
     except Exception as e:
         logger.exception("Error reading AWG plugin status")
         return JSONResponse({'error': str(e), 'code': 'internal_error'}, status_code=500)
@@ -5966,6 +9963,19 @@ async def _run_awg_plugin_update_locked(op_id, server_id, component, target, all
         op['finished_ts'] = datetime.now().timestamp()
         _awg_plugin_active.pop(op['server_uid'], None)
         _awg_plugin_save()
+        # A plugin update recreates the AWG containers, which wipes Smart
+        # Route's table 200 and its accounting chains. Re-apply now instead of
+        # waiting for the next periodic pass: until then RU traffic leaves
+        # through the exit node. Never let this delay the operation result.
+        if op.get('state') in ('success', 'manual_step_required'):
+            asyncio.create_task(_smartroute_reconcile_after(server_id))
+
+
+async def _smartroute_reconcile_after(server_id):
+    try:
+        await smartroute_svc.reconcile(server_id)
+    except Exception as e:
+        logger.warning("Smart Route reconcile after plugin update failed: %s", e)
 
 
 @app.post('/api/servers/{server_id}/awg-plugin/update/{op_id}/cancel', tags=["Protocols"])
@@ -6025,6 +10035,32 @@ def api_awg_plugin_update_status(request: Request, server_id: int, op_id: str):
 
 
 
+@app.get('/api/awg/i1/catalog', tags=["Protocols"])
+def api_awg_i1_catalog(request: Request):
+    """Masking domains and device presets for the I1 picker."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    return {
+        'domains': awg_i1_catalog(),
+        'device_profiles': [{'key': key, 'domains': list(domains)}
+                            for key, domains in AWG_I1_DEVICE_PROFILES],
+    }
+
+
+@app.post('/api/awg/i1/preview', tags=["Protocols"])
+def api_awg_i1_preview(request: Request, req: I1PreviewRequest):
+    """Build one I1 packet without touching any server (live preview)."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        pool = (req.pool or '').strip().lower() or None
+        domain = awg_i1_domain_from(req.domain, pool)
+        value = awg_generate_i1(domain, pool)
+    except ValueError as e:
+        return JSONResponse({'error': str(e), 'code': 'bad_i1_domain'}, status_code=400)
+    return {'i1': value, 'parsed': awg_parse_i1(value)}
+
+
 @app.post('/api/servers/{server_id}/awg/settings', tags=["Protocols"])
 def api_awg_settings_get(request: Request, server_id: int, req: ProtocolRequest):
     """Return MTU, DNS and the special junk packets I1-I5 of an AWG server."""
@@ -6061,10 +10097,28 @@ def api_awg_settings_save(request: Request, server_id: int, req: AwgSettingsRequ
         if server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
         server = data['servers'][server_id]
+        if srv_warp_ctx(server, req.protocol).get('active'):
+            # The warp client budget/link owns MTU and DNS while linked.
+            raise SrvWarpError('srv_warp_settings_locked', 409)
         special_junk = {key: getattr(req, key) for key in ('i1', 'i2', 'i3', 'i4', 'i5')}
-        if all(value is None for value in special_junk.values()):
+        i1_value = None
+        if req.regenerate_i1:
+            # API path: generate and apply in one call. The panel UI previews
+            # the packet first and then saves the literal, so this branch is
+            # for scripted clients; it still replaces only I1.
+            try:
+                domain = awg_i1_domain_from(req.i1_domain, req.i1_pool)
+            except ValueError as e:
+                return JSONResponse({'error': str(e), 'code': 'bad_i1_domain'},
+                                    status_code=400)
+            i1_value = awg_generate_i1(domain, (req.i1_pool or '').strip().lower() or None)
+            if all(value is None for key, value in special_junk.items() if key != 'i1'):
+                special_junk = None
+            else:
+                special_junk['i1'] = i1_value
+        if special_junk is not None and all(value is None for value in special_junk.values()):
             special_junk = None
-        else:
+        elif special_junk is not None:
             # Reject a malformed packet before opening an SSH connection.
             normalize_special_junk(special_junk)
         ssh = get_ssh(server)
@@ -6082,6 +10136,7 @@ def api_awg_settings_save(request: Request, server_id: int, req: AwgSettingsRequ
                 dns=dns,
                 special_junk=special_junk,
                 dns6=req.dns6,
+                i1_value=i1_value,
             )
         finally:
             ssh.disconnect()
@@ -6090,10 +10145,41 @@ def api_awg_settings_save(request: Request, server_id: int, req: AwgSettingsRequ
             proto_record['mtu'] = settings.get('mtu')
             proto_record['dns'] = settings.get('dns')
             proto_record['dns6'] = settings.get('dns6')
+            # I1-I5 live in the server config, but the panel keeps its own copy
+            # for the instance card and for copying the instance to another
+            # host. Without this the stored packet keeps the value from install
+            # time and silently disagrees with the server after I1 is edited or
+            # regenerated (PR #346). An empty value means "the packet is gone",
+            # so the key is dropped instead of stored as ''.
+            if settings.get('supports_special_junk'):
+                params = proto_record.get('awg_params')
+                if params is None or params == '':
+                    # Instances installed before PR #346 carry no mapping.
+                    params = {}
+                elif not isinstance(params, dict):
+                    # A hand-edited or damaged record: do not overwrite what
+                    # the admin may still want to recover by hand.
+                    logger.warning(
+                        "awg_params for %s is %s, not a mapping; "
+                        "skipping the I1-I5 write-back", req.protocol,
+                        type(params).__name__)
+                    params = None
+                if params is not None:
+                    for key in ('i1', 'i2', 'i3', 'i4', 'i5'):
+                        raw = settings.get(key)
+                        value = raw.strip() if isinstance(raw, str) else ''
+                        if value:
+                            params[key] = value
+                        else:
+                            params.pop(key, None)
+                    if params or 'awg_params' in proto_record:
+                        proto_record['awg_params'] = params
             save_data(data)
         settings['dns1'], settings['dns2'] = split_dns(settings.get('dns'))
         settings['status'] = 'success'
         return settings
+    except SrvWarpError:
+        raise
     except ValueError as e:
         return JSONResponse({'error': str(e)}, status_code=400)
     except Exception as e:
@@ -6101,9 +10187,658 @@ def api_awg_settings_save(request: Request, server_id: int, req: AwgSettingsRequ
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
+@app.get('/api/servers/{server_id}/xray/fingerprint', tags=["Protocols"])
+def api_xray_fingerprint_get(request: Request, server_id: int, protocol: str = 'xray'):
+    """The Reality fingerprint VLESS links are issued with on this connection."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if protocol_base(protocol) != 'xray':
+        return JSONResponse({'error': 'Not an Xray protocol'}, status_code=400)
+    data = load_data()
+    if server_id < 0 or server_id >= len(data['servers']):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = data['servers'][server_id]
+    return {
+        'fingerprint': xray_stored_fingerprint(server, protocol) or XRAY_DEFAULT_FINGERPRINT,
+        'choices': list(XRAY_FINGERPRINTS),
+    }
+
+
+@app.post('/api/servers/{server_id}/xray/fingerprint', tags=["Protocols"])
+def api_xray_fingerprint_save(request: Request, server_id: int, req: XrayFingerprintRequest):
+    """Remember the Reality fingerprint VLESS links are issued with.
+
+    Panel-side only (a protocol record field in data.json): Reality does not
+    pin the client hello, so the node is not touched and links already issued
+    keep working. fingerprint=None resets to the built-in default.
+    """
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if protocol_base(req.protocol) != 'xray':
+        return JSONResponse({'error': 'Not an Xray protocol'}, status_code=400)
+    fp = (req.fingerprint or '').strip() or None
+    if fp is not None and fp not in XRAY_FINGERPRINTS:
+        return JSONResponse({'error': 'Unknown fingerprint'}, status_code=400)
+    try:
+        data = load_data()
+        if server_id < 0 or server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        # Never mint a protocol record from this endpoint: saving a
+        # fingerprint for an uninstalled instance would leave a phantom
+        # "installed but stopped" entry (multi-instance records survive
+        # /check pruning).
+        if req.protocol not in server.get('protocols', {}):
+            return JSONResponse({'error': 'Protocol not found'}, status_code=404)
+        record = server['protocols'][req.protocol]
+        if fp is None:
+            record.pop('fingerprint', None)
+        else:
+            record['fingerprint'] = fp
+        save_data(data)
+        return {'status': 'success', 'fingerprint': fp or XRAY_DEFAULT_FINGERPRINT}
+    except Exception:
+        logger.exception("Error saving Xray fingerprint")
+        return JSONResponse({'error': 'internal_error', 'code': 'internal_error'},
+                            status_code=500)
+
+
+class XrayEncryptionRequest(BaseModel):
+    protocol: str = 'xray'
+    enable: bool
+
+
+@app.get('/api/servers/{server_id}/xray/encryption', tags=["Protocols"])
+def api_xray_encryption_state(request: Request, server_id: int,
+                              protocol: str = 'xray'):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        if server_id < 0 or server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        ssh = get_ssh(data['servers'][server_id])
+        ssh.connect()
+        try:
+            manager = get_protocol_manager(ssh, protocol)
+            state = manager.get_vless_encryption_state()
+        finally:
+            ssh.disconnect()
+        return state
+    except RuntimeError as e:
+        return JSONResponse({'error': str(e)}, status_code=409)
+    except Exception as e:
+        logger.exception("Error reading the xray encryption state")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/xray/encryption', tags=["Protocols"])
+async def api_xray_encryption_toggle(request: Request, server_id: int,
+                                     req: XrayEncryptionRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        if server_id < 0 or server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        ssh = get_ssh(data['servers'][server_id])
+        ssh.connect()
+        try:
+            manager = get_protocol_manager(ssh, req.protocol)
+            state = await asyncio.to_thread(manager.set_vless_encryption,
+                                            req.enable)
+        finally:
+            ssh.disconnect()
+        # The issued links changed (encryption parameter + flow): refresh
+        # the subscription files of the users on this protocol.
+        try:
+            user_ids = [c['user_id'] for c in data.get('user_connections', [])
+                        if c.get('server_id') == server_id
+                        and protocol_base(c.get('protocol')) == protocol_base(req.protocol)]
+            await asyncio.to_thread(auto_push_subscriptions, data, user_ids)
+        except Exception:
+            logger.warning("subscription auto-push failed after the vless "
+                           "encryption toggle", exc_info=True)
+        return {'status': 'success', **state}
+    except RuntimeError as e:
+        return JSONResponse({'error': str(e)}, status_code=409)
+    except Exception as e:
+        logger.exception("Error toggling the xray encryption layer")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.get('/api/servers/{server_id}/xray/core', tags=["Protocols"])
+async def api_xray_core_version(request: Request, server_id: int,
+                                protocol: str = 'xray'):
+    """Running Xray-core version of this connection and the latest release."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if protocol_base(protocol) != 'xray':
+        return JSONResponse({'error': 'Not an Xray protocol'}, status_code=400)
+    data = load_data()
+    if not 0 <= server_id < len(data['servers']):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = data['servers'][server_id]
+    try:
+        ssh = get_ssh(server)
+        await asyncio.to_thread(ssh.connect)
+        try:
+            manager = XrayManager(ssh, protocol)
+            current = await asyncio.to_thread(manager.get_core_version)
+        finally:
+            await asyncio.to_thread(ssh.disconnect)
+    except Exception:
+        logger.warning("Xray core version probe failed for %s",
+                       server.get('uid'), exc_info=True)
+        current = None
+    try:
+        latest = await asyncio.to_thread(_xray_latest_release)
+    except Exception:
+        logger.warning("Xray release lookup failed", exc_info=True)
+        latest = None
+    update_available = bool(latest and (not current
+                                        or current.lstrip('v') != latest.lstrip('v')))
+    return {'version': current, 'latest': latest,
+            'update_available': update_available}
+
+
+@app.post('/api/servers/{server_id}/xray/update', tags=["Protocols"])
+async def api_xray_update(request: Request, server_id: int,
+                          req: XrayUpdateRequest):
+    """Rebuild the image with a newer Xray-core and recreate the container.
+
+    Runs as an install-flow operation: a rebuild takes minutes and the page
+    watches the shared progress log. Only one server-wide operation at a time.
+    """
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if protocol_base(req.protocol) != 'xray':
+        return JSONResponse({'error': 'Not an Xray protocol'}, status_code=400)
+    data = load_data()
+    if not 0 <= server_id < len(data['servers']):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    _install_ops_load()
+    if _install_running(server_id):
+        return JSONResponse(
+            {'error': 'Another operation is running on this server',
+             'code': 'operation_in_progress'},
+            status_code=409)
+    op = op_create(server_id, 'xray_update', total=XRAY_UPDATE_TOTAL)
+    op['protocol'] = req.protocol
+    _install_ops_save()
+    asyncio.create_task(_run_xray_update(
+        op, server_id, req.protocol, (req.target or '').strip() or None))
+    return {'operation_id': op['id']}
+
+
+async def _run_xray_update(op, server_id, protocol, target):
+    data = load_data()
+    server = data['servers'][server_id]
+    ssh = get_ssh(server)
+
+    def progress(stage, message):
+        op_log(op, stage, message)
+
+    try:
+        op_log(op, 'start', f"updating Xray-core of {protocol}")
+        await asyncio.to_thread(ssh.connect)
+        manager = XrayManager(ssh, protocol)
+        if not target:
+            target = await asyncio.to_thread(_xray_latest_release)
+        if not target:
+            raise RuntimeError("cannot resolve the latest Xray-core release")
+        result = await asyncio.to_thread(
+            manager.update_core, target, progress,
+            ingress_ip=(server.get('ingress_ip') or None))
+        if result.get('status') != 'success':
+            raise RuntimeError(result.get('message') or 'update failed')
+        op_log(op, 'done', f"Xray-core is now {result.get('version')}")
+        op_finish(op, 'success', result=result)
+        _invalidate_ip_status(server.get('uid'))
+    except Exception as e:
+        logger.warning("Xray core update failed: %s", e, exc_info=True)
+        op_log(op, 'error', str(e))
+        op_finish(op, 'failed', error={'code': 'update_failed', 'message': str(e)})
+    finally:
+        try:
+            await asyncio.to_thread(ssh.disconnect)
+        except Exception:
+            pass
+
+
+IPV6_CONFLICT_CODES = frozenset({
+    'peers', 'peers_appeared', 'exit_link', 'server_off', 'docker_off',
+    'needs_recreate', 'state_unreadable', 'env_off', 'env_on',
+    'docker_pending', 'docker_flags_conflict', 'docker_bridge_ipv6_missing',
+    'daemon_json_invalid', 'ip6tables_unsupported', 'ipv6_pool_exhausted',
+    'ipv6_disabled_by_sysctl', 'docker_recovery_failed', 'operation_busy',
+    'peer_lifecycle_busy', 'peer_lifecycle_still_running', 'bad_request',
+})
+# A transient server-side condition: retry later, not a client mistake.
+IPV6_RETRY_CODES = frozenset({'peer_lifecycle_uncertain'})
+IPV6_BAD_REQUEST_CODES = frozenset({'not_awg', 'bad_request'})
+
+_IP_STATUS_TTL = 20.0
+# A degraded or unknown payload is re-probed sooner: the next poll should not
+# keep showing a stale error for the full healthy TTL.
+_IP_STATUS_TTL_DEGRADED = 3.0
+_IP_STATUS_CACHE = {}
+_OP_STORES = {}
+_OP_LOCKS = {}
+
+
+def _awg_protocols(server):
+    """AWG protocols that exist on this server, in stable order."""
+    return [proto for proto in (server.get('protocols') or {})
+            if protocol_base(proto) in AWG_PROTOCOLS]
+
+
+_XRAY_RELEASE_CACHE = {'ts': 0.0, 'tag': None}
+
+
+def _xray_latest_release():
+    """Latest published Xray-core tag, cached for an hour.
+
+    The GitHub API allows 60 unauthenticated requests per hour per IP, and
+    the update dialog polls it on every open — caching keeps the panel out
+    of the rate limit.
+    """
+    now = time.monotonic()
+    if _XRAY_RELEASE_CACHE['tag'] and now - _XRAY_RELEASE_CACHE['ts'] < 3600:
+        return _XRAY_RELEASE_CACHE['tag']
+    request = urllib.request.Request(
+        'https://api.github.com/repos/XTLS/Xray-core/releases/latest',
+        headers={'Accept': 'application/vnd.github+json',
+                 'User-Agent': 'Amnezia-Web-Panel'})
+    with urllib.request.urlopen(request, timeout=10) as response:
+        tag = (json.load(response) or {}).get('tag_name')
+    if tag:
+        _XRAY_RELEASE_CACHE.update(ts=now, tag=tag)
+    return _XRAY_RELEASE_CACHE['tag']
+def _xray_port_usage(ssh, server):
+    """Running/client info of every xray connection, for the header IP chips.
+
+    A failure on one connection is skipped, not fatal: the AWG part of the
+    payload stays valid and the chip simply undercounts.
+    """
+    usage = []
+    for proto in (server.get('protocols') or {}):
+        if protocol_base(proto) != 'xray':
+            continue
+        try:
+            usage.append(XrayManager(ssh, proto).get_port_usage())
+        except Exception:
+            logger.warning("Xray port usage failed for %s", proto, exc_info=True)
+    return usage
+
+
+def _ip_status_cache_ttl(payload):
+    """20 s for a healthy payload, 3 s for a degraded or failed one."""
+    if isinstance(payload, dict) and payload.get('state') == 'ok' \
+            and not payload.get('error'):
+        return _IP_STATUS_TTL
+    return _IP_STATUS_TTL_DEGRADED
+
+
+def _ip_status_cache_get(server_uid):
+    entry = _IP_STATUS_CACHE.get(server_uid)
+    if not entry:
+        return None
+    stamp, payload, ttl = entry
+    if time.time() - stamp > ttl:
+        _IP_STATUS_CACHE.pop(server_uid, None)
+        return None
+    return payload
+
+
+def _ip_status_cache_put(server_uid, payload):
+    _IP_STATUS_CACHE[server_uid] = (time.time(), payload,
+                                    _ip_status_cache_ttl(payload))
+
+
+def _invalidate_ip_status(server_uid=None):
+    """Drop one cached status, or all of them after a global change.
+
+    Снимок /check (?boot=1) инвалидируется вместе с ip-status: после
+    установки, удаления или переключения протокола страница не должна
+    показывать состояние до мутации.
+    """
+    display_cache.invalidate(DATA_FILE, server_uid)
+    if server_uid is None:
+        _IP_STATUS_CACHE.clear()
+    else:
+        _IP_STATUS_CACHE.pop(server_uid, None)
+
+
+def _invalidate_ip_status_for_server(server_id):
+    """Drop the cache entry of an endpoint that only knows the server index."""
+    try:
+        data = load_data()
+        servers = data.get('servers') or []
+        if 0 <= server_id < len(servers):
+            server = servers[server_id]
+            _invalidate_ip_status(server.get('uid') or f'#{server_id}')
+    except Exception:
+        logger.debug("Cannot resolve server %s for IP status invalidation",
+                     server_id, exc_info=True)
+
+
+def _op_store():
+    path = panel_data_file() + '.operations.json'
+    store = _OP_STORES.get(path)
+    if store is None:
+        store = OperationStore(path)
+        _OP_STORES[path] = store
+    return store
+
+
+def panel_data_file():
+    """Current data path. Tests swap it, so never capture it at import."""
+    return DATA_FILE
+
+
+def _op_lock(server_uid):
+    lock = _OP_LOCKS.get(server_uid)
+    if lock is None:
+        lock = threading.Lock()
+        _OP_LOCKS[server_uid] = lock
+    return lock
+
+
+def _ipv6_error(exc, default='state_unreadable'):
+    """Turn an IPv6 RuntimeError into a JSON error response.
+
+    Only known codes reach the client. An unexpected RuntimeError is an
+    internal fault: answer 500 and keep the raw text in the log, not in the
+    response, because it can carry shell output.
+    """
+    code = str(exc).strip() or default
+    if code in IPV6_RETRY_CODES:
+        return JSONResponse({'error': code, 'code': code}, status_code=503)
+    if code not in IPV6_CONFLICT_CODES and code not in IPV6_BAD_REQUEST_CODES:
+        logger.warning("Unexpected IPv6 failure: %s", code)
+        return JSONResponse({'error': 'internal_error',
+                             'code': 'internal_error'}, status_code=500)
+    status = 400 if code in IPV6_BAD_REQUEST_CODES else 409
+    return JSONResponse({'error': code, 'code': code}, status_code=status)
+
+
+@app.get('/api/servers/{server_id}/ip-status', tags=["Protocols"])
+def api_ip_status(request: Request, server_id: int):
+    """IPv4/IPv6 state of the host, Docker, every AWG instance and the
+    xray connections (as port usage: a running instance uses the host IP).
+
+    Cached for 20 s per server: the page polls it and every miss costs several
+    SSH round-trips. Mutations drop the entry themselves.
+    """
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    if server_id < 0 or server_id >= len(data['servers']):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = data['servers'][server_id]
+    uid = server.get('uid') or f'#{server_id}'
+    status = _ip_status_cache_get(uid)
+    if status is None:
+        try:
+            ssh = get_ssh(server)
+            ssh.connect()
+            try:
+                status = AWGManager(ssh).get_ip_status(
+                    _awg_protocols(server), port_usage=_xray_port_usage(ssh, server))
+            finally:
+                ssh.disconnect()
+            _ip_status_cache_put(uid, status)
+        except Exception:
+            # A dead host is a state, not a server error: the page shows grey.
+            logger.warning("IP status unavailable for server %s", uid,
+                           exc_info=True)
+            status = {'state': 'unknown', 'error': 'ssh_failed',
+                      'host': {}, 'docker': {}, 'instances': []}
+    status = dict(status)
+    status['preference'] = {
+        'new_instances': server.get('ipv6_new_instances'),
+        'env_override': (os.environ.get('AWG_IPV6') or 'auto').strip().lower(),
+    }
+    status['can_write'] = bool(_require_admin_strict(request))
+    return status
+
+
+@app.post('/api/servers/{server_id}/ipv6', tags=["Protocols"])
+def api_server_ipv6_preference(request: Request, server_id: int,
+                               req: Ipv6PreferenceRequest):
+    """Set whether new instances on this server get IPv6. None = auto.
+
+    A repeated request is a no-op: `changed` is false and data.json is not
+    written again.
+    """
+    if not _require_admin_strict(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if req.enabled is not None and not isinstance(req.enabled, bool):
+        return JSONResponse({'error': 'bad_request', 'code': 'bad_request'},
+                            status_code=400)
+    try:
+        data = load_data()
+        if server_id < 0 or server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        uid = server.get('uid') or f'#{server_id}'
+        current = server.get('ipv6_new_instances')
+        changed = current is not req.enabled
+        if changed:
+            if req.enabled is None:
+                server.pop('ipv6_new_instances', None)
+            else:
+                server['ipv6_new_instances'] = req.enabled
+            save_data(data)
+            _invalidate_ip_status(uid)
+        return {'status': 'success', 'changed': changed,
+                'preference': {
+                    'new_instances': server.get('ipv6_new_instances'),
+                    'env_override': (os.environ.get('AWG_IPV6') or 'auto').strip().lower(),
+                }}
+    except Exception:
+        logger.exception("Error saving IPv6 preference")
+        return JSONResponse({'error': 'internal_error', 'code': 'internal_error'},
+                            status_code=500)
+
+
+@app.post('/api/servers/{server_id}/docker/ipv6/apply', tags=["Protocols"])
+def api_docker_ipv6_apply(request: Request, server_id: int,
+                          req: DockerIpv6ApplyRequest):
+    """Write Docker IPv6 settings and restart Docker in the background.
+
+    Returns 202 with an operation id: the restart drops every VPN session and
+    can take 10-30 s, so the request must not wait for it. The op lock is
+    host-level and separate from the peer lifecycle lock.
+    """
+    if not _require_admin_strict(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    confirm = (req.confirm or '').strip().lower()
+    if confirm not in ('yes', 'true', '1', 'restart-docker'):
+        return JSONResponse({'error': 'confirm_required',
+                             'code': 'confirm_required'}, status_code=400)
+    data = load_data()
+    if server_id < 0 or server_id >= len(data['servers']):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = data['servers'][server_id]
+    uid = server.get('uid') or f'#{server_id}'
+    if _install_running(server_id):
+        return JSONResponse({'error': 'operation_busy',
+                             'code': 'operation_busy'}, status_code=409)
+    lock = _op_lock(uid)
+    if not lock.acquire(blocking=False):
+        return JSONResponse({'error': 'operation_busy',
+                             'code': 'operation_busy'}, status_code=409)
+    store = _op_store()
+    try:
+        operation = store.create(uid, 'docker_ipv6')
+    except Exception:
+        # Without this the lock stays taken and every later IPv6 mutation
+        # answers operation_busy until the panel restarts.
+        logger.exception("Failed to create Docker IPv6 operation")
+        lock.release()
+        return JSONResponse({'error': 'internal_error', 'code': 'internal_error'},
+                            status_code=500)
+
+    def work():
+        try:
+            store.update(operation['id'], step='restarting_docker')
+            ssh = get_ssh(server)
+            ssh.connect()
+            try:
+                AWGManager(ssh).enable_docker_ipv6(restart=True)
+            finally:
+                ssh.disconnect()
+            store.update(operation['id'], state='done', step='done')
+        except RuntimeError as exc:
+            code = str(exc).strip() or 'docker_bridge_ipv6_missing'
+            if code not in IPV6_CONFLICT_CODES:
+                code = 'internal_error'
+            store.update(operation['id'], state='failed', reason=code)
+        except Exception:
+            logger.exception("Docker IPv6 operation failed")
+            store.update(operation['id'], state='failed', reason='internal_error')
+        finally:
+            _invalidate_ip_status(uid)
+            lock.release()
+
+    try:
+        threading.Thread(target=work, name=f'ipv6-docker-{operation["id"][:8]}',
+                         daemon=True).start()
+    except Exception:
+        # The worker never ran, so its finally cannot release the op lock.
+        logger.exception("Failed to start Docker IPv6 worker")
+        store.update(operation['id'], state='failed', reason='internal_error')
+        lock.release()
+        return JSONResponse({'error': 'internal_error',
+                             'code': 'internal_error'}, status_code=500)
+    return JSONResponse({'op_id': operation['id'], 'state': 'running'},
+                        status_code=202)
+
+
+AWG_SWITCHABLE_BASES = frozenset({'awg', 'awg2', 'awg3'})
+
+
+def _is_switchable_awg(proto):
+    return is_valid_protocol(proto) and protocol_base(proto) in AWG_SWITCHABLE_BASES
+
+
+@app.post('/api/servers/{server_id}/protocol/{proto}/ipv6', tags=["Protocols"])
+@serialize_peer_lifecycle
+def api_instance_ipv6(request: Request, server_id: int, proto: str,
+                      req: InstanceIpv6Request):
+    """Enable or disable IPv6 on one instance.
+
+    A plain switch is synchronous (200). When the container predates Docker
+    IPv6 it must be rebuilt: that path returns 202 with an operation id.
+    """
+    if not _require_admin_strict(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if not _is_switchable_awg(proto):
+        return JSONResponse({'error': 'Not an AmneziaWG protocol',
+                             'code': 'not_awg'}, status_code=400)
+    data = load_data()
+    if server_id < 0 or server_id >= len(data['servers']):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = data['servers'][server_id]
+    if proto not in (server.get('protocols') or {}):
+        return JSONResponse({'error': 'Protocol not found',
+                             'code': 'not_awg'}, status_code=404)
+    uid = server.get('uid') or f'#{server_id}'
+    lock = _op_lock(uid)
+    if not lock.acquire(blocking=False):
+        return JSONResponse({'error': 'operation_busy',
+                             'code': 'operation_busy'}, status_code=409)
+    handed_off = False
+    try:
+        ssh = get_ssh(server)
+        ssh.connect()
+        try:
+            manager = AWGManager(ssh)
+            before = manager.get_instance_ipv6_state(proto)
+        finally:
+            ssh.disconnect()
+        blocked = before.get('blocked_reason') or 'none'
+        # Preconditions are checked before any operation exists. The rebuild
+        # path is the only 202; a peer block, an exit link or a dead Docker
+        # must answer 409 now, not fail later inside the operation.
+        if req.enabled and blocked not in ('needs_recreate', 'none'):
+            return _ipv6_error(RuntimeError(blocked))
+        if req.enabled and blocked == 'needs_recreate':
+            store = _op_store()
+            operation = store.create(uid, 'instance_ipv6', proto)
+            handed_off = True
+
+            def work():
+                try:
+                    store.update(operation['id'], step='rebuilding_container')
+                    worker_ssh = get_ssh(server)
+                    worker_ssh.connect()
+                    try:
+                        AWGManager(worker_ssh).set_instance_ipv6(proto, True)
+                    finally:
+                        worker_ssh.disconnect()
+                    store.update(operation['id'], state='done', step='done')
+                except RuntimeError as exc:
+                    code = str(exc).strip() or 'env_off'
+                    if code not in IPV6_CONFLICT_CODES:
+                        code = 'internal_error'
+                    store.update(operation['id'], state='failed', reason=code)
+                except Exception:
+                    logger.exception("IPv6 rebuild failed for %s", proto)
+                    store.update(operation['id'], state='failed',
+                                 reason='internal_error')
+                finally:
+                    _invalidate_ip_status(uid)
+                    lock.release()
+
+            try:
+                threading.Thread(
+                    target=work, name=f'ipv6-rebuild-{operation["id"][:8]}',
+                    daemon=True).start()
+            except Exception:
+                logger.exception("Failed to start IPv6 rebuild thread")
+                store.update(operation['id'], state='failed', reason='internal_error')
+                lock.release()
+                return JSONResponse({'error': 'internal_error', 'code': 'internal_error'}, status_code=500)
+            return JSONResponse({'op_id': operation['id'], 'state': 'running'},
+                                status_code=202)
+        state = manager.set_instance_ipv6(proto, bool(req.enabled),
+                                          allow_repair=bool(req.repair))
+        _invalidate_ip_status(uid)
+        return {'status': 'success', 'instance': state}
+    except RuntimeError as e:
+        return _ipv6_error(e)
+    except Exception:
+        logger.exception("Error switching instance IPv6")
+        return JSONResponse({'error': 'internal_error', 'code': 'internal_error'},
+                            status_code=500)
+    finally:
+        if not handed_off:
+            lock.release()
+
+
+@app.get('/api/servers/{server_id}/operations/{op_id}', tags=["Protocols"])
+def api_ipv6_operation(request: Request, server_id: int, op_id: str):
+    """Poll a long IPv6 operation started by this panel."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    if server_id < 0 or server_id >= len(data['servers']):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = data['servers'][server_id]
+    uid = server.get('uid') or f'#{server_id}'
+    operation = _op_store().get(op_id)
+    if not operation or operation.get('server_uid') != uid:
+        return JSONResponse({'error': 'Operation not found'}, status_code=404)
+    return operation
+
+
 @app.post('/api/servers/{server_id}/uninstall', tags=["Protocols"])
 @serialize_peer_lifecycle
-async def api_uninstall_protocol(request: Request, server_id: int, req: ProtocolRequest):
+async def api_uninstall_protocol(request: Request, server_id: int, req: ProtocolRequest,
+                                 archive_blocking: bool = False):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
@@ -6111,10 +10846,39 @@ async def api_uninstall_protocol(request: Request, server_id: int, req: Protocol
         if server_id < 0 or server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
         guard = _traffic_removal_guard(data, server_id=server_id, protocol=req.protocol)
-        if guard is not None:
+        if guard is not None and (not archive_blocking or protocol_base(req.protocol) != 'xray'):
             return guard
         server = data['servers'][server_id]
+        if srv_warp_ctx(server, req.protocol).get('active'):
+            # Drop the warp link from the WARP card first: uninstall must not
+            # tear down a container whose egress rules are still applied.
+            raise SrvWarpError('srv_warp_xor_conflict', 409)
         base = protocol_base(req.protocol)
+        blocked = (ownership_rows(data, server_id=server_id, protocol=req.protocol)
+                   if archive_blocking else [])
+        archive_states = {}
+        archive_baselines = {c.get('id'): c.get('last_bytes') for c in blocked}
+        for conn in blocked:
+            observed, quiescent = await asyncio.to_thread(_probe_blocking_peer, server, conn)
+            if not quiescent:
+                return JSONResponse({
+                    'error': 'A peer linked to this protocol is still active; '
+                             'stop or remove it before archiving its accounting.',
+                    'code': 'blocked_peer_still_active',
+                    'blocking': [_blocking_row_public(conn)],
+                }, status_code=409)
+            archive_states[conn.get('id')] = observed
+        if blocked:
+            async with DATA_LOCK:
+                current = load_data()
+                current_blocked = ownership_rows(
+                    current, server_id=server_id, protocol=req.protocol)
+                if [c.get('id') for c in current_blocked] != [c.get('id') for c in blocked]:
+                    return JSONResponse({
+                        'error': 'Connection accounting changed; refresh the server page and retry.',
+                        'code': 'traffic_finalization_required',
+                        'blocking': [_blocking_row_public(c) for c in current_blocked],
+                    }, status_code=409)
         if base in AWG_PROTOCOLS and ((server.get('protocols') or {}).get(req.protocol) or {}).get('exit_link'):
             # Drop our peer on the exit while the container still exists
             try:
@@ -6130,19 +10894,59 @@ async def api_uninstall_protocol(request: Request, server_id: int, req: Protocol
             await asyncio.to_thread(manager.remove_container)
         else:
             await asyncio.to_thread(manager.remove_container, req.protocol)
-        if req.protocol in server.get('protocols', {}):
-            del server['protocols'][req.protocol]
+        archived = 0
+        if blocked:
+            async with DATA_LOCK:
+                with STATE_FILE_LOCK:
+                    data = load_data()
+                    current = data['servers'][server_id]
+                    current_blocked = ownership_rows(
+                        data, server_id=server_id, protocol=req.protocol)
+                    if (current.get('uid') != server.get('uid')
+                            or [c.get('id') for c in current_blocked] != [c.get('id') for c in blocked]):
+                        return JSONResponse({
+                            'error': 'Connection accounting changed; refresh the server page and retry.',
+                            'code': 'traffic_finalization_required',
+                            'blocking': [_blocking_row_public(c) for c in current_blocked],
+                        }, status_code=409)
+                    before = pathlib_read_data_bytes()
+                    operation_id = uuid.uuid4().hex
+                    actor = _actor_id(request, True)
+                    for conn in current_blocked:
+                        observed = archive_states.get(conn.get('id'))
+                        if conn.get('last_bytes') != archive_baselines.get(conn.get('id')):
+                            # A newer accounting scrape owns this baseline now. Never
+                            # reinterpret the older probe as a counter reset.
+                            observed = None
+                        finalize_connection_record(
+                            data, conn, current, observed,
+                            time.time(), 'protocol_uninstall_absent', operation_id, True)
+                    if req.protocol in current.get('protocols', {}):
+                        del current['protocols'][req.protocol]
+                    commit_finalize(
+                        DATA_FILE, operation_id, actor, 'protocol_archive_uninstall',
+                        recovery_digest({'server_uid': current.get('uid'),
+                                         'protocol': req.protocol,
+                                         'mode': 'protocol_uninstall_absent'}),
+                        before, data)
+                    archived = len(current_blocked)
+                    server = current
+                    _invalidate_ip_status(server.get('uid'))
+        else:
+            if req.protocol in server.get('protocols', {}):
+                del server['protocols'][req.protocol]
+                save_data(data)
+                _invalidate_ip_status(server.get('uid'))
+            # The instance is gone: its peers are gone with it, so connections
+            # pointing at this (server, protocol) would dangle forever — the
+            # modal would list a phantom that errors with 'Client not found'
+            # on every action. Purge them like server/user deletion does.
+            data['user_connections'] = [
+                c for c in data.get('user_connections', [])
+                if not (c.get('server_id') == server_id
+                        and c.get('protocol') == req.protocol)
+            ]
             save_data(data)
-        # The instance is gone: its peers are gone with it, so connections
-        # pointing at this (server, protocol) would dangle forever — the
-        # modal would list a phantom that errors with 'Client not found'
-        # on every action. Purge them like server/user deletion does.
-        data['user_connections'] = [
-            c for c in data.get('user_connections', [])
-            if not (c.get('server_id') == server_id
-                    and c.get('protocol') == req.protocol)
-        ]
-        save_data(data)
         ssh.disconnect()
         if base == 'exit':
             detached = await exit_link_svc.detach_entries_for_exit(server.get('uid'), 'exit_uninstalled')
@@ -6152,7 +10956,12 @@ async def api_uninstall_protocol(request: Request, server_id: int, req: Protocol
             restored = await exit_link_svc.disable_dns_via_exit_for_exit(server.get('uid'))
             if restored:
                 return {'status': 'success', 'dns_restored': restored}
-        return {'status': 'success'}
+        response = {'status': 'success'}
+        if archived:
+            response['archived'] = archived
+        return response
+    except SrvWarpError:
+        raise
     except Exception as e:
         logger.exception("Error uninstalling protocol")
         return JSONResponse({'error': str(e)}, status_code=500)
@@ -6170,6 +10979,7 @@ CONTAINER_NAMES = {
     'socks5': 'amnezia-socks5proxy',
     'adguard': 'amnezia-adguard',
     'nginx': 'amnezia-nginx',
+    'haproxy': 'amnezia-haproxy',
 }
 
 
@@ -6268,11 +11078,8 @@ def api_protocol_backup_download(request: Request, server_id: int, req: BackupDo
             return JSONResponse({'error': err or 'Backup not found'}, status_code=404)
         fd, tmp_path = tempfile.mkstemp(prefix='amnezia-backup-', suffix='.tar.gz')
         os.close(fd)
-        sftp = ssh.client.open_sftp()
-        try:
+        with ssh.sftp_transfer() as sftp:
             sftp.get(tmp_remote, tmp_path)
-        finally:
-            sftp.close()
         return FileResponse(
             tmp_path,
             media_type='application/gzip',
@@ -6384,6 +11191,7 @@ async def api_protocol_backup_restore(request: Request, server_id: int, req: Bac
             result.update(await exit_link_svc.reconcile_after_restore(server_id, req.protocol))
         except Exception as e:
             logger.warning(f"exit-link reconcile after restore failed: {e}")
+        _invalidate_ip_status(server.get('uid'))
         return result
     except Exception as e:
         logger.exception("Error restoring protocol backup")
@@ -6423,6 +11231,408 @@ def api_protocol_backup_delete(request: Request, server_id: int, req: BackupDown
             ssh.disconnect()
 
 
+# ===== Copy one AWG instance to another server =====
+INSTANCE_COPY_TTL = 60 * 60
+INSTANCE_COPY_KEEP = 20
+_inst_copy_ops = {}
+_inst_copy_active = {'op_id': None}
+_inst_copy_loaded = {'done': False}
+
+
+def _instance_copy_store_path():
+    return os.path.join(os.path.dirname(DATA_FILE), 'instance_copy_ops.json')
+
+
+def _instance_copy_save():
+    path = _instance_copy_store_path()
+    # Unique temp name: the worker (event loop) and the start handler
+    # (threadpool) can save at the same time and must not overwrite each other.
+    tmp = '%s.%s.tmp' % (path, uuid.uuid4().hex)
+    try:
+        with open(tmp, 'w', encoding='utf-8') as handle:
+            json.dump(list(_inst_copy_ops.values()), handle, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:
+        logger.warning("Cannot persist instance copy operations", exc_info=True)
+
+
+def _instance_copy_prune():
+    now = datetime.now().timestamp()
+    for op_id, op in list(_inst_copy_ops.items()):
+        if op.get('finished_ts') and now - op['finished_ts'] > INSTANCE_COPY_TTL:
+            _inst_copy_ops.pop(op_id, None)
+    if len(_inst_copy_ops) > INSTANCE_COPY_KEEP:
+        finished = sorted(
+            (op for op in _inst_copy_ops.values() if op.get('finished_ts')),
+            key=lambda op: op['finished_ts'],
+        )
+        for op in finished[:len(_inst_copy_ops) - INSTANCE_COPY_KEEP]:
+            _inst_copy_ops.pop(op['id'], None)
+
+
+def _instance_copy_load():
+    if _inst_copy_loaded['done']:
+        return
+    _inst_copy_loaded['done'] = True
+    try:
+        with open(_instance_copy_store_path(), encoding='utf-8') as handle:
+            stored = json.load(handle)
+    except Exception:
+        return
+    for op in stored if isinstance(stored, list) else []:
+        if not isinstance(op, dict) or not op.get('id'):
+            continue
+        if op.get('state') == 'running':
+            # The process that owned the SSH session is gone.
+            op['state'] = 'failed'
+            op['error'] = {
+                'code': 'interrupted',
+                'message': 'the panel restarted during the copy; check the target server',
+            }
+            op.setdefault('lines', []).append({
+                'ts': datetime.now().isoformat(timespec='seconds'),
+                'stage': 'error',
+                'text': 'panel restarted before the operation finished',
+            })
+            op['finished_at'] = datetime.now().isoformat(timespec='seconds')
+            op['finished_ts'] = datetime.now().timestamp()
+        _inst_copy_ops[op['id']] = op
+    _instance_copy_prune()
+
+
+def _instance_copy_error(exc, status_code=400):
+    return JSONResponse({'error': exc.message, 'code': exc.code}, status_code=status_code)
+
+
+def _instance_copy_targets(data, server_id):
+    return [
+        {'id': index, 'name': server.get('name') or server.get('host'),
+         'host': server.get('host')}
+        for index, server in enumerate(data.get('servers', []))
+        if index != server_id
+    ]
+
+
+def _instance_copy_source(data, server_id, protocol):
+    """(server, protocol_key, panel_entry, container) or raises InstanceCopyError."""
+    if server_id < 0 or server_id >= len(data.get('servers', [])):
+        raise InstanceCopyError('server_not_found', 'Server not found')
+    server = data['servers'][server_id]
+    protocols = server.get('protocols') or {}
+    entry = protocols.get(protocol)
+    if not isinstance(entry, dict):
+        raise InstanceCopyError('protocol_not_found', 'Protocol is not installed on this server')
+    if instance_copy_base(protocol) not in ('awg', 'awg2', 'awg3'):
+        raise InstanceCopyError('unsupported', 'Only AmneziaWG instances can be copied')
+    container = entry.get('container_name') or protocol_container_name(protocol)
+    if not container:
+        raise InstanceCopyError('unsupported', 'Unknown container for this protocol')
+    return server, entry, container
+
+
+def _instance_copy_apply(plan, source_server_id, target_server_id, source_protocol):
+    """Write the copied instance and its user bindings into data.json."""
+    data = load_data()
+    if target_server_id < 0 or target_server_id >= len(data.get('servers', [])):
+        raise InstanceCopyError('server_not_found', 'Target server not found')
+    source_entry = data['servers'][source_server_id]['protocols'][source_protocol]
+    target = data['servers'][target_server_id]
+    protocols = target.setdefault('protocols', {})
+    if plan['target_key'] in protocols:
+        raise InstanceCopyError('name_taken', 'Target instance name is already in use')
+
+    entry = copy_module.deepcopy(source_entry)
+    entry['container_name'] = plan['target_container']
+    entry['instance'] = plan['target_index']
+    entry['port'] = str(plan['port'])
+    params = entry.get('awg_params')
+    if isinstance(params, dict):
+        params['port'] = str(plan['port'])
+    entry['public_host'] = None
+    entry['public_port'] = None
+    entry['installed'] = True
+    display = str(entry.get('display_name') or '').strip()
+    if plan['target_index'] > 1 and '#' not in display:
+        display = ('%s #%d' % (display, plan['target_index'])).strip()
+    entry['display_name'] = display or plan['target_key']
+    protocols[plan['target_key']] = entry
+
+    now = datetime.now().isoformat(timespec='seconds')
+    connections = data.setdefault('user_connections', [])
+    copied = 0
+    for connection in list(connections):
+        if (connection.get('server_id') != source_server_id
+                or connection.get('protocol') != source_protocol):
+            continue
+        connections.append({
+            'id': str(uuid.uuid4()),
+            'user_id': connection.get('user_id'),
+            'server_id': target_server_id,
+            'protocol': plan['target_key'],
+            'client_id': connection.get('client_id'),
+            'name': connection.get('name'),
+            'created_at': connection.get('created_at') or now,
+            # Traffic belongs to the source host; the copy starts at zero.
+            'last_bytes': 0,
+            'last_rx_bytes': 0,
+            'last_tx_bytes': 0,
+            # Nothing to finalize on the copy until it actually carries traffic:
+            # without this flag the usage-accounting guard blocks uninstalling
+            # the instance the copy just created (peer_accounting.ownership_rows).
+            'accounting_unowned': True,
+        })
+        copied += 1
+    save_data(data)
+    return copied
+
+
+def _instance_copy_rollback_panel(plan, target_server_id):
+    try:
+        data = load_data()
+        target = data['servers'][target_server_id]
+        protocols = target.get('protocols') or {}
+        entry = protocols.get(plan['target_key'])
+        if (isinstance(entry, dict)
+                and entry.get('container_name') != plan['target_container']):
+            # A concurrent install took the same key after planning: that
+            # instance is not ours, so keep it and its user bindings.
+            return
+        protocols.pop(plan['target_key'], None)
+        connections = data.get('user_connections') or []
+        data['user_connections'] = [
+            connection for connection in connections
+            if not (connection.get('server_id') == target_server_id
+                    and connection.get('protocol') == plan['target_key'])
+        ]
+        save_data(data)
+    except Exception:
+        logger.warning("instance copy: cannot roll back data.json", exc_info=True)
+
+
+async def _run_instance_copy(op_id):
+    """Worker: SSH work in a thread, panel state on the event loop."""
+    op = _inst_copy_ops[op_id]
+    source_ssh = target_ssh = None
+    plan = None
+    copier = None
+    stage_steps = {
+        'planning': (1, 12), 'inspecting': (2, 25), 'patching': (2, 32),
+        'image': (3, 45), 'creating': (4, 55), 'uploading': (5, 70),
+        'starting': (6, 80), 'verifying': (7, 90), 'tools': (7, 93),
+        'done': (8, 100),
+    }
+
+    def log(stage, text):
+        step, percent = stage_steps.get(stage, (op.get('step', 0), op.get('percent', 0)))
+        op['step'] = max(op.get('step', 0), step)
+        op['percent'] = max(op.get('percent', 0), percent)
+        op['lines'].append({
+            'ts': datetime.now().isoformat(timespec='seconds'),
+            'stage': stage,
+            'text': text,
+        })
+
+    try:
+        data = load_data()
+        source_server, _entry, container = _instance_copy_source(
+            data, op['source_server_id'], op['protocol'])
+        if op['target_server_id'] < 0 or op['target_server_id'] >= len(data.get('servers') or []):
+            # The panel state may change between the start request and the
+            # worker (a server removed in between must not crash the task).
+            raise InstanceCopyError('server_not_found', 'Target server not found')
+        target_server = data['servers'][op['target_server_id']]
+        log('planning', 'connecting to %s and %s' % (
+            source_server.get('name') or source_server['host'],
+            target_server.get('name') or target_server['host']))
+        source_ssh = await asyncio.to_thread(get_ssh, source_server)
+        await asyncio.to_thread(source_ssh.connect)
+        target_ssh = await asyncio.to_thread(get_ssh, target_server)
+        await asyncio.to_thread(target_ssh.connect)
+
+        copier = InstanceCopier(source_ssh, target_ssh)
+        plan = await asyncio.to_thread(
+            copier.plan, op['protocol'], container, target_server.get('protocols') or {})
+        op['target_key'] = plan['target_key']
+        op['target_container'] = plan['target_container']
+        op['port'] = plan['port']
+        log('planning', 'target instance %s, port %d, %d peers' % (
+            plan['target_key'], plan['port'], plan['peers']))
+
+        result = await asyncio.to_thread(
+            copier.execute, plan, log, lambda: bool(op.get('cancel_requested')))
+
+        try:
+            # Hold the panel write lock across load_data/save_data: a traffic
+            # update landing in between would otherwise be overwritten by the
+            # copy snapshot.
+            async with DATA_LOCK:
+                copied = await asyncio.to_thread(
+                    _instance_copy_apply, plan, op['source_server_id'],
+                    op['target_server_id'], op['protocol'])
+        except Exception:
+            # The container exists but the panel cannot record it: drop the
+            # partial panel entry under the same lock the successful write
+            # uses (a traffic update must not be overwritten by the snapshot),
+            # then remove the container.
+            async with DATA_LOCK:
+                await asyncio.to_thread(
+                    _instance_copy_rollback_panel, plan, op['target_server_id'])
+            await asyncio.to_thread(copier.destroy, plan)
+            raise
+        result['connections'] = copied
+        op['result'] = result
+        op['state'] = 'success'
+        op['step'] = op['total']
+        op['percent'] = 100
+        log('done', 'instance %s is ready on %s' % (
+            plan['target_key'], target_server.get('name') or target_server['host']))
+    except CopyCancelled:
+        op['state'] = 'cancelled'
+        log('error', 'copy cancelled; the target container was removed')
+    except InstanceCopyError as exc:
+        op['state'] = 'failed'
+        op['error'] = {'code': exc.code, 'message': exc.message}
+        log('error', exc.message)
+    except Exception as exc:
+        logger.exception("Instance copy failed")
+        op['state'] = 'failed'
+        op['error'] = {'code': 'internal_error', 'message': str(exc)}
+        log('error', 'unexpected error: %s' % exc)
+    finally:
+        op['finished_at'] = datetime.now().isoformat(timespec='seconds')
+        op['finished_ts'] = datetime.now().timestamp()
+        _inst_copy_active['op_id'] = None
+        _instance_copy_save()
+        for ssh in (source_ssh, target_ssh):
+            if ssh:
+                try:
+                    ssh.disconnect()
+                except Exception:
+                    logger.debug("instance copy: disconnect failed", exc_info=True)
+
+
+@app.post('/api/servers/{server_id}/copy/preflight', tags=["Protocols"])
+def api_instance_copy_preflight(request: Request, server_id: int, req: InstanceCopyRequest):
+    """Resolve the target instance name, port and warnings. Changes nothing."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if req.target_server_id == server_id:
+        return JSONResponse({'error': 'Choose another server', 'code': 'same_server'},
+                            status_code=400)
+    source_ssh = target_ssh = None
+    try:
+        data = load_data()
+        _server, _entry, container = _instance_copy_source(data, server_id, req.protocol)
+        if req.target_server_id < 0 or req.target_server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Target server not found', 'code': 'server_not_found'},
+                                status_code=404)
+        target = data['servers'][req.target_server_id]
+        source_ssh = get_ssh(data['servers'][server_id])
+        source_ssh.connect()
+        target_ssh = get_ssh(target)
+        target_ssh.connect()
+        plan = InstanceCopier(source_ssh, target_ssh).plan(
+            req.protocol, container, target.get('protocols') or {})
+        payload = dict(plan)
+        payload['status'] = 'ok'
+        payload['protocol'] = req.protocol
+        return payload
+    except InstanceCopyError as e:
+        return _instance_copy_error(e)
+    except Exception as e:
+        logger.exception("Error planning instance copy")
+        return JSONResponse({'error': str(e), 'code': 'internal_error'}, status_code=500)
+    finally:
+        for ssh in (source_ssh, target_ssh):
+            if ssh:
+                ssh.disconnect()
+
+
+@app.post('/api/servers/{server_id}/copy', tags=["Protocols"])
+async def api_instance_copy_start(request: Request, server_id: int, req: InstanceCopyRequest):
+    """Start copying one instance; only one copy runs in the whole panel."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if req.target_server_id == server_id:
+        return JSONResponse({'error': 'Choose another server', 'code': 'same_server'},
+                            status_code=400)
+    _instance_copy_load()
+    _instance_copy_prune()
+    if _inst_copy_active['op_id']:
+        return JSONResponse(
+            {'error': 'Another instance copy is already running', 'code': 'copy_in_progress'},
+            status_code=409)
+    try:
+        data = load_data()
+        _instance_copy_source(data, server_id, req.protocol)
+        if req.target_server_id < 0 or req.target_server_id >= len(data['servers']):
+            raise InstanceCopyError('server_not_found', 'Target server not found')
+    except InstanceCopyError as e:
+        return _instance_copy_error(e)
+
+    op_id = uuid.uuid4().hex
+    op = {
+        'id': op_id,
+        'source_server_id': server_id,
+        'target_server_id': req.target_server_id,
+        'protocol': req.protocol,
+        'state': 'running',
+        'lines': [],
+        'result': None,
+        'error': None,
+        'cancel_requested': False,
+        'step': 0,
+        'total': INSTANCE_COPY_STEPS,
+        'percent': 0,
+        'started_at': datetime.now().isoformat(timespec='seconds'),
+    }
+    _inst_copy_ops[op_id] = op
+    _instance_copy_save()
+    _inst_copy_active['op_id'] = op_id
+    asyncio.create_task(_run_instance_copy(op_id))
+    return {'operation_id': op_id}
+
+
+@app.get('/api/servers/{server_id}/copy/{op_id}', tags=["Protocols"])
+async def api_instance_copy_status(request: Request, server_id: int, op_id: str, offset: int = 0):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    _instance_copy_load()
+    op = _inst_copy_ops.get(op_id)
+    if not op:
+        return JSONResponse({'error': 'Operation not found', 'code': 'not_found'}, status_code=404)
+    lines = op.get('lines') or []
+    offset = max(0, min(int(offset or 0), len(lines)))
+    return {
+        'operation_id': op_id,
+        'state': op.get('state'),
+        'step': op.get('step', 0),
+        'total': op.get('total', INSTANCE_COPY_STEPS),
+        'percent': op.get('percent', 0),
+        'lines': lines[offset:],
+        'next_offset': len(lines),
+        'result': op.get('result'),
+        'error': op.get('error'),
+        'target_key': op.get('target_key'),
+        'target_container': op.get('target_container'),
+        'port': op.get('port'),
+    }
+
+
+@app.post('/api/servers/{server_id}/copy/{op_id}/cancel', tags=["Protocols"])
+async def api_instance_copy_cancel(request: Request, server_id: int, op_id: str):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    _instance_copy_load()
+    op = _inst_copy_ops.get(op_id)
+    if not op:
+        return JSONResponse({'error': 'Operation not found', 'code': 'not_found'}, status_code=404)
+    if op.get('state') == 'running':
+        op['cancel_requested'] = True
+        return {'status': 'cancelling'}
+    return {'status': op.get('state')}
+
+
 @app.post('/api/servers/{server_id}/container/toggle', tags=["Protocols"])
 def api_container_toggle(request: Request, server_id: int, req: ContainerToggleRequest):
     """Start or stop a protocol Docker container. Stopping an exit node that
@@ -6459,6 +11669,7 @@ def api_container_toggle(request: Request, server_id: int, req: ContainerToggleR
         if hasattr(ssh, 'docker_ps_invalidate'):
             ssh.docker_ps_invalidate()
         ssh.disconnect()
+        _invalidate_ip_status(server.get('uid') or f'#{server_id}')
         return {'status': 'success', 'action': action, 'container': container}
     except Exception as e:
         logger.exception("Error toggling container")
@@ -6502,6 +11713,10 @@ def api_server_config(request: Request, server_id: int, req: ProtocolRequest, se
         elif protocol_base(req.protocol) == 'nginx':
             from managers.nginx_manager import NginxManager
             mgr = NginxManager(ssh, req.protocol)
+            config = mgr._get_server_config(req.protocol)
+        elif protocol_base(req.protocol) == 'haproxy':
+            from managers.haproxy_manager import HaproxyManager
+            mgr = HaproxyManager(ssh, req.protocol)
             config = mgr._get_server_config(req.protocol)
         else:
             mgr = AWGManager(ssh)
@@ -6671,8 +11886,9 @@ async def api_set_protocol_public_endpoint(request: Request, server_id: int, req
     Both fields are optional and empty means "as before": the server's own
     address, the instance's listen port. Useful when an instance answers on a
     second IP of the same box, behind a port forward, or under a domain name.
-    A custom public port on this same box is published automatically: REDIRECT
-    rules in iptables/ip6tables send it to the instance's listen port.
+    A custom public port on this same box is published automatically: a DNAT
+    rule in iptables/ip6tables sends it straight to the container, the same
+    path Docker uses. Unverified Docker publications are never redirected.
     """
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -6702,13 +11918,15 @@ async def api_set_protocol_public_endpoint(request: Request, server_id: int, req
 
         # The override reaches the server in two ways: telemt composes its own
         # tg:// links from config.toml, and a custom public port on this same
-        # box needs an iptables REDIRECT to the listen port. The record is
+        # box is published with owned DNAT straight to the verified container.
+        # The record is
         # saved either way: a box that is down right now must not lose the
         # setting, and the next save re-applies it.
         warning = ''
         ssh = None
         try:
             base = protocol_base(proto)
+            needs_forward_sync = any(base in protocols for protocols in PUBLIC_FORWARD_L4.values())
             if base == 'telemt':
                 pub_host, pub_port = protocol_public_endpoint(server, proto)
                 ssh = await asyncio.to_thread(get_ssh, server)
@@ -6716,38 +11934,14 @@ async def api_set_protocol_public_endpoint(request: Request, server_id: int, req
                 manager = get_protocol_manager(ssh, proto)
                 await asyncio.to_thread(
                     manager.set_public_endpoint, pub_host, pub_port or record.get('port', '443'))
-            fwd_host, _ = protocol_public_endpoint(server, proto)
-            fwd, fwd_warning = public_port_forward_commands(
-                proto, port, listen_port, old_public_port, fwd_host)
-            if fwd_warning and not warning:
-                warning = fwd_warning
-            if fwd is not None:
-                if ssh is None:
-                    ssh = await asyncio.to_thread(get_ssh, server)
-                    await asyncio.to_thread(ssh.connect)
-                for cmd in fwd:
-                    out, err, code = await asyncio.to_thread(ssh.run_sudo_command, cmd)
-                    if code != 0 and not warning:
-                        logger.warning(f"Public port forward command failed on {proto}: {cmd}: {err}")
-                        warning = f"forward command failed: {cmd}: {err}"
-                # Verify the rule exists for each address family when adding,
-                # scoped exactly like the rule that was installed.
-                if not warning and port and str(port) != str(listen_port):
-                    l4 = next((k for k, v in PUBLIC_FORWARD_L4.items() if base in v), None)
-                    if l4:
-                        fam, _ = _forward_family_dests(fwd_host)
-                        for ipt, fkey in (('iptables', 4), ('ip6tables', 6)):
-                            addrs = fam[fkey]
-                            if addrs == []:
-                                continue
-                            for addr in (addrs if addrs is not None else ['']):
-                                dest = f' -d {addr}' if addr else ''
-                                verify = (f'{ipt} -t nat -C PREROUTING -p {l4}{dest} --dport {port} '
-                                          f'-j REDIRECT --to-ports {listen_port}')
-                                vout, verr, vcode = await asyncio.to_thread(ssh.run_sudo_command, verify)
-                                if vcode != 0 and not warning:
-                                    logger.warning(f"Public port forward verification failed on {proto}: {ipt}: {verr}")
-                                    warning = f"forward verification failed: {ipt} REDIRECT to :{listen_port} not present"
+            # A previous cleanup may have failed after the override was saved.
+            # Repeated clears must still reconcile the stable ownership marker.
+            if ssh is None and needs_forward_sync:
+                ssh = await asyncio.to_thread(get_ssh, server)
+                await asyncio.to_thread(ssh.connect)
+            if ssh is not None and needs_forward_sync:
+                warning = await asyncio.to_thread(
+                    _apply_public_port_forward, ssh, server, proto, port, listen_port, old_public_port)
         except Exception as e:
             logger.warning(f"Could not apply the public endpoint to {proto}: {e}")
             warning = str(e)
@@ -6766,7 +11960,7 @@ async def api_set_protocol_public_endpoint(request: Request, server_id: int, req
 # TCP for the rest. DNS resolvers and the exit node have nothing to publish.
 PUBLIC_FORWARD_L4 = {
     'udp': ('awg', 'awg2', 'awg3', 'awg_legacy', 'wireguard'),
-    'tcp': ('xray', 'telemt', 'socks5', 'nginx'),
+    'tcp': ('xray', 'telemt', 'socks5', 'nginx', 'haproxy'),
 }
 
 # Seconds before the startup re-apply touches SSH, so the panel is serving
@@ -6776,23 +11970,117 @@ RESTORE_FORWARD_DELAY = 10
 # Seconds between periodic re-applies of the public-port forwards. A VPS can
 # reboot on its own while the panel keeps running, and hand-made iptables
 # rules do not come back - the panel owns putting them back, again and again.
-# Idempotency makes every round safe: -C-guarded additions never duplicate.
-RESTORE_FORWARD_INTERVAL = 6 * 3600
+# Every round is cheap and idempotent: the -C probe runs first and a write
+# happens only when the live rule is missing or still points at a container
+# address Docker has replaced. The interval is short enough to repair a
+# recreated container before clients notice.
+RESTORE_FORWARD_INTERVAL = 60
+
+# Smart Route self-heal. Recreating an AWG container (kernel/plugin upgrade,
+# docker restart, host reboot) wipes table 200 and the split accounting chains,
+# and the panel keeps believing the instance is split: Russian traffic silently
+# goes through the exit node until the host-side hourly timer re-applies the
+# list - and if that timer is stuck, never. The panel therefore reads the throw
+# count itself and re-applies a lost split right away. The startup pass covers
+# a panel restart; the loop covers container work done while the panel runs.
+SMARTR_RECONCILE_DELAY = 25
+SMARTR_RECONCILE_INTERVAL = 300
+
+# One-shot rewrite of the host timer installed by panels up to v1.8.14: they
+# wrote OnUnitActiveSec, a monotonic schedule that silently stops arming when
+# the service's activation stamp goes stale (ZK and MAMKAM, 2026-11-19: the
+# timer stayed "active" for 9 days without a single run). The unit is written
+# only at install time, so existing installations keep the broken timer forever
+# without this pass. Off switch for tests and for admins who manage the unit
+# themselves.
+SMARTR_TIMER_MIGRATION = os.environ.get(
+    'AWP_SMARTR_TIMER_MIGRATION', '1').lower() not in ('0', 'false', 'no', 'off')
+SMARTR_TIMER_MIGRATION_DELAY = 40      # after the reconcile pass and the boot probes
+SMARTR_TIMER_MIGRATION_KEY = 'smartroute_timer_v1'
+
+
+async def smartroute_timer_migration():
+    """Rewrite legacy Smart Route timers once, per host, fail-soft."""
+    if not SMARTR_TIMER_MIGRATION:
+        logger.info("Smart Route timer migration disabled by AWP_SMARTR_TIMER_MIGRATION")
+        return
+    await asyncio.sleep(SMARTR_TIMER_MIGRATION_DELAY)
+    try:
+        data = load_data()
+    except Exception as e:
+        logger.warning(f"Smart Route timer migration: cannot read data: {e}")
+        return
+    rec = (data.get('panel_migrations') or {}).get(SMARTR_TIMER_MIGRATION_KEY) or {}
+    if rec.get('done_at'):
+        return
+    try:
+        report = await smartroute_svc.migrate_timer()
+    except Exception as e:
+        logger.warning(f"Smart Route timer migration failed: {e}")
+        return
+    migrated = [r['server'] for r in report if r.get('state') == 'migrated']
+    failed = [r['server'] for r in report if str(r.get('state', '')).startswith('failed')]
+    if migrated:
+        logger.warning("Smart Route timer rewritten on: " + ', '.join(migrated))
+    if failed:
+        logger.warning("Smart Route timer migration still pending on: " + ', '.join(failed))
+    await _smartroute_timer_migration_finish(bool(failed), len(failed))
+
+
+async def _smartroute_timer_migration_finish(pending, count):
+    try:
+        async with DATA_LOCK:
+            data = load_data()
+            rec = (data.setdefault('panel_migrations', {})
+                   .setdefault(SMARTR_TIMER_MIGRATION_KEY, {}))
+            rec['last_attempt_at'] = datetime.now(timezone.utc).isoformat()
+            rec['pending'] = count
+            if not pending:
+                rec['done_at'] = rec['last_attempt_at']
+            save_data(data)
+    except Exception as e:
+        logger.warning(f"Smart Route timer migration: cannot record the result: {e}")
+
+
+async def smartroute_reconcile_pass():
+    """One self-heal round over every server with Smart Route installed."""
+    try:
+        report = await smartroute_svc.reconcile()
+    except Exception as e:
+        logger.warning(f"Smart Route reconcile pass failed: {e}")
+        return []
+    repaired = [r for r in report if r.get('repaired')]
+    for item in report:
+        if item.get('error'):
+            logger.warning(f"Smart Route reconcile: {item['server']}/"
+                           f"{item['protocol']}: {item['error']}")
+    if repaired:
+        logger.warning("Smart Route re-applied after container recreation: " +
+                       ', '.join(f"{r['server']}/{r['protocol']}" for r in repaired))
+    return report
+
+
+async def smartroute_reconcile_loop():
+    """Periodic self-heal. Never raises - the next round retries."""
+    await asyncio.sleep(SMARTR_RECONCILE_DELAY)
+    while True:
+        await smartroute_reconcile_pass()
+        await asyncio.sleep(SMARTR_RECONCILE_INTERVAL)
 
 
 async def restore_public_port_forwards():
-    """Re-apply public-port REDIRECT rules on every server at panel startup.
+    """Re-apply public-port DNAT rules on every server at panel startup.
 
     Hosts have no uniform persistence for hand-made iptables rules (netfilter
     -persistent exists on some boxes only, docker restores only its own), so
     after a server or panel restart the panel's own forwards were gone. The
     panel owns these rules -- it puts them back. Idempotent: additions are
-    guarded by -C, so a double run never duplicates anything.
+    serialized on the SSH host; only owned rules are reconciled.
     """
     await asyncio.sleep(RESTORE_FORWARD_DELAY)  # let the panel finish booting
     data = load_data()
     for server in data.get('servers', []):
-        commands = []
+        pending = []
         for proto, record in (server.get('protocols') or {}).items():
             if not isinstance(record, dict):
                 continue
@@ -6800,29 +12088,21 @@ async def restore_public_port_forwards():
             listen_port = str(record.get('port') or '').strip()
             if not public_port or not listen_port:
                 continue
-            pub_host, _ = protocol_public_endpoint(server, proto)
-            cmds, fwd_warning = public_port_forward_commands(
-                proto, public_port, listen_port, public_ip=pub_host)
-            if fwd_warning:
-                logger.warning(f"Public port forward on "
-                               f"{server.get('name') or server.get('host')} {proto}: {fwd_warning}")
-            if cmds:
-                commands.extend(cmds)
-        if not commands:
+            pending.append((proto, public_port, listen_port))
+        if not pending:
             continue
         ssh = None
         try:
             ssh = get_ssh(server)
             await asyncio.to_thread(ssh.connect)
-            failed = False
-            for cmd in commands:
-                out, err, code = await asyncio.to_thread(ssh.run_sudo_command, cmd)
-                if code != 0:
-                    logger.error(f"Failed to re-apply public port forward on "
-                                 f"{server.get('name') or server.get('host')}: {cmd}: {err}")
-                    failed = True
-            if not failed:
-                logger.info(f"Public port forwards re-applied on {server.get('name') or server.get('host')}")
+            for proto, public_port, listen_port in pending:
+                try:
+                    warning = await asyncio.to_thread(
+                        _apply_public_port_forward, ssh, server, proto, public_port, listen_port)
+                    if warning:
+                        logger.warning("Public port forward on %s: %s", proto, warning)
+                except Exception as e:
+                    logger.warning("Could not re-apply public port forward on %s: %s", proto, e)
         except Exception as e:
             logger.warning(f"Could not re-apply public port forwards on "
                            f"{server.get('name') or server.get('host')}: {e}")
@@ -6833,7 +12113,7 @@ async def restore_public_port_forwards():
 
 async def restore_public_port_forwards_loop():
     """Re-apply the forwards periodically, not only at panel startup: a VPS
-    rebooted independently leaves its REDIRECT rules gone until someone
+    rebooted independently leaves its DNAT rules gone until someone
     restarts the panel. Never raises - the next round retries."""
     while True:
         await asyncio.sleep(RESTORE_FORWARD_INTERVAL)
@@ -6844,15 +12124,14 @@ async def restore_public_port_forwards_loop():
 
 
 def _forward_family_dests(public_ip):
-    """Per-address-family -d scoping for the REDIRECT rules.
+    """Per-address-family -d scoping for the public-port forward rules.
 
     Returns ({4: addrs|None, 6: addrs|None}, warning): None means the family
     stays unrestricted, [] means the family is skipped entirely (a resolved
     host with no addresses of that family publishes nothing there), a list
     scopes every rule of that family to those addresses. An IP literal
     restricts its own family only; a domain resolves on the panel machine.
-    An unresolvable domain falls back to unrestricted rules plus a warning
-    the API surfaces.
+    An unresolvable domain produces no rules and a warning.
     """
     if not public_ip:
         return {4: None, 6: None}, ''
@@ -6876,53 +12155,77 @@ def _forward_family_dests(public_ip):
         pass
     v4, v6 = sorted(set(v4)), sorted(set(v6))
     if not v4 and not v6:
-        return {4: None, 6: None}, (f'could not restrict the forward rule to the public IP: '
+        return {4: [], 6: []}, (f'could not restrict the forward rule to the public IP: '
                                     f'{host} does not resolve')
     return {4: v4, 6: v6}, ''
 
 
 def public_port_forward_commands(protocol, public_port, listen_port, old_public_port='',
-                                 public_ip=''):
-    """iptables/ip6tables commands publishing a custom public port.
+                                 public_ip='', server_uid=''):
+    """One privileged process: inspect, validate, lock, reconcile and verify.
 
-    Returns (commands, warning); commands is None when nothing is needed.
-    A public port equal to the listen port (or empty) means "no rule"; any
-    previous rule for the same instance is removed. Idempotent: additions are
-    guarded by -C, removals loop -D until the rule is gone. Rules are scoped
-    to the public address (-d public_ip) so they redirect only the traffic
-    actually meant for this instance, not every packet hitting the port.
+    No remote shell interpolation of Docker output, no REDIRECT fallback and
+    no deletion of unmarked legacy/foreign rules. Public Endpoint fields and
+    the API's saved-setting + warning contract stay unchanged.
     """
     base = protocol_base(protocol)
     l4 = next((k for k, v in PUBLIC_FORWARD_L4.items() if base in v), None)
     if l4 is None:
         return None, ''
-    fam, warning = _forward_family_dests(public_ip)
-    commands = []
+    try:
+        listen_port = public_port_forward.port(listen_port)
+        if public_port:
+            public_port = public_port_forward.port(public_port)
+        if old_public_port:
+            public_port_forward.port(old_public_port)
+        if not server_uid:
+            raise ValueError('missing stable server UID; forward unchanged')
+    except ValueError as e:
+        return None, str(e)
+    # Deleting our marker needs neither Docker discovery nor working DNS.
+    fam, warning = (_forward_family_dests(public_ip) if public_port and public_port != listen_port
+                    else ({4: [], 6: []}, ''))
+    if warning:
+        return None, warning
+    request = {'protocol': protocol, 'container': protocol_container_name(protocol),
+               'server_uid': server_uid, 'l4': l4, 'listen_port': listen_port,
+               'public_port': public_port, 'old_public_port': old_public_port,
+               'scopes': {k: (v if v is not None else ['']) for k, v in fam.items()}}
+    with open(public_port_forward.__file__, encoding='utf-8') as f:
+        source = f.read()
+    return ['python3 -c ' + shlex.quote(source) + ' ' + shlex.quote(json.dumps(request))], ''
 
-    def drop(port):
-        for ipt, fkey in (('iptables', 4), ('ip6tables', 6)):
-            addrs = fam[fkey]
-            if addrs == []:
-                continue  # nothing was ever published in this family
-            for addr in (addrs if addrs is not None else ['']):
-                dest = f' -d {addr}' if addr else ''
-                rule = (f'-t nat -D PREROUTING -p {l4}{dest} --dport {port} '
-                        f'-j REDIRECT --to-ports {listen_port}')
-                commands.append(f'for i in 1 2 3; do {ipt} {rule} 2>/dev/null || break; done')
 
-    for stale in {p for p in (old_public_port,) if p and p != public_port}:
-        drop(stale)
-    if public_port and public_port != listen_port:
-        for ipt, fkey in (('iptables', 4), ('ip6tables', 6)):
-            addrs = fam[fkey]
-            if addrs == []:
-                continue
-            for addr in (addrs if addrs is not None else ['']):
-                dest = f' -d {addr}' if addr else ''
-                rule = (f'-t nat -A PREROUTING -p {l4}{dest} --dport {public_port} '
-                        f'-j REDIRECT --to-ports {listen_port}')
-                commands.append(f'{ipt} {rule.replace("-A ", "-C ", 1)} 2>/dev/null || {ipt} {rule}')
-    return (commands or None), warning
+
+def _apply_public_port_forward(ssh, server, proto, public_port, listen_port, old_public_port=''):
+    pub_host, _ = protocol_public_endpoint(server, proto)
+    commands, warning = public_port_forward_commands(
+        proto, public_port, listen_port, old_public_port, pub_host,
+        server_uid=server.get('uid', ''))
+    if warning or not commands:
+        return warning
+    # A catalog reorder must not retarget a queued SSH operation. Check the
+    # stable identity, SSH endpoint and requested record again after connect.
+    def current():
+        matches = [s for s in load_data().get('servers', []) if s.get('uid') == server.get('uid')]
+        return (len(matches) == 1
+                and all(matches[0].get(k) == server.get(k) for k in ('host', 'ssh_port', 'username', 'private_key', 'password'))
+                and matches[0].get('protocols', {}).get(proto) == server.get('protocols', {}).get(proto))
+    if not current():
+        return 'server identity or endpoint changed; forward unchanged'
+    out, _, code = ssh.run_sudo_command(commands[0], timeout=120)
+    try:
+        warning = json.loads(out)['warning']
+        if not isinstance(warning, str):
+            raise ValueError()
+    except (ValueError, KeyError, TypeError):
+        warning = 'forward command failed or returned an invalid result'
+    if code and not warning:
+        warning = 'forward command failed; reconciliation required'
+    if not current():
+        return 'server identity changed during forwarding; reconciliation required'
+    return warning
+
 
 
 def _parse_ss_listeners(output):
@@ -6976,8 +12279,8 @@ async def api_check_protocol_port(request: Request, server_id: int, port: str = 
             foreign = [l for l in listeners
                        if not re.match(r'^(docker-proxy|dockerd)$', l.get('process', ''))]
             if not foreign:
-                resp['warning'] = (f'Port {port} is held by Docker; the REDIRECT rule may '
-                                   f'conflict unless the container publish is removed.')
+                resp['warning'] = (f'Port {port} is held by Docker; a forward on this port '
+                                   f'conflicts with the container publish unless it is removed.')
         return resp
     except Exception as e:
         logger.warning(f"Port check on server {server_id} failed: {e}")
@@ -7062,6 +12365,9 @@ def api_server_config_save(request: Request, server_id: int, req: ServerConfigSa
         server = data['servers'][server_id]
         if server_uid is not None and server.get('uid') != server_uid:
             return JSONResponse({'error': 'Server identity changed; refresh the inventory'}, status_code=409)
+        if srv_warp_ctx(server, req.protocol).get('active'):
+            # MTU/DNS come from the warp budget while the link is active.
+            raise SrvWarpError('srv_warp_settings_locked', 409)
         base = protocol_base(req.protocol)
         from peer_accounting import _protocol_scope
         scope = _protocol_scope(req.protocol)
@@ -7148,6 +12454,9 @@ def api_server_config_save(request: Request, server_id: int, req: ServerConfigSa
         if not protected and any(info.get('exit_link') for key, info in current['servers'][server_id].get('protocols', {}).items()
                                  if _protocol_scope(key) == scope):
             return JSONResponse({'error': 'Exit link changed; refresh the configuration'}, status_code=409)
+        if srv_warp_ctx(current['servers'][server_id], req.protocol).get('active'):
+            # A warp link created while SSH was connecting owns MTU/DNS too.
+            raise SrvWarpError('srv_warp_settings_locked', 409)
         if protected:
             mgr = get_protocol_manager(ssh, req.protocol)
             if base == 'xray':
@@ -7174,8 +12483,27 @@ def api_server_config_save(request: Request, server_id: int, req: ServerConfigSa
                 unchanged = False
             if unchanged:
                 return {'status': 'success', 'unchanged': True}
-            return JSONResponse({'error': 'Applying this configuration may restart the protocol and reset peer counters. A counter-preserving apply procedure is required.',
-                                 'code': 'traffic_finalization_required'}, status_code=409)
+            if base != 'xray':
+                # Other protocols have no counter-preserving apply; keep
+                # their accounted configs read-only.
+                return JSONResponse({'error': 'Applying this configuration may restart the protocol and reset peer counters. A counter-preserving apply procedure is required.',
+                                     'code': 'traffic_finalization_required'}, status_code=409)
+            # Counter-preserving apply for xray: commit the owned peers'
+            # current counters against their baselines, apply the config,
+            # then move the baselines to the restarted core's zero counters.
+            owned_rows = ownership_rows(current, server_id=server_id,
+                                        protocol=req.protocol)
+            now = time.time()
+            for conn in owned_rows:
+                observed, _quiescent = read_peer_state(
+                    mgr, conn['protocol'], conn.get('client_id'))
+                if observed is not None:
+                    apply_final_sample(current, conn, server, observed, now)
+                else:
+                    # Peer gone or counters unreadable: the restart resets
+                    # the core counters to zero anyway — rebase up front.
+                    conn['last_bytes'] = 0
+            save_data(current)
         if protocol_base(req.protocol) == 'xray':
             from managers.xray_manager import XrayManager
             mgr = XrayManager(ssh, req.protocol)
@@ -7185,6 +12513,19 @@ def api_server_config_save(request: Request, server_id: int, req: ServerConfigSa
             except Exception as e:
                 return JSONResponse({'error': f'Invalid JSON format: {str(e)}'}, status_code=400)
             mgr._save_server_json(data_json)
+            if protected and owned_rows:
+                # The recreation restarted the core with zeroed counters:
+                # move the owned peers' baselines with them, otherwise the
+                # first poll would read observed < baseline.
+                owned_ids = {(c.get('user_id'), c.get('client_id'))
+                             for c in owned_rows}
+                data = load_data()
+                for conn in data.get('user_connections', []):
+                    if (conn.get('server_id') == server_id
+                            and protocol_base(conn.get('protocol')) == base
+                            and (conn.get('user_id'), conn.get('client_id')) in owned_ids):
+                        conn['last_bytes'] = 0
+                save_data(data)
         elif protocol_base(req.protocol) == 'telemt':
             from managers.telemt_manager import TelemtManager
             mgr = TelemtManager(ssh, req.protocol)
@@ -7197,10 +12538,31 @@ def api_server_config_save(request: Request, server_id: int, req: ServerConfigSa
             from managers.nginx_manager import NginxManager
             mgr = NginxManager(ssh, req.protocol)
             mgr.save_server_config(req.protocol, req.config)
+        elif protocol_base(req.protocol) == 'haproxy':
+            from managers.haproxy_manager import HaproxyManager
+            mgr = HaproxyManager(ssh, req.protocol)
+            mgr.save_server_config(req.protocol, req.config)
+        elif protocol_base(req.protocol) == 'exit':
+            # The exit container has its own path/template; AWGManager would
+            # write into the awg container instead.
+            from managers.exit_manager import ExitManager
+            mgr = ExitManager(ssh, req.protocol)
+            ctx = srv_warp_ctx(server, req.protocol)
+            if ctx.get('active'):
+                mgr.save_server_config(req.protocol, req.config, warp_ctx=ctx)
+            else:
+                mgr.save_server_config(req.protocol, req.config)
         else:
             mgr = AWGManager(ssh)
-            mgr.save_server_config(req.protocol, req.config)
+            ctx = srv_warp_ctx(server, req.protocol)
+            if ctx.get('active'):
+                mgr.save_server_config(req.protocol, req.config, warp_ctx=ctx)
+            else:
+                mgr.save_server_config(req.protocol, req.config)
+        _invalidate_ip_status(server.get('uid'))
         return {'status': 'success'}
+    except SrvWarpError:
+        raise
     except Exception as e:
         logger.exception("Error saving server config")
         return JSONResponse({'error': str(e)}, status_code=500)
@@ -7293,7 +12655,35 @@ def api_get_connections(request: Request, server_id: int, protocol: str = Query(
                         client['assigned_user'] = u['username']
                         client['assigned_user_id'] = uid
                     break
-        return {'clients': clients}
+        # Плагин «Защита от торрентов»: метки, режим и здоровье фильтра
+        # добавляются только когда он установлен на этом сервере. Иначе в
+        # ответе нет ни одного торрент-поля — ядро не отдаёт данные фичи,
+        # которой на сервере нет.
+        if not torrent_plugin.installed(server):
+            return {'clients': clients}
+        buckets = torrent_plugin.peer_buckets(server, protocol)
+        torrent_mode = torrent_plugin.mode_of(server, protocol)
+        for client in clients:
+            user_data = client.get('userData') or {}
+            ip = user_data.get('clientIp') or ''
+            if not ip:
+                m = re.search(r'(\d+\.\d+\.\d+\.\d+)',
+                              user_data.get('allowedIps') or '')
+                ip = m.group(1) if m else ''
+            bucket = buckets.get(ip) or {}
+            owner = bucket.get('client_id') or ''
+            cid = client.get('clientId') or ''
+            # Адрес переиспользуется: удалили ключ — адрес выдали новому.
+            # История прежнего владельца новому не показывается.
+            if owner and cid and owner != cid:
+                bucket = {}
+            events = (bucket.get('events') or []) if ip else []
+            if events:
+                client['torrentEvents'] = events
+                client['torrentIp'] = ip
+            client['torrentGuard'] = torrent_mode
+        return {'clients': clients, 'torrent_guard': torrent_mode,
+                'torrent_guard_health': torrent_plugin.health_for(server)}
     except Exception as e:
         logger.exception("Error getting connections")
         return JSONResponse({'error': str(e)}, status_code=500)
@@ -7328,8 +12718,15 @@ def api_add_connection(request: Request, server_id: int, req: AddConnectionReque
             )
         elif protocol_base(req.protocol) == 'wireguard':
             result = manager.add_client(req.name, pub_host, public_port=pub_port)
+        elif protocol_base(req.protocol) == 'xray':
+            result = manager.add_client(req.protocol, req.name, pub_host, port,
+                                        public_port=pub_port,
+                                        fingerprint=xray_stored_fingerprint(server, req.protocol),
+                                        warp_ctx=srv_warp_ctx(server, req.protocol))
         else:
-            result = manager.add_client(req.protocol, req.name, pub_host, port, public_port=pub_port)
+            result = manager.add_client(req.protocol, req.name, pub_host, port,
+                                        public_port=pub_port,
+                                        warp_ctx=srv_warp_ctx(server, req.protocol))
         ssh.disconnect()
 
         if result.get('config'):
@@ -7348,7 +12745,15 @@ def api_add_connection(request: Request, server_id: int, req: AddConnectionReque
             }
             data['user_connections'].append(conn)
             save_data(data)
+            if protocol_base(req.protocol) == 'xray':
+                # Refresh the owner's subscription file right away; the
+                # periodic monitor covers every other change source.
+                try:
+                    auto_push_subscriptions(data, [req.user_id])
+                except Exception:
+                    logger.warning("subscription auto-push failed", exc_info=True)
 
+        _invalidate_ip_status(server.get('uid'))
         return result
     except Exception as e:
         logger.exception("Error adding connection")
@@ -7381,6 +12786,7 @@ async def api_remove_connection(request: Request, server_id: int, req: Connectio
             await asyncio.to_thread(_manager_call, manager, 'remove_client',
                                     req.protocol, req.client_id)
             ssh.disconnect()
+            _invalidate_ip_status(server.get('uid'))
             return {'status': 'success', 'finalized': False}
 
         scope = connection_scope(conn, server)
@@ -7436,6 +12842,7 @@ async def api_remove_connection(request: Request, server_id: int, req: Connectio
                 before, data)
             result['accounting'] = accounting
             result['finalized'] = True
+            _invalidate_ip_status(data['servers'][server_id].get('uid'))
             return result
     except Exception as e:
         logger.exception("Error removing connection")
@@ -7493,6 +12900,314 @@ def api_clear_conn_warnings(request: Request, server_id: int, req: ConnectionAct
     except Exception as e:
         logger.exception("Error clearing connection warnings")
         return JSONResponse({'error': str(e)}, status_code=500)
+
+
+
+
+# ===== Плагин «Защита от торрентов»: API =====
+# Роуты плагина, а не ядра: без установки на сервере они отвечают 409, и
+# ядровых торрент-роутов в приложении больше нет.
+
+async def _torrent_plugin_body(request):
+    try:
+        payload = await request.json()
+    except Exception:                                   # noqa: BLE001
+        payload = None
+    return payload if isinstance(payload, dict) else {}
+
+
+def _torrent_plugin_error(exc):
+    if isinstance(exc, TorrentPluginError):
+        return JSONResponse(exc.as_dict(), status_code=exc.status)
+    logger.exception('torrent plugin operation failed')
+    return JSONResponse({'error': str(exc) or 'operation failed',
+                         'code': 'internal_error'}, status_code=500)
+
+
+def _torrent_plugin_server(data, server_id):
+    if server_id < 0 or server_id >= len(data.get('servers', [])):
+        return None
+    return data['servers'][server_id]
+
+
+def _torrent_plugin_require_installed(server):
+    """409 до любого SSH: у неустановленного плагина нет ни правил, ни прав."""
+    if not torrent_plugin.installed(server):
+        raise TorrentPluginError('plugin_not_installed',
+                                 'Torrent guard plugin is not installed', 409)
+
+
+def _torrent_plugin_guards(server):
+    """Фабрика guard'ов и закрытие SSH. Без подходящих инстансов SSH не нужен.
+
+    Возвращает (factory, close). Фабрика вызывается только для инстансов,
+    которые сервис считает подходящими; всё остальное — явная ошибка.
+    """
+    if not torrent_plugin.capable(server, True):
+        def factory(proto):
+            raise TorrentPluginError(
+                'unsupported_protocol',
+                'Protocol %s does not support torrent guard' % proto, 400)
+        return factory, lambda: None
+    ssh = get_ssh(server)
+    ssh.connect()
+
+    def factory(proto):
+        manager = get_protocol_manager(ssh, proto)
+        make = getattr(manager, 'torrent_guard', None)
+        if not callable(make):
+            raise TorrentPluginError(
+                'unsupported_protocol',
+                'Protocol %s does not support torrent guard' % proto, 400)
+        return make(proto)
+
+    def close():
+        try:
+            ssh.disconnect()
+        except Exception:                               # noqa: BLE001
+            pass
+
+    return factory, close
+
+
+@app.get('/api/servers/{server_id}/plugins/torrent_guard', tags=["Servers"])
+def api_torrent_plugin_state(request: Request, server_id: int):
+    """Состояние плагина на сервере. Работает и без установки: 200 + installed=false."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    server = _torrent_plugin_server(data, server_id)
+    if server is None:
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    return torrent_plugin.status(server)
+
+
+@app.get('/api/plugins/torrent_guard/flags', tags=["Servers"])
+def api_torrent_plugin_flags(request: Request):
+    """Метки торрент-активности для плиток — только по установленным серверам."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    return {'flags': torrent_plugin.flags(data.get('servers', []))}
+
+
+async def _torrent_plugin_persist(server_id, changes, remove_mode_keys=False):
+    """Пишет только режимы плагина в СВЕЖИЙ data.json под DATA_LOCK.
+
+    SSH-операция длится секунды-минуты; держать всё это время снимок
+    data.json нельзя — параллельный писатель (пир, пользователь, другой
+    сервер) потерялся бы при сохранении старого снимка.
+    """
+    if not changes and not remove_mode_keys:
+        return
+    async with DATA_LOCK:
+        data = load_data()
+        server = _torrent_plugin_server(data, server_id)
+        if server is None:
+            return
+        protocols = server.get('protocols') or {}
+        for proto, mode in (changes or {}).items():
+            entry = protocols.get(proto)
+            if not isinstance(entry, dict):
+                continue
+            if mode is None:
+                entry.pop('torrent_guard', None)
+            else:
+                entry['torrent_guard'] = mode
+        if remove_mode_keys:
+            server.pop('torrent_guard_enabled', None)
+        save_data(data)
+
+
+def _torrent_plugin_run(server, action):
+    """SSH-операция в отдельном потоке: sync-вызов из async роута вешает loop."""
+    factory, close = _torrent_plugin_guards(server)
+    try:
+        return action(factory)
+    finally:
+        close()
+
+
+async def _torrent_plugin_finish(server_id, result):
+    """Сохраняет изменения и отдаёт статус, посчитанный по свежим данным."""
+    await _torrent_plugin_persist(server_id,
+                                  result.get('changes') or {},
+                                  bool(result.get('remove_mode_keys')))
+    data = load_data()
+    server = _torrent_plugin_server(data, server_id)
+    status = torrent_plugin.status(server) if server is not None else result
+    status['errors'] = result.get('errors') or []
+    return status
+
+
+@app.post('/api/servers/{server_id}/plugins/torrent_guard/install', tags=["Servers"])
+async def api_torrent_plugin_install(request: Request, server_id: int):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    body = await _torrent_plugin_body(request)
+    settings = body.get('settings') if isinstance(body.get('settings'), dict) else {}
+    reapply = bool(body.get('reapply'))
+    try:
+        data = load_data()
+        server = _torrent_plugin_server(data, server_id)
+        if server is None:
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        # Валидация и «уже установлен» — до SSH.
+        if settings:
+            torrent_plugin.merge_settings(torrent_plugin.settings(server),
+                                          settings)
+        if torrent_plugin.installed(server) and not reapply:
+            status = torrent_plugin.status(server)
+            status['errors'] = []
+            return status
+        result = await asyncio.to_thread(
+            _torrent_plugin_run, server,
+            lambda factory: torrent_plugin.install(
+                server, factory, settings=settings, reapply=reapply))
+        return await _torrent_plugin_finish(server_id, result)
+    except Exception as exc:                            # noqa: BLE001
+        return _torrent_plugin_error(exc)
+
+
+@app.post('/api/servers/{server_id}/plugins/torrent_guard/uninstall', tags=["Servers"])
+async def api_torrent_plugin_uninstall(request: Request, server_id: int):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    body = await _torrent_plugin_body(request)
+    try:
+        data = load_data()
+        server = _torrent_plugin_server(data, server_id)
+        if server is None:
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        if not torrent_plugin.installed(server):
+            return torrent_plugin.status(server)
+        result = await asyncio.to_thread(
+            _torrent_plugin_run, server,
+            lambda factory: torrent_plugin.uninstall(
+                server, factory, force=bool(body.get('force'))))
+        result['remove_mode_keys'] = True
+        return await _torrent_plugin_finish(server_id, result)
+    except Exception as exc:                            # noqa: BLE001
+        return _torrent_plugin_error(exc)
+
+
+@app.post('/api/servers/{server_id}/plugins/torrent_guard/settings', tags=["Servers"])
+async def api_torrent_plugin_settings(request: Request, server_id: int):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    body = await _torrent_plugin_body(request)
+    patch = body.get('settings') if isinstance(body.get('settings'), dict) \
+        else {k: v for k, v in body.items() if k != 'settings'}
+    try:
+        data = load_data()
+        server = _torrent_plugin_server(data, server_id)
+        if server is None:
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        record = torrent_plugin.record(server)
+        if not record or not record.get('installed'):
+            raise TorrentPluginError('plugin_not_installed',
+                                     'Torrent guard plugin is not installed', 409)
+        # Валидация до SSH: кривая настройка не должна стоить коннекта.
+        torrent_plugin.merge_settings(record.get('settings') or {}, patch)
+        if torrent_plugin.excluded_wireguard(server, patch):
+            result = await asyncio.to_thread(
+                _torrent_plugin_run, server,
+                lambda factory: torrent_plugin.set_settings(server, factory, patch))
+        else:
+            result = await asyncio.to_thread(
+                torrent_plugin.set_settings, server, None, patch)
+        return await _torrent_plugin_finish(server_id, result)
+    except Exception as exc:                            # noqa: BLE001
+        return _torrent_plugin_error(exc)
+
+
+@app.post('/api/servers/{server_id}/plugins/torrent_guard/enabled', tags=["Servers"])
+async def api_torrent_plugin_enabled(request: Request, server_id: int):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    body = await _torrent_plugin_body(request)
+    try:
+        data = load_data()
+        server = _torrent_plugin_server(data, server_id)
+        if server is None:
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        _torrent_plugin_require_installed(server)
+        result = await asyncio.to_thread(
+            _torrent_plugin_run, server,
+            lambda factory: torrent_plugin.set_enabled(
+                server, factory, bool(body.get('enabled'))))
+        return await _torrent_plugin_finish(server_id, result)
+    except Exception as exc:                            # noqa: BLE001
+        return _torrent_plugin_error(exc)
+
+
+@app.post('/api/servers/{server_id}/plugins/torrent_guard/mode', tags=["Servers"])
+async def api_torrent_plugin_mode(request: Request, server_id: int):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    body = await _torrent_plugin_body(request)
+    proto = str(body.get('protocol') or '')
+    mode = str(body.get('mode') or '').strip().lower()
+    try:
+        data = load_data()
+        server = _torrent_plugin_server(data, server_id)
+        if server is None:
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        _torrent_plugin_require_installed(server)
+        # Параметры проверяем до SSH: неверный режим — это 400, а не 502.
+        if mode not in TORRENT_MODES:
+            raise TorrentPluginError('invalid_mode',
+                                     'Mode must be one of %s'
+                                     % ', '.join(TORRENT_MODES), 400)
+        if proto not in torrent_plugin.capable(server, True):
+            raise TorrentPluginError(
+                'unsupported_protocol',
+                'Protocol %s does not support torrent guard' % proto, 400)
+        result = await asyncio.to_thread(
+            _torrent_plugin_run, server,
+            lambda factory: torrent_plugin.set_mode(server, factory, proto, mode))
+        return await _torrent_plugin_finish(server_id, result)
+    except Exception as exc:                            # noqa: BLE001
+        return _torrent_plugin_error(exc)
+
+
+@app.post('/api/servers/{server_id}/plugins/torrent_guard/refresh', tags=["Servers"])
+def api_torrent_plugin_refresh(request: Request, server_id: int):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        server = _torrent_plugin_server(data, server_id)
+        if server is None:
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        _torrent_plugin_require_installed(server)
+        factory, close = _torrent_plugin_guards(server)
+        try:
+            result = torrent_plugin.refresh(server, factory)
+        finally:
+            close()
+        return result
+    except Exception as exc:                            # noqa: BLE001
+        return _torrent_plugin_error(exc)
+
+
+@app.post('/api/servers/{server_id}/plugins/torrent_guard/marks/clear', tags=["Servers"])
+async def api_torrent_plugin_marks_clear(request: Request, server_id: int):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    body = await _torrent_plugin_body(request)
+    try:
+        data = load_data()
+        server = _torrent_plugin_server(data, server_id)
+        if server is None:
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        _torrent_plugin_require_installed(server)
+        removed = torrent_plugin.clear_marks(
+            server, str(body.get('protocol') or ''),
+            str(body.get('client_id') or ''), str(body.get('ip') or ''))
+        return {'status': 'success', 'removed': removed}
+    except Exception as exc:                            # noqa: BLE001
+        return _torrent_plugin_error(exc)
 
 
 @app.post('/api/servers/{server_id}/connections/rename', tags=["Connections"])
@@ -7619,12 +13334,16 @@ def api_save_connection_config(request: Request, server_id: int, req: SaveConnec
             return JSONResponse({'error': 'Config is required'}, status_code=400)
         if not req.client_id:
             return JSONResponse({'error': 'Client ID is required'}, status_code=400)
+        # The editor shows the config with the bypass list expanded; store it
+        # folded so the client keeps following later changes to the list.
+        config_text = split_tunnel.fold_config(config_text)
         ssh = get_ssh(server)
         ssh.connect()
         manager = get_protocol_manager(ssh, req.protocol)
         _manager_call(manager, 'save_client_config', req.protocol, req.client_id, config_text)
         ssh.disconnect()
-        return {'status': 'success', **config_payloads(config_text, server, req.protocol)}
+        shown = split_tunnel.apply_to_config(config_text)
+        return {'status': 'success', **config_payloads(shown, server, req.protocol)}
     except Exception as e:
         logger.exception("Error saving connection config")
         return JSONResponse({'error': str(e)}, status_code=500)
@@ -7637,7 +13356,7 @@ def api_get_connection_config(request: Request, server_id: int, req: ConnectionA
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
         data = load_data()
-        if server_id >= len(data['servers']):
+        if server_id < 0 or server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
         # Only explicit privileged roles may view unowned connections.
         if user.get('role') not in ('admin', 'support'):
@@ -7654,16 +13373,73 @@ def api_get_connection_config(request: Request, server_id: int, req: ConnectionA
             if not owned:
                 return JSONResponse({'error': 'Forbidden'}, status_code=403)
         server = data['servers'][server_id]
+        expected_uid = getattr(req, 'server_uid', None)
+        if expected_uid is not None and server.get('uid') != expected_uid:
+            return JSONResponse({'error': 'Server identity changed'}, status_code=409)
+        endpoint = (server.get('uid'), server.get('host'), server.get('ssh_port', 22), server.get('username'))
         if not req.client_id:
             return JSONResponse({'error': 'Client ID is required'}, status_code=400)
+        if expected_uid is not None and req.protocol not in server.get('protocols', {}):
+            return JSONResponse({'error': 'Protocol instance not found'}, status_code=404)
         proto_info = server.get('protocols', {}).get(req.protocol, {})
+        instance_fields = ('installed', 'base_protocol', 'instance', 'container_name',
+                           'port', 'public_host', 'public_port')
+        instance_identity = tuple(proto_info.get(key) for key in instance_fields)
         port = proto_info.get('port', '55424')
         pub_host, pub_port = protocol_public_endpoint(server, req.protocol)
         ssh = get_ssh(server)
-        ssh.connect()
-        manager = get_protocol_manager(ssh, req.protocol)
-        config = _manager_call(manager, 'get_client_config', req.protocol, req.client_id, pub_host, port, public_port=pub_port)
-        ssh.disconnect()
+        try:
+            ssh.connect()
+            manager = get_protocol_manager(ssh, req.protocol)
+            config = _manager_call(
+                manager,
+                'get_client_config',
+                req.protocol,
+                req.client_id,
+                pub_host,
+                port,
+                public_port=pub_port,
+                **xray_fp_kwargs(server, req.protocol)
+            )
+        finally:
+            ssh.disconnect()
+
+        if expected_uid is not None:
+            fresh = load_data()
+            latest = fresh.get('servers', [])
+            current = latest[server_id] if server_id < len(latest) else {}
+            actual = (
+                current.get('uid'),
+                current.get('host'),
+                current.get('ssh_port', 22),
+                current.get('username')
+            )
+            current_info = current.get('protocols', {}).get(req.protocol, {})
+            if (actual != endpoint or req.protocol not in current.get('protocols', {})
+                    or tuple(current_info.get(key) for key in instance_fields) != instance_identity):
+                return JSONResponse({'error': 'Server identity changed'}, status_code=409)
+
+            actor = next(
+                (u for u in fresh.get('users', [])
+                 if u.get('id') == user['id']), None
+            )
+            if not actor or not actor.get('enabled', True):
+                return JSONResponse({'error': 'Forbidden'}, status_code=403)
+
+            if actor.get('role') not in ('admin', 'support') and not any(
+                c.get('user_id') == actor['id']
+                and c.get('server_id') == server_id
+                and c.get('client_id') == req.client_id
+                and protocol_base(c.get('protocol', '')) == protocol_base(req.protocol)
+                and protocol_instance(c.get('protocol', '')) == protocol_instance(req.protocol)
+                for c in fresh.get('user_connections', [])
+            ):
+                return JSONResponse({'error': 'Forbidden'}, status_code=403)
+
+        return {
+            'config': config,
+            **config_payloads(config, server, req.protocol)
+        }
         return {'config': config, **config_payloads(config, server, req.protocol)}
     except Exception as e:
         logger.exception("Error getting connection config")
@@ -7687,6 +13463,7 @@ def api_toggle_connection(request: Request, server_id: int, req: ToggleConnectio
         manager = get_protocol_manager(ssh, req.protocol)
         _manager_call(manager, 'toggle_client', req.protocol, req.client_id, req.enable)
         ssh.disconnect()
+        _invalidate_ip_status(server.get('uid') or f'#{server_id}')
         status = 'enabled' if req.enable else 'disabled'
         return {'status': 'success', 'enabled': req.enable, 'message': f'Connection {status}'}
     except Exception as e:
@@ -7734,6 +13511,7 @@ def api_list_users(request: Request, search: str = '', page: int = 1, size: int 
             'email': u.get('email'),
             'description': u.get('description'),
             'connections_count': sum(1 for c in conns if c['user_id'] == u['id']),
+            'max_connections': u.get('max_connections', 0),
             'traffic_used': u.get('traffic_used', 0),
             'traffic_total': u.get('traffic_total', 0),
             'traffic_limit': u.get('traffic_limit', 0),
@@ -7743,6 +13521,7 @@ def api_list_users(request: Request, search: str = '', page: int = 1, size: int 
             'share_enabled': u.get('share_enabled', False),
             'share_token': u.get('share_token'),
             'has_share_password': bool(u.get('share_password_hash')),
+            'sub_url': u.get('sub_url'),
             'source': 'Remnawave' if u.get('remnawave_uuid') else 'Local'
         })
     return {
@@ -7783,6 +13562,7 @@ def api_add_user(request: Request, req: AddUserRequest):
             'email': req.email,
             'description': req.description,
             'traffic_limit': int(req.traffic_limit * 1024**3) if req.traffic_limit else 0,
+            'max_connections': req.max_connections,
             'traffic_reset_strategy': req.traffic_reset_strategy or 'never',
             'traffic_used': 0,
             'traffic_total': 0,
@@ -7822,7 +13602,10 @@ def api_add_user(request: Request, req: AddUserRequest):
                         max_tcp_conns=req.telemt_max_conns
                     )
                 else:
-                    conn_result = manager.add_client(req.protocol, conn_name, pub_host, port, public_port=pub_port)
+                    conn_result = manager.add_client(
+                        req.protocol, conn_name, pub_host, port,
+                        public_port=pub_port,
+                        warp_ctx=srv_warp_ctx(server, req.protocol))
                 ssh.disconnect()
 
                 if conn_result.get('client_id'):
@@ -7874,6 +13657,8 @@ async def api_update_user(request: Request, user_id: str, req: UpdateUserRequest
                     return JSONResponse({'error': str(exc)}, status_code=400)
             if req.email is not None: user['email'] = req.email
             if req.description is not None: user['description'] = req.description
+            if req.max_connections is not None:
+                user['max_connections'] = req.max_connections
             if req.traffic_limit is not None:
                 new_limit = int(req.traffic_limit * 1024**3)
                 user['traffic_limit'] = new_limit
@@ -7991,8 +13776,11 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
         if not req.client_id and protocol_base(req.protocol) in ('awg', 'awg2', 'awg3', 'awg_legacy'):
+            options = {}
+            if getattr(req, 'server_uid', None) is not None:
+                options['expected_server_uid'] = req.server_uid
             result = await peer_creates.create(user_id, req.server_id, req.protocol,
-                                               req.name, req.operation_id)
+                                               req.name, req.operation_id, **options)
             data = load_data()
             operation = peer_creates.journal.read()[result['operation_id']]
             server = next(server for server in data['servers']
@@ -8039,7 +13827,7 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
             # Use existing client
             target_client_id = req.client_id
             # Retrieve config for existing client
-            config = await asyncio.to_thread(_manager_call, manager, 'get_client_config', req.protocol, req.client_id, pub_host, port, public_port=pub_port)
+            config = await asyncio.to_thread(_manager_call, manager, 'get_client_config', req.protocol, req.client_id, pub_host, port, public_port=pub_port, **xray_fp_kwargs(server, req.protocol))
             result = {'client_id': target_client_id, 'config': config}
         else:
             # Create new client
@@ -8052,6 +13840,12 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
                     secret=req.telemt_secret,
                     user_ad_tag=req.telemt_ad_tag,
                     max_tcp_conns=req.telemt_max_conns
+                )
+            elif protocol_base(req.protocol) == 'xray':
+                result = await asyncio.to_thread(
+                    manager.add_client, req.protocol, req.name, pub_host, port,
+                    public_port=pub_port,
+                    fingerprint=xray_stored_fingerprint(server, req.protocol)
                 )
             else:
                 result = await asyncio.to_thread(manager.add_client, req.protocol, req.name, pub_host, port, public_port=pub_port)
@@ -8071,6 +13865,14 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
             data = load_data()
             data['user_connections'].append(conn)
             save_data(data)
+            if protocol_base(req.protocol) == 'xray':
+                # Refresh the user's subscription file right away; the
+                # periodic monitor covers every other change source.
+                try:
+                    await asyncio.to_thread(auto_push_subscriptions, data,
+                                            [user_id])
+                except Exception:
+                    logger.warning("subscription auto-push failed", exc_info=True)
 
         resp = {'status': 'success'}
         if result.get('config'):
@@ -8429,7 +14231,7 @@ def api_share_config(token: str, connection_id: str, request: Request):
         ssh.connect()
         # Use appropriate manager for the protocol
         manager = get_protocol_manager(ssh, conn['protocol'])
-        config = _manager_call(manager, 'get_client_config', conn['protocol'], conn['client_id'], pub_host, port, public_port=pub_port)
+        config = _manager_call(manager, 'get_client_config', conn['protocol'], conn['client_id'], pub_host, port, public_port=pub_port, **xray_fp_kwargs(server, conn['protocol']))
         ssh.disconnect()
         return {'config': config, **config_payloads(config, server, conn['protocol'])}
     except Exception as e:
@@ -8461,12 +14263,90 @@ def api_my_connection_config(request: Request, connection_id: str):
         ssh.connect()
         # Use appropriate manager for the protocol (fixes Telemt/Xray not working for users)
         manager = get_protocol_manager(ssh, conn['protocol'])
-        config = _manager_call(manager, 'get_client_config', conn['protocol'], conn['client_id'], pub_host, port, public_port=pub_port)
+        config = _manager_call(manager, 'get_client_config', conn['protocol'], conn['client_id'], pub_host, port, public_port=pub_port, **xray_fp_kwargs(server, conn['protocol']))
         ssh.disconnect()
         return {'config': config, **config_payloads(config, server, conn['protocol'])}
     except Exception as e:
         logger.exception("Error getting my connection config")
         return JSONResponse({'error': str(e)}, status_code=500)
+
+
+# ======================== SPLIT TUNNEL: NETWORKS OUTSIDE THE VPN ========================
+
+class SplitTunnelSaveRequest(BaseModel):
+    enabled: bool = False
+    networks: str = ''
+    source: str = 'manual'
+
+
+class SplitTunnelPublicRequest(BaseModel):
+    country: str = 'RU'
+    shorten: bool = True
+
+
+def _split_tunnel_error(exc: split_tunnel.SplitTunnelError):
+    status = 502 if exc.code == 'fetch_failed' else 400
+    return JSONResponse({'error': str(exc), 'code': exc.code, **exc.details}, status_code=status)
+
+
+@app.get('/api/settings/split-tunnel', tags=["Settings"])
+def api_split_tunnel_get(request: Request):
+    """The bypass list and what it costs a client (AllowedIPs entries)."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    return split_tunnel.describe(load_data()['settings'].get('split_tunnel'))
+
+
+@app.post('/api/settings/split-tunnel', tags=["Settings"])
+def api_split_tunnel_save(request: Request, req: SplitTunnelSaveRequest):
+    """Store a typed or uploaded list and the on/off switch. Every WireGuard/
+    AmneziaWG config generated afterwards routes these networks outside the
+    tunnel; server-side peers are not touched."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        networks, invalid, ipv6_skipped = split_tunnel.parse_networks(req.networks)
+        if invalid:
+            return JSONResponse({'error': 'Invalid networks', 'code': 'invalid_networks',
+                                 'invalid': invalid[:20], 'invalid_count': len(invalid)},
+                                status_code=400)
+        data = load_data()
+        settings = data['settings']
+        current = settings.get('split_tunnel') or {}
+        networks = split_tunnel.normalize(networks)
+        if networks == list(current.get('networks') or []):
+            # Same list (a toggle, or a re-save): keep where it came from.
+            updated = {**current, 'enabled': bool(req.enabled)}
+        else:
+            source = req.source if req.source in ('manual', 'file') else 'manual'
+            updated = split_tunnel.settings_update(current, networks, source, enabled=req.enabled)
+        settings['split_tunnel'] = updated
+        save_data(data)
+    except split_tunnel.SplitTunnelError as exc:
+        return _split_tunnel_error(exc)
+    return {**split_tunnel.describe(updated), 'ipv6_skipped': ipv6_skipped}
+
+
+@app.post('/api/settings/split-tunnel/public', tags=["Settings"])
+def api_split_tunnel_public(request: Request, req: SplitTunnelPublicRequest):
+    """One click: fetch the country's networks from public registries
+    (RIPEstat, then ipdeny / country-ip-blocks), shorten them unless told
+    not to, store the list and switch it on."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        result = split_tunnel.build_public_list(req.country, shorten_list=req.shorten)
+        data = load_data()
+        settings = data['settings']
+        updated = split_tunnel.settings_update(
+            settings.get('split_tunnel'), result['networks'], result['source'],
+            source_detail=result['source_detail'], shortened=result['shortened'], enabled=True)
+        settings['split_tunnel'] = updated
+        save_data(data)
+    except split_tunnel.SplitTunnelError as exc:
+        return _split_tunnel_error(exc)
+    return {**split_tunnel.describe(updated), 'full_count': result['full_count'],
+            'unresolved_hosts': result['unresolved_hosts']}
 
 
 # ======================== EMAIL DELIVERY (admin) ========================
@@ -8540,6 +14420,8 @@ def settings_page(request: Request):
         return RedirectResponse('/login')
     data = load_data()
     backup_csrf = request.session.setdefault('backup_csrf', secrets.token_urlsafe(32)) if user['role'] == 'admin' else ''
+    # Bucket and endpoint details are admin-only, like backups: support never gets them.
+    storage_status = panel_storage.status() if user['role'] == 'admin' else {}
     return tpl(
         request,
         'settings.html',
@@ -8548,8 +14430,542 @@ def settings_page(request: Request):
         current_version=CURRENT_VERSION,
         update_source=UPDATE_SOURCE,
         backup_csrf=backup_csrf,
+        storage_status=storage_status,
         self_service_protocol_choices=self_service_protocol_choices(),
+        cheburcheck_targets=_cheburcheck_targets_context(data),
+        subscription_settings=subscription_settings(data),
+        subscription_servers=[
+            {'uid': server.get('uid'), 'label': server.get('name') or server.get('host')}
+            for server in data.get('servers', [])
+            if any(protocol_base(key) == 'nginx'
+                   for key in (server.get('protocols') or {}))
+        ],
     )
+
+
+# ===== Subscriptions (Xray): the panel builds each user's link list and
+# pushes ready base64 files into the html root of an NGINX mask server,
+# where clients fetch them over the entry domain. The panel itself stays
+# unreachable from the internet — it only initiates outbound SSH. =====
+
+def subscription_settings(data):
+    settings = (data.get('settings') or {}).get('subscription') or {}
+    try:
+        path = normalize_subscription_path(settings.get('path'))
+    except ValueError:
+        path = 'sub'
+    # server_uid is the stable reference (indexes shift when servers are
+    # deleted or reordered). Legacy settings stored a list index - resolve
+    # it once here; the next settings save persists the uid.
+    server_uid = settings.get('server_uid')
+    if not server_uid:
+        legacy = settings.get('server_id')
+        if isinstance(legacy, int) and 0 <= legacy < len(data.get('servers', [])):
+            server_uid = data['servers'][legacy].get('uid')
+    return {'enabled': bool(settings.get('enabled')),
+            'server_uid': server_uid,
+            'path': path,
+            'name': normalize_subscription_name(settings.get('name'))}
+
+
+def normalize_subscription_path(path):
+    path = (path or '').strip().strip('/').lower() or 'sub'
+    if not re.fullmatch(r'[a-z0-9][a-z0-9/_-]{0,63}', path):
+        raise ValueError('Invalid subscription path')
+    return path
+
+
+def normalize_subscription_name(name):
+    return ' '.join((name or '').split())[:96]
+
+
+def _subscription_profile_title(name):
+    """profile-title header value: raw when ASCII-safe, base64-prefixed
+    otherwise (the widely supported way to carry non-ASCII names)."""
+    name = name or ''
+    if all(32 <= ord(c) < 127 for c in name):
+        return name
+    return 'base64:' + base64.b64encode(name.encode()).decode()
+
+
+def _nginx_quote(value):
+    """Escape a value for an nginx double-quoted config string."""
+    value = str(value).replace(chr(92), chr(92) * 2)
+    value = value.replace(chr(34), chr(92) + chr(34))
+    return value
+
+
+def _subscription_userinfo(user):
+    """subscription-userinfo header value: the user's used quota and
+    expiry, as of the last push. Clients render it as a traffic bar."""
+    parts = ['upload=0']
+    used = user.get('traffic_used')
+    if isinstance(used, int) and used >= 0:
+        parts.append('download=' + str(used))
+    limit = user.get('traffic_limit')
+    if isinstance(limit, int) and limit > 0:
+        parts.append('total=' + str(limit))
+    expires = user.get('expiration_date')
+    if expires:
+        try:
+            ts = int(datetime.fromisoformat(str(expires)).timestamp())
+            if ts > 0:
+                parts.append('expire=' + str(ts))
+        except (ValueError, TypeError):
+            pass
+    return '; '.join(parts)
+
+
+def _subscription_config_entries(data):
+    """[(token, userinfo), ...] for users with a token and xray targets."""
+    entries = []
+    for user in data.get('users', []):
+        token = user.get('sub_token')
+        if not token or not _subscription_user_targets(data, user):
+            continue
+        entries.append((token, _subscription_userinfo(user)))
+    return entries
+
+
+def _subscription_config_block(sub_path, profile_title, entries=()):
+    """Per-token exact-match locations carry the per-user userinfo
+    header (values as of the last push); the generic prefix location
+    keeps serving the mask site for unknown tokens."""
+    nl = chr(10)
+    lines = [nl + '    # === panel subscription (managed) ===']
+    for token, userinfo in entries:
+        lines.append(f'    location = /{sub_path}/{token} ' + chr(123))
+        lines.append('        add_header subscription-userinfo "'
+                     + _nginx_quote(userinfo) + '" always;')
+        lines.append('        add_header profile-title "'
+                     + _nginx_quote(profile_title) + '" always;')
+        lines.append('        add_header profile-update-interval "6" always;')
+        lines.append('        try_files $uri =404;')
+        lines.append('    ' + chr(125))
+    lines.append(f'    location /{sub_path}/ ' + chr(123))
+    lines.append('        add_header profile-title "'
+                 + _nginx_quote(profile_title) + '" always;')
+    lines.append('        add_header profile-update-interval "6" always;')
+    lines.append('        try_files $uri =404;')
+    lines.append('    ' + chr(125))
+    lines.append('    # === end panel subscription block ===')
+    return nl.join(lines) + nl
+
+
+def _apply_subscription_config_text(config, sub_path='sub', profile_title='',
+                                    entries=(), remove=False):
+    """Inject/replace/remove the managed subscription location inside the
+    last server block of the mask site config (pure text, testable)."""
+    cleaned = re.sub(r"\n?[ \t]*# === panel subscription \(managed\) ===.*?"
+                     r"# === end panel subscription block ===\n?",
+                     "\n", config, flags=re.S)
+    if remove:
+        return cleaned
+    index = cleaned.rstrip().rfind('}')
+    if index == -1:
+        raise RuntimeError('unexpected NGINX config shape')
+    return cleaned[:index] + _subscription_config_block(sub_path, profile_title, entries) + cleaned[index:]
+
+
+def _apply_subscription_config(nginx_server, nginx_protocol, sub_settings,
+                               entries=(), remove=False):
+    """Apply the managed subscription location on the live mask (nginx -t
+    validated by save_server_config, which reverts on failure). Skips the
+    write when the live config already matches."""
+    from managers.nginx_manager import NginxManager
+    ssh = get_ssh(nginx_server)
+    ssh.connect()
+    try:
+        nginx = NginxManager(ssh)
+        config = nginx._get_server_config(nginx_protocol)
+        new_config = _apply_subscription_config_text(
+            config, sub_settings['path'],
+            _subscription_profile_title(sub_settings.get('name')),
+            entries=entries, remove=remove)
+        if new_config == config:
+            return False
+        return nginx.save_server_config(nginx_protocol, new_config)
+    finally:
+        ssh.disconnect()
+
+
+def subscription_nginx_server(data, sub_settings):
+    """The NGINX server chosen as the subscription file host, or None."""
+    server_uid = sub_settings.get('server_uid')
+    if not server_uid:
+        return None
+    for server in data.get('servers', []):
+        if (server.get('uid') == server_uid
+                and any(protocol_base(key) == 'nginx'
+                        for key in (server.get('protocols') or {}))):
+            return server
+    return None
+
+
+def ensure_subscription_token(user):
+    token = user.get('sub_token')
+    if not token or not re.fullmatch(r'[0-9a-f]{32}', str(token)):
+        token = secrets.token_hex(16)
+        user['sub_token'] = token
+    return token
+
+
+def _subscription_mask_domain(nginx_server):
+    """The LE domain the NGINX mask serves (best-effort live lookup)."""
+    try:
+        from managers.nginx_manager import NginxManager
+        ssh = get_ssh(nginx_server)
+        ssh.connect()
+        try:
+            return NginxManager(ssh).get_server_status(
+                next(key for key in (nginx_server.get('protocols') or {})
+                     if protocol_base(key) == 'nginx')).get('domain')
+        finally:
+            ssh.disconnect()
+    except Exception:
+        logger.warning("subscription mask domain lookup failed", exc_info=True)
+        return None
+
+
+def _subscription_user_targets(data, user):
+    """[(server, [connection, ...])] for the user's xray connections."""
+    groups = {}
+    for conn in data.get('user_connections', []):
+        if conn.get('user_id') != user.get('id'):
+            continue
+        protocol = conn.get('protocol') or ''
+        if not protocol.startswith('xray'):
+            continue
+        server_id = conn.get('server_id')
+        if isinstance(server_id, int) and 0 <= server_id < len(data.get('servers', [])):
+            groups.setdefault(server_id, []).append(conn)
+    return [(data['servers'][server_id], conns)
+            for server_id, conns in groups.items()]
+
+
+def push_user_subscription(data, user, sub_settings, nginx_server):
+    """Build the user's link list and write the base64 file into the mask
+    html root. One SSH hop per entry server (the live config is the link
+    source) plus one write into the mask server.
+    Returns (token, link_count, per-entry-server errors)."""
+    from managers.nginx_manager import NginxManager
+    token = ensure_subscription_token(user)
+    links = []
+    errors = []
+    for server, conns in _subscription_user_targets(data, user):
+        instance_names = server_protocol_names(server)
+        try:
+            ssh = get_ssh(server)
+            ssh.connect()
+            try:
+                for conn in conns:
+                    protocol = conn['protocol']
+                    proto_info = server.get('protocols', {}).get(protocol, {})
+                    port = proto_info.get('port', 443)
+                    pub_host, pub_port = protocol_public_endpoint(server, protocol)
+                    link = _manager_call(
+                        get_protocol_manager(ssh, protocol), 'get_client_config',
+                        protocol, conn.get('client_id'), pub_host, port,
+                        public_port=pub_port,
+                        **xray_fp_kwargs(server, protocol))
+                    if link:
+                        # The link fragment is what the user sees in their
+                        # client: "server · xray instance". The panel-side
+                        # connection name is the admin's private note and
+                        # must not leak into the subscription.
+                        instance_name = (proto_info.get('custom_name')
+                                         or instance_names.get(protocol)
+                                         or protocol_display_name(protocol))
+                        entry_name = (f"{server.get('name') or server.get('host')}"
+                                      f" · {instance_name}")
+                        fragment = urllib.parse.quote(entry_name)
+                        links.append(link.rpartition('#')[0] + '#' + fragment
+                                     if '#' in link
+                                     else link + '#' + fragment)
+            finally:
+                ssh.disconnect()
+        except Exception as e:
+            errors.append(f"{server.get('host')}: {e}")
+    if not links:
+        raise RuntimeError('no links collected: '
+                           + ('; '.join(errors) or 'no xray connections'))
+    payload = base64.b64encode('\n'.join(links).encode()).decode()
+    sub_dir = f"{NginxManager.HTML_DIR}/{sub_settings['path']}"
+    remote_path = f"{sub_dir}/{token}"
+    ssh = get_ssh(nginx_server)
+    ssh.connect()
+    try:
+        # Skip the write when the served file is already current: the
+        # periodic auto-push runs this for every user around the clock.
+        out, _, _ = ssh.run_sudo_command(f"cat {shlex.quote(remote_path)} 2>/dev/null")
+        if (out or '').strip() == payload:
+            return token, len(links), errors, True
+        ssh.run_sudo_command(f"mkdir -p {shlex.quote(sub_dir)}")
+        ssh.upload_file_sudo(payload, remote_path)
+    finally:
+        ssh.disconnect()
+    return token, len(links), errors, False
+
+
+def auto_push_subscriptions(data, user_ids=None):
+    """Best-effort regeneration of the affected users' subscription files.
+    Never raises; no-ops when subscriptions are disabled. Persists minted
+    tokens and cached sub URLs via save_data."""
+    sub_settings = subscription_settings(data)
+    if not sub_settings['enabled']:
+        logger.debug("subscription auto-push skipped: disabled")
+        return
+    nginx_server = subscription_nginx_server(data, sub_settings)
+    if nginx_server is None:
+        logger.warning("subscription auto-push skipped: no NGINX host "
+                       "selected or the selected server has no NGINX")
+        return
+    domain = _subscription_mask_domain(nginx_server)
+    users_by_id = {u.get('id'): u for u in data.get('users', [])}
+    if user_ids is None:
+        targets = [u for u in data.get('users', [])
+                   if _subscription_user_targets(data, u)]
+    else:
+        targets = [users_by_id[uid] for uid in user_ids if uid in users_by_id]
+    updated = 0
+    for user in targets:
+        if not _subscription_user_targets(data, user):
+            user.pop('sub_url', None)  # all xray connections are gone
+            continue
+        try:
+            token, count, errors, unchanged = push_user_subscription(
+                data, user, sub_settings, nginx_server)
+            if domain:
+                user['sub_url'] = (f"https://{domain}/{sub_settings['path']}/"
+                                   f"{token}")
+            if not unchanged:
+                updated += 1
+        except Exception as e:
+            logger.warning("subscription auto-push failed for %s: %s",
+                           user.get('username'), e)
+    if updated:
+        logger.info("subscription auto-push: %d file(s) updated", updated)
+    # The per-token userinfo headers live in the mask config: refresh them
+    # with the fresh counters (skipped internally when nothing changed).
+    try:
+        nginx_key = next((key for key in (nginx_server.get('protocols') or {})
+                          if protocol_base(key) == 'nginx'), None)
+        if nginx_key:
+            _apply_subscription_config(
+                nginx_server, nginx_key, sub_settings,
+                entries=_subscription_config_entries(data))
+    except Exception:
+        logger.warning("subscription userinfo refresh failed", exc_info=True)
+    save_data(data)
+
+
+def push_all_subscriptions(data):
+    sub_settings = subscription_settings(data)
+    nginx_server = subscription_nginx_server(data, sub_settings)
+    if nginx_server is None:
+        raise ValueError('No NGINX server selected for subscriptions')
+    domain = _subscription_mask_domain(nginx_server)
+    pushed, errors = [], []
+    valid_tokens = set()
+    for user in data.get('users', []):
+        if not _subscription_user_targets(data, user):
+            continue
+        try:
+            token, count, user_errors, unchanged = push_user_subscription(
+                data, user, sub_settings, nginx_server)
+            errors.extend(f"{user.get('username')}: {text}" for text in user_errors)
+            valid_tokens.add(token)
+            url = (f"https://{domain}/{sub_settings['path']}/{token}"
+                   if domain else None)
+            if url:
+                user['sub_url'] = url  # cached for the /users page
+            pushed.append({
+                'username': user.get('username'), 'token': token, 'links': count,
+                'unchanged': unchanged, 'url': url,
+            })
+        except Exception as e:
+            errors.append(f"{user.get('username')}: {e}")
+    _subscription_prune_stale_files(data, nginx_server, sub_settings, valid_tokens)
+    # Refresh the per-token userinfo headers with the fresh counters.
+    try:
+        nginx_key = next((key for key in (nginx_server.get('protocols') or {})
+                          if protocol_base(key) == 'nginx'), None)
+        if nginx_key:
+            _apply_subscription_config(
+                nginx_server, nginx_key, sub_settings,
+                entries=_subscription_config_entries(data))
+    except Exception:
+        logger.warning("subscription userinfo refresh failed", exc_info=True)
+    return {'pushed': pushed, 'errors': errors,
+            'path': sub_settings['path'], 'domain': domain}
+
+
+def _subscription_prune_stale_files(data, nginx_server, sub_settings,
+                                    valid_tokens):
+    """Remove subscription files of users that no longer exist (deleting a
+    user does not walk the mask's html root)."""
+    from managers.nginx_manager import NginxManager
+    sub_dir = f"{NginxManager.HTML_DIR}/{sub_settings['path']}"
+    ssh = get_ssh(nginx_server)
+    ssh.connect()
+    try:
+        out, _, code = ssh.run_sudo_command(
+            f"ls -1 {shlex.quote(sub_dir)} 2>/dev/null")
+        if code != 0 or not (out or '').strip():
+            return
+        stale = [name.strip() for name in out.strip().split('\n')
+                 if name.strip() and name.strip() not in valid_tokens
+                 and re.fullmatch(r'[0-9a-f]{32}', name.strip())]
+        for name in stale:
+            ssh.run_sudo_command(f"rm -f {shlex.quote(f'{sub_dir}/{name}')}")
+        if stale:
+            logger.info("removed %d stale subscription files", len(stale))
+    finally:
+        ssh.disconnect()
+
+
+class SubscriptionSettingsRequest(BaseModel):
+    enabled: bool = False
+    server_uid: Optional[str] = None
+    path: Optional[str] = None
+    name: Optional[str] = None
+
+
+@app.get('/api/subscription/status', tags=["Settings"])
+def api_subscription_status(request: Request):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    sub_settings = subscription_settings(data)
+    nginx_server = (subscription_nginx_server(data, sub_settings)
+                    if sub_settings['enabled'] else None)
+    domain = _subscription_mask_domain(nginx_server) if nginx_server is not None else None
+    urls = []
+    if nginx_server is not None:
+        prefix = f"https://{domain or '<mask-domain>'}/{sub_settings['path']}/"
+        for user in data.get('users', []):
+            token = user.get('sub_token')
+            if token and _subscription_user_targets(data, user):
+                urls.append({'username': user.get('username'),
+                             'url': prefix + token})
+    return {**sub_settings, 'domain': domain, 'urls': urls}
+
+
+@app.post('/api/settings/subscription', tags=["Settings"])
+def api_subscription_settings_save(request: Request, req: SubscriptionSettingsRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        sub_path = normalize_subscription_path(req.path)
+        sub_name = normalize_subscription_name(req.name)
+        old = subscription_settings(data)
+        if req.enabled:
+            probe = subscription_nginx_server(
+                data, {'enabled': True, 'server_uid': req.server_uid})
+            if probe is None:
+                return JSONResponse(
+                    {'error': 'Select a server with NGINX installed'}, status_code=400)
+        settings = data.setdefault('settings', {}).setdefault('subscription', {})
+        settings['enabled'] = req.enabled
+        settings['server_uid'] = req.server_uid
+        settings.pop('server_id', None)  # legacy index format
+        settings['path'] = sub_path
+        settings['name'] = sub_name
+        save_data(data)
+        result = {'status': 'success', 'enabled': req.enabled, 'path': sub_path,
+                  'pushed': [], 'errors': []}
+        if req.enabled:
+            nginx_key = next(key for key in (probe.get('protocols') or {})
+                             if protocol_base(key) == 'nginx')
+            _apply_subscription_config(probe, nginx_key,
+                                       subscription_settings(data),
+                                       entries=_subscription_config_entries(data))
+            outcome = push_all_subscriptions(data)
+            save_data(data)  # freshly minted sub tokens
+            result['pushed'] = outcome['pushed']
+            result['errors'] = outcome['errors']
+            result['domain'] = outcome.get('domain')
+        elif old['enabled']:
+            old_server = subscription_nginx_server(data, {'server_uid': old['server_uid']})
+            nginx_key = next((key for key in (old_server.get('protocols') or {})
+                              if protocol_base(key) == 'nginx'), None) \
+                if old_server is not None else None
+            if nginx_key:
+                # Strip the managed location the previous configuration added
+                # and stop serving the files entirely.
+                _apply_subscription_config(old_server, nginx_key,
+                                           subscription_settings(data),
+                                           remove=True)
+                try:
+                    from managers.nginx_manager import NginxManager
+                    ssh = get_ssh(old_server)
+                    ssh.connect()
+                    try:
+                        ssh.run_sudo_command(
+                            f"rm -rf {shlex.quote(NginxManager.HTML_DIR + '/' + old['path'])}")
+                    finally:
+                        ssh.disconnect()
+                except Exception:
+                    logger.warning("subscription file cleanup failed", exc_info=True)
+            for user in data.get('users', []):
+                user.pop('sub_url', None)
+        return result
+    except ValueError as e:
+        return JSONResponse({'error': str(e)}, status_code=400)
+    except Exception as e:
+        logger.exception("subscription settings save failed")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/subscription/push', tags=["Settings"])
+def api_subscription_push(request: Request):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        if not subscription_settings(data)['enabled']:
+            return JSONResponse({'error': 'Subscriptions are disabled'},
+                                status_code=409)
+        outcome = push_all_subscriptions(data)
+        save_data(data)
+        return {'status': 'success', **outcome}
+    except ValueError as e:
+        return JSONResponse({'error': str(e)}, status_code=400)
+    except Exception as e:
+        logger.exception("subscription push failed")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/users/{user_id}/subscription/reset', tags=["Settings"])
+def api_subscription_reset(request: Request, user_id: str):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        sub_settings = subscription_settings(data)
+        nginx_server = subscription_nginx_server(data, sub_settings)
+        if nginx_server is None:
+            return JSONResponse({'error': 'Subscriptions are disabled'},
+                                status_code=409)
+        user = next((u for u in data.get('users', []) if u.get('id') == user_id), None)
+        if not user:
+            return JSONResponse({'error': 'User not found'}, status_code=404)
+        user['sub_token'] = secrets.token_hex(16)  # force a fresh token
+        token, count, errors, _ = push_user_subscription(data, user, sub_settings,
+                                                         nginx_server)
+        save_data(data)
+        domain = _subscription_mask_domain(nginx_server)
+        url = (f"https://{domain}/{sub_settings['path']}/{token}"
+               if domain else None)
+        if url:
+            user['sub_url'] = url
+        save_data(data)
+        return {'status': 'success', 'token': token, 'links': count,
+                'url': url, 'errors': errors}
+    except Exception as e:
+        logger.exception("subscription token reset failed")
+        return JSONResponse({'error': str(e)}, status_code=500)
 
 
 @app.get('/api/settings', tags=["Settings"])
@@ -8557,7 +14973,14 @@ def api_get_settings(request: Request):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     data = load_data()
-    return data.get('settings', {})
+    settings = dict(data.get('settings', {}))
+    # API-токен cheburcheck — только на запись: из общего ответа настроек он
+    # вырезается, иначе утекает в каждый GET /api/settings.
+    cb = settings.get('cheburcheck')
+    if isinstance(cb, dict) and 'api_token' in cb:
+        settings['cheburcheck'] = {k: v for k, v in cb.items()
+                                   if k != 'api_token'}
+    return settings
 
 
 @app.get('/api/settings/tunnels/status', tags=["Settings"])
@@ -8669,17 +15092,73 @@ async def api_warp_disconnect(request: Request):
 #     return {'status': 'success'}
 
 @app.post('/api/settings/save', tags=["Settings"])
-def save_settings(request: Request, payload: SaveSettingsRequest):
+async def save_settings(request: Request, payload: SaveSettingsRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    async with DATA_LOCK:
+        return await _save_settings(request, payload)
+
+
+async def _save_settings(request: Request, payload: SaveSettingsRequest):
     data = load_data()
     settings = data.setdefault('settings', {})
     settings['appearance'] = payload.appearance.dict()
     settings['sync'] = payload.sync.dict()
     settings['captcha'] = payload.captcha.dict()
+    jump_host_uid = (payload.ssh_jump.jump_host_uid or '').strip()
+    if jump_host_uid and not any(server.get('uid') == jump_host_uid
+                                 for server in data.get('servers', [])):
+        return JSONResponse({'error': 'Selected SSH jump host is no longer available'},
+                            status_code=400)
+    previous_jump_uid = ((settings.get('ssh_jump') or {}).get('jump_host_uid') or '')
+    settings['ssh_jump'] = {'jump_host_uid': jump_host_uid}
+    previous_telegram = dict(settings.get('telegram') or {})
     settings['telegram'] = payload.telegram.dict()
+    # Only the lifecycle endpoint changes intent. Old/stale settings pages may
+    # still submit enabled based on runtime state; never let that disable boot.
+    settings['telegram']['enabled'] = bool(previous_telegram.get('enabled'))
     settings['ssl'] = payload.ssl.dict()
     settings['mail'] = merge_mail_settings(settings.get('mail'), payload.mail.dict())
+
+    # Panel access control: validate the list before storing anything, so a
+    # typo cannot leave the panel half-configured.
+    raw_entries = [ln.strip() for ln in (payload.panel_access.ip_allowlist or '').splitlines()
+                   if ln.strip()]
+    access_entries = []
+    for entry in raw_entries:
+        try:
+            access_entries.append(str(ipaddress.ip_network(entry, strict=False)))
+        except ValueError:
+            return JSONResponse({'error': 'invalid_ip_allowlist_entry', 'entry': entry},
+                                status_code=400)
+    access_domain = (payload.panel_access.allowed_domain or '').strip().lower()
+    if payload.panel_access.domain_only:
+        access_domain = access_domain or str(settings['ssl'].get('domain') or '').strip().lower()
+        if not access_domain:
+            return JSONResponse({'error': 'domain_required_for_domain_only'},
+                                status_code=400)
+    # Never lock the admin out with the very save that enables the list: the
+    # caller's own address is added when the submitted list does not cover it.
+    if payload.panel_access.ip_allowlist_enabled:
+        client_ip = _request_client_ip(request)
+        try:
+            me = ipaddress.ip_address(client_ip)
+            covered = False
+            for entry in access_entries:
+                net = ipaddress.ip_network(entry, strict=False)
+                if me.version == net.version and me in net:
+                    covered = True
+                    break
+            if not covered:
+                access_entries.append(str(me))
+        except ValueError:
+            pass
+    settings['panel_access'] = {
+        'ip_allowlist_enabled': bool(payload.panel_access.ip_allowlist_enabled),
+        'ip_allowlist': access_entries,
+        'domain_only': bool(payload.panel_access.domain_only),
+        'allowed_domain': access_domain,
+    }
 
     old_auto_backup = settings.get('auto_backup', {}) or {}
     interval_hours = max(1, min(24, int(payload.auto_backup.interval_hours or 24)))
@@ -8704,20 +15183,27 @@ def save_settings(request: Request, payload: SaveSettingsRequest):
         warnings.append('exit_default_cleared')
     settings['exit_nodes'] = {'default_exit_uid': default_exit_uid}
     save_data(data)
+    _refresh_panel_access(data)
+    if previous_jump_uid != jump_host_uid:
+        with _SSH_POOL_LOCK:
+            pooled = list(_SSH_POOL.values())
+            _SSH_POOL.clear()
+        for ssh in pooled:
+            try:
+                ssh.force_disconnect()
+            except Exception:
+                pass
     logger.info("Settings saved (including captcha, telegram and auto backup)")
 
-    # Handle bot start/stop based on new telegram settings
-    tg_cfg = payload.telegram
-    if tg_cfg.enabled and tg_cfg.token:
-        if not tg_bot.is_running():
-            logger.info("Starting Telegram bot (settings save)...")
-            tg_bot.launch_bot(tg_cfg.token, load_data, generate_vpn_link, save_data, self_service_svc=self_service_connections)
-    else:
-        if tg_bot.is_running():
-            logger.info("Stopping Telegram bot (settings save)...")
-            asyncio.create_task(tg_bot.stop_bot())
+    # This handler runs on the application loop: launch_bot uses create_task.
+    tg_cfg = settings['telegram']
+    if previous_telegram.get('token') != tg_cfg.get('token') or not tg_cfg.get('token') or not tg_cfg['enabled']:
+        await tg_bot.stop_bot()
+    if tg_cfg['enabled'] and tg_cfg.get('token') and not tg_bot.is_running():
+        tg_bot.launch_bot(tg_cfg['token'], load_data, generate_vpn_link, save_data, self_service_svc=self_service_connections, credential_resolver=lambda server: _credential_store().resolve(server))
 
-    return {"status": "success", "bot_running": tg_bot.is_running(), "warnings": warnings}
+    return {"status": "success", "bot_running": tg_bot.is_running(),
+            "bot_enabled": tg_cfg['enabled'], "warnings": warnings}
 
 
 # ----- DuckDNS: free domain + one-click auto-renewed Let's Encrypt cert -----
@@ -8878,28 +15364,30 @@ def _start_duckdns_monitor():
 
 
 @app.post('/api/settings/telegram/toggle', tags=["Settings"])
-async def api_telegram_toggle(request: Request):
-    """Quick enable/disable of the bot without a full settings save."""
+async def api_telegram_toggle(request: Request, payload: Optional[TelegramToggleRequest] = None):
+    """Persist explicit intent, independently of whether the task is alive.
+
+    An empty POST remains supported for older clients, toggling saved intent.
+    """
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
-    data = load_data()
-    tg_cfg = data.get('settings', {}).get('telegram', {})
-    token = tg_cfg.get('token', '')
-    if not token:
-        return JSONResponse({'error': 'Telegram token not set in settings'}, status_code=400)
+    async with DATA_LOCK:
+        data = load_data()
+        tg_cfg = data.setdefault('settings', {}).setdefault('telegram', {})
+        enabled = payload.enabled if payload is not None else not bool(tg_cfg.get('enabled'))
+        token = tg_cfg.get('token', '')
+        if enabled and not token:
+            return JSONResponse({'error': 'Telegram token not set in settings'}, status_code=400)
+        tg_cfg['enabled'] = enabled
+        save_data(data)
+        if enabled:
+            if not tg_bot.is_running():
+                tg_bot.launch_bot(token, load_data, generate_vpn_link, save_data, self_service_svc=self_service_connections, credential_resolver=lambda server: _credential_store().resolve(server))
+        else:
+            await tg_bot.stop_bot()
+        return {'status': 'started' if enabled else 'stopped',
+                'bot_enabled': enabled, 'bot_running': tg_bot.is_running()}
 
-    if tg_bot.is_running():
-        await tg_bot.stop_bot()
-        tg_cfg['enabled'] = False
-        data['settings']['telegram'] = tg_cfg
-        save_data(data)
-        return {'status': 'stopped', 'bot_running': False}
-    else:
-        tg_bot.launch_bot(token, load_data, generate_vpn_link, save_data, self_service_svc=self_service_connections)
-        tg_cfg['enabled'] = True
-        data['settings']['telegram'] = tg_cfg
-        save_data(data)
-        return {'status': 'started', 'bot_running': True}
 
 @app.post('/api/settings/sync_now', tags=["Settings"])
 async def api_sync_now(request: Request):
@@ -9055,13 +15543,56 @@ def _backup_admin(request):
     return actor
 
 
+# Optional S3 mirror of the data directory (docs/S3_STORAGE.md); every hook is a
+# no-op unless PANEL_STORAGE=s3. Registered after startup(), so the sync thread
+# starts only once PanelLease is held and the migrations have been saved.
+@app.on_event('startup')
+async def start_panel_storage():
+    panel_storage.start()
+
+
+@app.on_event('shutdown')
+async def stop_panel_storage():
+    # Requests the final flush at once and polls for it: the default executor may be
+    # full of slow SSH calls, and a queued stop() could miss the pod's grace period.
+    await panel_storage.stop_async()
+
+
+@app.get('/api/settings/storage', tags=["Settings"])
+def api_storage_status(request: Request):
+    # Bucket, endpoint and lease owner: same audience as backups (admin only).
+    if not _backup_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403,
+                            headers=PRIVATE_HEADERS)
+    return JSONResponse(panel_storage.status(), headers=PRIVATE_HEADERS)
+
+
+@app.get('/api/integration/inventory', tags=["Servers"])
+async def api_integration_inventory(request: Request):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403,
+                            headers=PRIVATE_HEADERS)
+    from integration_inventory import integration_inventory
+    try:
+        async with DATA_LOCK:
+            result = integration_inventory(load_data(), protocol_base)
+        return JSONResponse(result, headers=PRIVATE_HEADERS)
+    except (ValueError, TypeError, AttributeError):
+        return JSONResponse({'error': 'Inventory cannot be verified'},
+                            status_code=503, headers=PRIVATE_HEADERS)
+
+
 @app.get('/api/settings/backup/download', tags=["Settings"])
 def api_backup_download(request: Request):
     if not _backup_admin(request):
-        return JSONResponse({'error': 'Forbidden'}, status_code=403)
-    if not os.path.exists(DATA_FILE):
-        return JSONResponse({'error': 'Data file not found'}, status_code=404)
-    return FileResponse(DATA_FILE, media_type='application/json', filename='data.json')
+        return JSONResponse({'error': 'Forbidden'}, status_code=403,
+                            headers=PRIVATE_HEADERS)
+    # The legacy endpoint returned the raw state file (historically including
+    # reusable SSH credentials). Use the complete, access-controlled archive.
+    return JSONResponse({
+        'error': 'Legacy plaintext state export is disabled. Use the complete backup archive.',
+        'code': 'legacy_backup_disabled',
+    }, status_code=410, headers=PRIVATE_HEADERS)
 
 
 class PrivateBackupResponse(StreamingResponse):
@@ -9119,13 +15650,39 @@ async def api_backup_archive(request: Request):
                              'code': 'panel_backup_unavailable'}, status_code=503, headers=PRIVATE_HEADERS)
 
 
+def _prepare_restore_credentials(current, backup):
+    """Seal legacy backup credentials and keep envelopes stable when unchanged.
+
+    Online restore compares server records strictly. Reusing the existing
+    envelope for identical credentials prevents random nonces from looking like
+    a topology change; changed credentials still fail that guard as before.
+    """
+    store = _credential_store()
+    current_servers = current.get('servers', [])
+    for server in backup.get('servers', []):
+        match = next((s for s in current_servers
+                      if s.get('uid') and s.get('uid') == server.get('uid')), None)
+        if match and all(server.get(k) == match.get(k)
+                         for k in ('host', 'ssh_port', 'username')):
+            if store.resolve(server) == store.resolve(match) and match.get('ssh_credentials'):
+                server.pop('password', None)
+                server.pop('private_key', None)
+                server['ssh_credentials'] = dict(match['ssh_credentials'])
+                continue
+        store.seal_document({'servers': [server]})
+
+
 @app.post('/api/settings/backup/restore', tags=["Settings"])
 @serialize_peer_lifecycle
 async def api_backup_restore(request: Request, file: UploadFile = File(...),
                              operation_id: Optional[str] = Form(None)):
     backup_actor = _backup_admin(request)
     if not backup_actor:
-        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+        return JSONResponse({'error': 'Forbidden'}, status_code=403,
+                            headers=PRIVATE_HEADERS)
+    if request is not None and not _same_origin_request(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403,
+                            headers=PRIVATE_HEADERS)
     try:
         # Limit the in-memory JSON read; enforce request-body limits at the
         # reverse proxy too, since multipart parsing happens before this handler.
@@ -9159,6 +15716,10 @@ async def api_backup_restore(request: Request, file: UploadFile = File(...),
         async with DATA_LOCK:
             # Even identical-looking old backups can rewind traffic baselines.
             current = load_data()
+            if not _backup_admin(request):
+                return JSONResponse({'error': 'Forbidden'}, status_code=403,
+                                    headers=PRIVATE_HEADERS)
+            _prepare_restore_credentials(current, backup_data)
             # Bearer-admin restores have no session, so the resolved token
             # owner is the audit actor; session restores keep the same id.
             actor = str(backup_actor.get('id') if isinstance(backup_actor, dict)
@@ -9186,9 +15747,10 @@ async def api_backup_restore(request: Request, file: UploadFile = File(...),
         # Full disaster recovery is deliberately separate and offline; see
         # scripts/panel_recovery.py. Never use a force flag on this endpoint.
         return result if isinstance(operation_id, str) else {'status': 'success'}
-    except Exception as e:
+    except Exception:
         logger.exception("Error during restore")
-        return JSONResponse({'error': str(e)}, status_code=500)
+        return JSONResponse({'error': 'Restore failed'}, status_code=500,
+                            headers=PRIVATE_HEADERS)
 
 
 class OrphanRecoveryRequest(BaseModel):
@@ -9211,30 +15773,43 @@ def api_recovery_status(request: Request):
 def _probe_blocking_peer(server, conn):
     """Return (observed_bytes, quiescent) for a leftover accounting row.
 
-    ``quiescent`` is True only when the peer is absent from the live protocol
-    instance or is explicitly disabled there.  Unknown state is NOT quiescent.
+    ``quiescent`` is True only when the peer cannot carry traffic on the
+    live instance: absent from it, explicitly disabled there, or — for
+    xray — gone from the runtime config while only lingering in the
+    clientsTable (a hand-edited config carries no traffic).  Unknown
+    state is NOT quiescent.
     """
     ssh = get_ssh(server)
     try:
         ssh.connect()
         manager = get_protocol_manager(ssh, conn['protocol'])
-        clients = _manager_call(manager, 'get_clients', conn['protocol'])
+        is_xray = protocol_base(conn['protocol']) == 'xray'
+        if is_xray:
+            try:
+                runtime_ids = manager.get_runtime_client_ids()
+                if not isinstance(runtime_ids, (list, set, tuple)):
+                    raise RecoveryError('incomplete_peer_state')
+                live = conn['client_id'] in runtime_ids
+                clients = manager.get_clients(conn['protocol'], strict=True)
+            except RuntimeError as error:
+                raise RecoveryError('incomplete_peer_state') from error
+        else:
+            clients = _manager_call(manager, 'get_clients', conn['protocol'])
         if not isinstance(clients, list):
             raise RecoveryError('incomplete_peer_state')
         peers = [c for c in clients
                  if isinstance(c, dict) and c.get('clientId') == conn.get('client_id')]
         if len(peers) > 1:
             raise RecoveryError('peer_identity_ambiguous')
-        if not peers:
-            verify_awg_peer_absent(ssh, conn['protocol'], conn['client_id'])
-            return None, True
-        ud = peers[0].get('userData') or {}
+        ud = (peers[0].get('userData') or {}) if peers else {}
         rx, tx = ud.get('dataReceivedBytes'), ud.get('dataSentBytes')
         observed = (rx + tx if type(rx) is int and type(tx) is int
                     and rx >= 0 and tx >= 0 else None)
-        if ud.get('enabled') is not False:
+        if is_xray:
+            return observed, not live
+        if peers and ud.get('enabled') is not False:
             return observed, False
-        verify_awg_peer_absent(ssh, conn['protocol'], conn['client_id'], allow_disabled=True)
+        verify_awg_peer_absent(ssh, conn['protocol'], conn['client_id'], allow_disabled=bool(peers))
         return observed, True
     finally:
         ssh.disconnect()
@@ -9346,6 +15921,18 @@ async def api_orphan_recovery(request: Request, req: OrphanRecoveryRequest):
                              'code': 'recovery_not_completed'}, status_code=503)
 
 
+def panel_bind_host(ssl_conf: dict) -> str:
+    # Docker/.env can override the saved choice without rewriting data.json.
+    # Unknown values fail closed to loopback; an unset variable preserves the
+    # administrator's explicit setting from the Settings page.
+    override = os.environ.get('PANEL_BIND_ALL_INTERFACES')
+    if override is not None:
+        enabled = override.strip().lower() in ('1', 'true', 'yes', 'on')
+        return '0.0.0.0' if enabled else '127.0.0.1'
+    # Bind locally by default; public exposure requires explicit opt-in.
+    return '0.0.0.0' if ssl_conf.get('bind_all_interfaces') is True else '127.0.0.1'
+
+
 def pathlib_read_data_bytes():
     # Kept separate so failure injection can prove there is no destructive write.
     with open(DATA_FILE, 'rb') as source:
@@ -9353,6 +15940,9 @@ def pathlib_read_data_bytes():
 
 
 if __name__ == '__main__':
+    # PANEL_STORAGE=s3: restore the data directory from the bucket before anything
+    # reads it (the main thread is required for the SIGTERM handler). No-op by default.
+    panel_storage.bootstrap(DATA_FILE, app_dir=application_path, panel_version=CURRENT_VERSION)
     data = load_data()
     ssl_conf = data.get('settings', {}).get('ssl', {})
     
@@ -9376,18 +15966,34 @@ if __name__ == '__main__':
                 with open(key_file, 'w') as f:
                     f.write(ssl_conf['key_text'].strip() + '\n')
 
+    public_port = int(ssl_conf.get('panel_port', 5000))
+    front_enabled = os.environ.get('PANEL_FRONT') == '1'
+    internal_port = int(os.environ.get('PANEL_INTERNAL_PORT', '5001')) if front_enabled else public_port
+
     uvicorn_kwargs = {
         "app": app,
-        "host": "0.0.0.0",
-        "port": ssl_conf.get('panel_port', 5000)
+        "host": '127.0.0.1' if front_enabled else panel_bind_host(ssl_conf),
+        "port": internal_port,
+        # uvicorn's own "server: uvicorn" header fingerprints the panel; the
+        # public front answers like an empty nginx instead.
+        "server_header": False,
     }
-    
+    # s3 mode bounds uvicorn's graceful shutdown so the final S3 flush fits the pod's grace period.
+    uvicorn_kwargs.update(panel_storage.uvicorn_overrides())
+
     if ssl_conf.get('enabled') and cert_file and key_file:
         if os.path.exists(cert_file) and os.path.exists(key_file):
-            logger.info(f"Starting panel with HTTPS enabled on domain: {ssl_conf.get('domain')} at port {uvicorn_kwargs['port']}")
+            logger.info(f"Starting panel with HTTPS enabled on domain: {ssl_conf.get('domain')} at port {internal_port}")
             uvicorn_kwargs["ssl_certfile"] = cert_file
             uvicorn_kwargs["ssl_keyfile"] = key_file
         else:
             logger.error("SSL certificates not found at specified paths. Starting with HTTP.")
 
-    uvicorn.run(**uvicorn_kwargs)
+    if front_enabled:
+        import panel_front
+        threading.Thread(target=lambda: uvicorn.run(**uvicorn_kwargs), daemon=True).start()
+        logger.info(f"Panel front on 0.0.0.0:{public_port} -> 127.0.0.1:{internal_port}")
+        panel_front.serve(host='0.0.0.0', port=public_port,
+                          backend=('127.0.0.1', internal_port))
+    else:
+        uvicorn.run(**uvicorn_kwargs)

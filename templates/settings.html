@@ -11,20 +11,28 @@
     </h1>
 </div>
 
+{# Read-only S3 storage card: s3 mode only, and never for support (bucket/endpoint are admin data). #}
+{% set show_storage_card = storage_status and storage_status.backend == 's3' and current_user and current_user.role == 'admin' %}
 <div id="settings-nav-anchor" aria-hidden="true"></div>
 <nav class="settings-nav" aria-label="{{ _('settings_title') }}">
     <a href="#settings-appearance">{{ _('appearance') }}</a>
     <a href="#settings-captcha">{{ _('captcha_title') }}</a>
     <a href="#settings-telegram">{{ _('telegram_bot_title') }}</a>
     <a href="#settings-mail">{{ _('mail_title') }}</a>
+    <a href="#settings-split-tunnel">{{ _('split_title') }}</a>
     <a href="#settings-tunnels">{{ _('tunnels_title') }}</a>
+    <a href="#settings-ssh-jump">{{ _('ssh_jump_title') }}</a>
     <a href="#settings-ssl">{{ _('ssl_title') }}</a>
     <a href="#settings-duckdns">{{ _('duckdns_title') }}</a>
     <a href="#settings-import">{{ _('import_users_title') }}</a>
     <a href="#settings-backup">{{ _('backup_title') }}</a>
+    {% if show_storage_card %}
+    <a href="#settings-storage">{{ _('storage_title') }}</a>
+    {% endif %}
     <a href="#settings-tokens">{{ _('api_tokens_title') }}</a>
     <a href="#settings-exit-nodes">{{ _('exit_defaults_title') }}</a>
     <a href="#settings-self-service">{{ _('self_service_title') }}</a>
+    <a href="#settings-subscription">{{ _('subscription_title') }}</a>
     <a href="#settings-about">{{ _('about_title') }}</a>
 </nav>
 
@@ -73,6 +81,27 @@
                     <input type="text" class="form-input" id="tg_token" value="{{ telegram_settings.token or '' }}"
                         placeholder="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11">
                 </div>
+                <div class="form-group">
+                    <label style="display: flex; align-items: center; gap: var(--space-sm); cursor: pointer;">
+                        <input type="checkbox" id="tg_auto_create_users" {% if telegram_settings.auto_create_users %}checked{% endif %}>
+                        {{ _('telegram_auto_create_users') }}
+                    </label>
+                    <p class="form-hint">{{ _('telegram_auto_create_users_desc') }}</p>
+                </div>
+                <div class="form-group">
+                    <label style="display: flex; align-items: center; gap: var(--space-sm); cursor: pointer;">
+                        <input type="checkbox" id="tg_create_users_disabled" {% if telegram_settings.create_users_disabled %}checked{% endif %}>
+                        {{ _('telegram_create_users_disabled') }}
+                    </label>
+                    <p class="form-hint">{{ _('telegram_create_users_disabled_desc') }}</p>
+                </div>
+                <div class="form-group">
+                    <label style="display: flex; align-items: center; gap: var(--space-sm); cursor: pointer;">
+                        <input type="checkbox" id="tg_webapp_initdata_auth" {% if telegram_settings.webapp_initdata_auth %}checked{% endif %}>
+                        {{ _('telegram_webapp_auth') }}
+                    </label>
+                    <p class="form-hint">{{ _('telegram_webapp_auth_desc') }}</p>
+                </div>
                 <div class="row-between" style="margin-top: var(--space-md);">
                     <div style="display: flex; align-items: center; gap: var(--space-sm);">
                         <span style="font-size: 0.85rem; color: var(--text-muted);">{{ _('bot_status') }}:</span>
@@ -83,7 +112,7 @@
                         {% endif %}
                     </div>
                     <button type="button" class="btn btn-secondary btn-sm" onclick="toggleBot()" id="toggleBotBtn">
-                        <span id="toggleBotBtnText">{% if bot_running %}{{ _('bot_stop_btn') }}{% else %}{{
+                        <span id="toggleBotBtnText">{% if telegram_settings.enabled %}{{ _('bot_stop_btn') }}{% else %}{{
                             _('bot_start_btn') }}{% endif %}</span>
                         <div class="spinner hidden" id="toggleBotSpinner" style="width:14px;height:14px;"></div>
                     </button>
@@ -176,6 +205,48 @@
                 </div>
                 <p class="form-hint">{{ _('mail_hint') }}</p>
             </form>
+        </div>
+
+        <!-- BLOCK: networks routed outside the VPN (client AllowedIPs) -->
+        <div class="card" id="settings-split-tunnel">
+            <h3 class="card-title" style="margin-bottom: var(--space-lg);"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="margin-right: 6px; vertical-align: -2px;"><path d="M16 3h5v5"/><path d="M8 3H3v5"/><path d="M12 22v-8.3a4 4 0 0 0-1.172-2.872L3 3"/><path d="m15 9 6-6"/></svg>{{ _('split_title') }}</h3>
+            <p class="form-hint" style="margin-top: 0;">{{ _('split_intro') }}</p>
+            <div class="form-group">
+                <label style="display: flex; align-items: center; gap: var(--space-sm); cursor: pointer;">
+                    <input type="checkbox" id="split_enabled" onchange="saveSplitTunnel(true)">
+                    {{ _('split_enabled_label') }}
+                </label>
+                <div class="form-hint" id="splitStatus">{{ _('split_status_empty') }}</div>
+            </div>
+            <div style="padding: var(--space-md); border: 1px solid var(--border-color); border-radius: var(--radius-md); background: var(--bg-primary); margin-bottom: var(--space-md);">
+                <strong>{{ _('split_public_title') }}</strong>
+                <div class="form-hint" style="margin: var(--space-xs) 0 var(--space-sm);">{{ _('split_public_hint') }}</div>
+                <label style="display: flex; align-items: center; gap: var(--space-sm); cursor: pointer;">
+                    <input type="checkbox" id="split_shorten" checked>
+                    {{ _('split_shorten_label') }}
+                </label>
+                <div class="form-hint" style="margin-bottom: var(--space-sm);">{{ _('split_shorten_hint') }}</div>
+                <button type="button" class="btn btn-primary" onclick="fetchSplitPublic()" id="splitFetchBtn">
+                    <span>{{ _('split_fetch_btn') }}</span>
+                    <div class="spinner hidden" id="splitFetchSpinner" style="width:14px;height:14px;"></div>
+                </button>
+            </div>
+            <div class="form-group">
+                <label class="form-label" for="split_networks">{{ _('split_networks_label') }}</label>
+                <textarea class="form-input" id="split_networks" rows="8" spellcheck="false"
+                    placeholder="77.88.0.0/18&#10;87.240.128.0/18" style="font-family: monospace;"></textarea>
+                <div class="form-hint">{{ _('split_networks_hint') }}</div>
+            </div>
+            <p class="form-hint hidden" id="splitLargeWarning" style="color: var(--warning);">{{ _('split_large_warning') }}</p>
+            <div style="display: flex; gap: var(--space-sm); flex-wrap: wrap;">
+                <input type="file" id="split_file" hidden onchange="loadSplitFile(this)"
+                    accept=".txt,.csv,.json,.lst,.list,.zone,.cidr,.ipset,text/plain,application/json">
+                <button type="button" class="btn btn-secondary" onclick="document.getElementById('split_file').click()">{{ _('split_file_btn') }}</button>
+                <button type="button" class="btn btn-primary" onclick="saveSplitTunnel(false)" id="splitSaveBtn">
+                    <span>{{ _('split_save_btn') }}</span>
+                    <div class="spinner hidden" id="splitSaveSpinner" style="width:14px;height:14px;"></div>
+                </button>
+            </div>
         </div>
 
         <!-- BLOCK 4: API Docs -->
@@ -291,10 +362,14 @@
         <div class="card" id="settings-ssl">
             <h3 class="card-title" style="margin-bottom: var(--space-lg);"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="margin-right: 6px; vertical-align: -2px;"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>{{ _('ssl_title') }}</h3>
             <form id="sslForm">
-                <div class="form-group">
+                <div class="form-group" style="display: flex; flex-wrap: wrap; gap: var(--space-lg);">
                     <label class="form-label">
                         <input type="checkbox" id="ssl_enabled" {% if settings.get('ssl', {}).get('enabled') %}checked{% endif %}>
                         {{ _('enable_https') }}
+                    </label>
+                    <label class="form-label">
+                        <input type="checkbox" id="ssl_bind_all_interfaces" {% if settings.get('ssl', {}).get('bind_all_interfaces', False) %}checked{% endif %}>
+                        {{ _('enable_all_interfaces') }}
                     </label>
                 </div>
                 <div class="form-group" style="margin-top: var(--space-md);">
@@ -332,6 +407,35 @@
                     <p class="form-hint">{{ _('ssl_hint') }}</p>
                 </div>
             </form>
+        </div>
+
+        <!-- BLOCK 2c: panel access control -->
+        <div class="card" id="settings-access">
+            <h3 class="card-title" style="margin-bottom: var(--space-lg);">{{ _('panel_access_title') }}</h3>
+            <p class="form-hint" style="margin-bottom: var(--space-md);">{{ _('panel_access_intro') }}</p>
+            <div class="form-group">
+                <label class="form-label">
+                    <input type="checkbox" id="pa_ip_enabled" onchange="togglePanelAccessFields()" {% if settings.get('panel_access', {}).get('ip_allowlist_enabled') %}checked{% endif %}>
+                    {{ _('panel_access_ip_enable') }}
+                </label>
+                <p class="form-hint">{{ _('panel_access_ip_hint') }}</p>
+            </div>
+            <div class="form-group" id="paIpFields" style="{% if not settings.get('panel_access', {}).get('ip_allowlist_enabled') %}display:none;{% endif %}">
+                <label class="form-label">{{ _('panel_access_ip_list_label') }}</label>
+                <textarea class="form-input" id="pa_ip_list" rows="6" placeholder="203.0.113.10&#10;198.51.100.0/24">{{ (settings.get('panel_access', {}).get('ip_allowlist') or []) | join('\n') }}</textarea>
+            </div>
+            <hr style="margin: var(--space-lg) 0;">
+            <div class="form-group">
+                <label class="form-label">
+                    <input type="checkbox" id="pa_domain_only" onchange="togglePanelAccessFields()" {% if settings.get('panel_access', {}).get('domain_only') %}checked{% endif %}>
+                    {{ _('panel_access_domain_only') }}
+                </label>
+                <p class="form-hint">{{ _('panel_access_domain_hint') }}</p>
+            </div>
+            <div class="form-group" id="paDomainFields" style="{% if not settings.get('panel_access', {}).get('domain_only') %}display:none;{% endif %}">
+                <label class="form-label">{{ _('panel_access_domain_label') }}</label>
+                <input type="text" class="form-input" id="pa_domain" value="{{ settings.get('panel_access', {}).get('allowed_domain', '') or settings.get('ssl', {}).get('domain', '') }}" placeholder="panel.example.com">
+            </div>
         </div>
 
         <!-- BLOCK 2b: DuckDNS domain -->
@@ -486,6 +590,23 @@
             </form>
         </div>
 
+        <!-- BLOCK: SSH jump host -->
+        <div class="card" id="settings-ssh-jump">
+            <h3 class="card-title" style="margin-bottom: var(--space-lg);">{{ _('ssh_jump_title') }}</h3>
+            <div class="form-group">
+                <label class="form-label" for="ssh_jump_host_uid">{{ _('ssh_jump_server_label') }}</label>
+                <select class="form-select" id="ssh_jump_host_uid">
+                    <option value="">{{ _('ssh_jump_off') }}</option>
+                    {% for s in servers %}
+                    <option value="{{ s.uid }}" {% if settings.get('ssh_jump', {}).get('jump_host_uid', '') == s.uid %}selected{% endif %}>
+                        {{ s.name or s.host }} ({{ s.host }}:{{ s.ssh_port or 22 }})
+                    </option>
+                    {% endfor %}
+                </select>
+            </div>
+            <p class="form-hint">{{ _('ssh_jump_hint') }}</p>
+        </div>
+
         <!-- BLOCK: Simple Backup -->
         <div class="card" id="settings-backup" style="margin-top: var(--space-lg);">
             <h3 class="card-title" style="margin-bottom: var(--space-lg);"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="margin-right: 6px; vertical-align: -2px;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>{{ _('backup_title') }}</h3>
@@ -499,7 +620,7 @@
                 <p class="form-hint">{{ _('full_backup_warning') }}</p>
                 <p class="form-hint">{{ _('full_backup_scope') }}</p>
                 <p class="form-hint">{{ _('full_backup_offline') }}</p>
-                <a href="/api/settings/backup/download">{{ _('legacy_json_backup') }}</a>
+                <p class="form-hint">{{ _('legacy_backup_disabled') }}</p>
                 <div style="border-top: 1px solid var(--border-color); padding-top: var(--space-md);">
                     <div style="display: flex; flex-direction: column; gap: var(--space-sm);">
                         <input type="file" id="backupFile" accept=".json" style="display: none;"
@@ -550,6 +671,71 @@
                 {{ _('restore_confirm') }}
             </p>
         </div>
+
+        {% if show_storage_card %}
+        {% set s3 = storage_status %}
+        <!-- BLOCK: S3 storage (read-only, configured by environment variables) -->
+        <div class="card" id="settings-storage" style="margin-top: var(--space-lg);">
+            <h3 class="card-title" style="margin-bottom: var(--space-lg);"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="margin-right: 6px; vertical-align: -2px;"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>{{ _('storage_title') }}</h3>
+            {% if s3.fenced %}
+            <p class="form-hint" style="margin-bottom: var(--space-md); color: var(--danger);">{{ _('storage_fenced_warning') }}</p>
+            {% endif %}
+            {# Names and codes are case-sensitive: keep the badge from upper-casing them, and let long ones wrap. #}
+            {% set value_style = 'text-transform: none; overflow-wrap: anywhere; max-width: 100%;' %}
+            <div style="display: flex; flex-direction: column;">
+                <div class="row-between" style="padding: var(--space-sm) 0; border-bottom: 1px solid var(--border-color);">
+                    <span style="font-weight: 500;">{{ _('storage_bucket') }}</span>
+                    <span class="badge badge-secondary" style="{{ value_style }}">{{ s3.bucket or '—' }}</span>
+                </div>
+                <div class="row-between" style="padding: var(--space-sm) 0; border-bottom: 1px solid var(--border-color);">
+                    <span style="font-weight: 500;">{{ _('storage_prefix') }}</span>
+                    <span class="badge badge-secondary" style="{{ value_style }}">{{ s3.prefix or _('storage_prefix_root') }}</span>
+                </div>
+                <div class="row-between" style="padding: var(--space-sm) 0; border-bottom: 1px solid var(--border-color);">
+                    <span style="font-weight: 500;">{{ _('storage_endpoint') }}</span>
+                    <span class="badge badge-secondary" style="{{ value_style }}">{{ s3.endpoint or _('storage_endpoint_default') }}</span>
+                </div>
+                <div class="row-between" style="padding: var(--space-sm) 0; border-bottom: 1px solid var(--border-color);">
+                    <span style="font-weight: 500;">{{ _('storage_region') }}</span>
+                    <span class="badge badge-secondary" style="{{ value_style }}">{{ s3.region or '—' }}</span>
+                </div>
+                <div class="row-between" style="padding: var(--space-sm) 0; border-bottom: 1px solid var(--border-color);">
+                    <span style="font-weight: 500;">{{ _('storage_fencing') }}</span>
+                    {% if s3.fencing == 'enforced' %}
+                    <span class="badge badge-success" style="{{ value_style }}">{{ _('storage_fencing_enforced') }}</span>
+                    {% elif s3.fencing == 'unfenced' %}
+                    <span class="badge badge-warn" style="{{ value_style }}">{{ _('storage_fencing_unfenced') }}</span>
+                    {% else %}
+                    <span class="badge badge-secondary">—</span>
+                    {% endif %}
+                </div>
+                <div class="row-between" style="padding: var(--space-sm) 0; border-bottom: 1px solid var(--border-color);">
+                    <span style="font-weight: 500;">{{ _('storage_generation') }}</span>
+                    <span class="badge badge-info">{{ s3.generation if s3.generation is not none else '—' }}</span>
+                </div>
+                <div class="row-between" style="padding: var(--space-sm) 0; border-bottom: 1px solid var(--border-color);">
+                    <span style="font-weight: 500;">{{ _('storage_files') }}</span>
+                    <span class="badge badge-secondary" style="{{ value_style }}">{{ s3.files or 0 }} · {{ (s3.bytes or 0) | filesizeformat }}</span>
+                </div>
+                <div class="row-between" style="padding: var(--space-sm) 0; border-bottom: 1px solid var(--border-color);">
+                    <span style="font-weight: 500;">{{ _('storage_last_sync') }}</span>
+                    <span class="badge badge-secondary" style="{{ value_style }}">{% if s3.last_commit_at %}{{ s3.last_commit_at | replace('T', ' ') | replace('Z', ' UTC') }}{% else %}{{ _('storage_never') }}{% endif %}</span>
+                </div>
+                <div class="row-between" style="padding: var(--space-sm) 0;">
+                    <span style="font-weight: 500;">{{ _('storage_last_error') }}</span>
+                    {% if s3.last_error %}
+                    <span class="badge badge-danger" style="{{ value_style }}">{{ s3.last_error }}{% if s3.last_error_at %} · {{ s3.last_error_at | replace('T', ' ') | replace('Z', ' UTC') }}{% endif %}</span>
+                    {% else %}
+                    <span class="badge badge-success" style="{{ value_style }}">{{ _('storage_no_error') }}</span>
+                    {% endif %}
+                </div>
+            </div>
+            {% if s3.fencing == 'unfenced' %}
+            <p class="form-hint" style="margin-top: var(--space-sm); color: var(--warning);">{{ _('storage_unfenced_hint') }}</p>
+            {% endif %}
+            <p class="form-hint" style="margin-top: var(--space-sm);">{{ _('storage_env_hint') }}</p>
+        </div>
+        {% endif %}
 
         <!-- BLOCK: API Tokens -->
         <div class="card" id="settings-tokens" style="margin-top: var(--space-lg);">
@@ -603,7 +789,7 @@
                     </div>
                     <div class="form-group">
                         <label class="form-label">{{ _('self_service_max_conns') }}</label>
-                        <input type="number" class="form-input" id="ss_max_connections" value="{{ settings.self_service.max_connections_per_user | default(5) }}" min="1" max="100">
+                        <input type="number" class="form-input" id="ss_max_connections" value="{{ settings.self_service.max_connections_per_user | default(5) }}" min="0" max="100">
                     </div>
                     <div class="form-group">
                         <label class="form-label">{{ _('self_service_rate_limit') }}</label>
@@ -625,6 +811,174 @@
                     </div>
                 </div>
             </form>
+        </div>
+
+        <!-- BLOCK: Cheburcheck (Russia block check) -->
+        <div class="card" id="settings-cheburcheck" style="margin-top: var(--space-lg);">
+            <h3 class="card-title" style="margin-bottom: var(--space-lg);">🚫 {{ _('cheburcheck_settings_title') }}</h3>
+            <p class="form-hint" style="margin-bottom: var(--space-md);">{{ _('cheburcheck_settings_intro') }}</p>
+            <div class="form-group">
+                <label class="form-label">
+                    <input type="checkbox" id="cb_enabled" {% if settings.get('cheburcheck', {}).get('enabled') %}checked{% endif %}>
+                    {{ _('cheburcheck_enable') }}
+                </label>
+                <p class="form-hint">{{ _('cheburcheck_enable_hint') }}</p>
+            </div>
+            {# Shown outside #cb_body: with the master switch off the admin must see
+               why nothing is checked, not an empty collapsed body. #}
+            <div id="cb_targets_block" style="margin-bottom: var(--space-md); {% if not settings.get('cheburcheck', {}).get('enabled') %}display:none;{% endif %}">
+                <p class="form-hint" style="margin-bottom:6px;">{{ _('cheburcheck_targets_intro') }}</p>
+                <div id="cb_targets_list" class="text-muted"></div>
+            </div>
+            <p id="cb_master_off" class="form-hint" style="margin-bottom: var(--space-md); {% if settings.get('cheburcheck', {}).get('enabled') %}display:none;{% endif %}">{{ _('cheburcheck_master_off') }}</p>
+            {# Everything below is inert until the master switch is on: no checks,
+               no badges, no header button, no popup anywhere in the panel. #}
+            <div id="cb_body" style="{% if not settings.get('cheburcheck', {}).get('enabled') %}display:none;{% endif %}">
+            <div class="form-group">
+                <label class="form-label">{{ _('cheburcheck_interval') }}</label>
+                <input type="number" class="form-input" id="cb_interval" min="1" max="24" value="{{ settings.get('cheburcheck', {}).get('interval_hours', 1) }}" style="width:120px;">
+                <p class="form-hint">{{ _('cheburcheck_interval_hint') }}</p>
+            </div>
+            <div class="form-group">
+                <label class="form-label">
+                    <input type="checkbox" id="cb_quiet_enabled" {% if settings.get('cheburcheck', {}).get('quiet_enabled') %}checked{% endif %}>
+                    {{ _('cheburcheck_quiet_enable') }}
+                </label>
+                <p class="form-hint">{{ _('cheburcheck_quiet_hint') }}</p>
+            </div>
+            <div class="form-group" id="cb_quiet_fields" style="display:{% if not settings.get('cheburcheck', {}).get('quiet_enabled') %}none{% else %}flex{% endif %}; align-items:flex-end; gap:12px;">
+                <div>
+                    <label class="form-label">{{ _('cheburcheck_quiet_from') }}</label>
+                    <select class="form-input" id="cb_quiet_start" style="width:auto;">
+                        {% for h in range(24) %}
+                        <option value="{{ h }}" {% if settings.get('cheburcheck', {}).get('quiet_start', 0) == h %}selected{% endif %}>{{ '%02d:00' % h }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div>
+                    <label class="form-label">{{ _('cheburcheck_quiet_to') }}</label>
+                    <select class="form-input" id="cb_quiet_end" style="width:auto;">
+                        {% for h in range(24) %}
+                        <option value="{{ h }}" {% if settings.get('cheburcheck', {}).get('quiet_end', 0) == h %}selected{% endif %}>{{ '%02d:00' % h }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+            </div>
+            <div class="form-group">
+                <label class="form-label" for="cb_api_token">{{ _('cheburcheck_token_label') }}</label>
+                {# Токен, кнопка и ответ проверки — одной строкой: ответ появляется
+                   справа от кнопки (как проверка выходного IP в модуле выходной ноды). #}
+                <div style="display:flex; align-items:center; gap:var(--space-sm); flex-wrap:wrap;">
+                    <input type="password" class="form-input" id="cb_api_token" autocomplete="off"
+                           spellcheck="false" placeholder="{{ _('cheburcheck_token_placeholder') }}"
+                           style="flex:1 1 220px; min-width:0; width:auto;">
+                    <button type="button" class="btn btn-secondary btn-sm" id="cb_token_check_btn"
+                            onclick="checkCheburcheckToken()">{{ _('cheburcheck_token_check') }}</button>
+                    <span id="cb_token_check_result" class="form-hint" role="status" aria-live="polite"
+                          style="margin:0; display:none;"></span>
+                </div>
+                <p class="form-hint" style="margin-top:6px;">
+                    {% set cb_token = settings.get('cheburcheck', {}).get('api_token') or '' %}
+                    <span id="cb_token_state">{% if cb_token %}{{ _('cheburcheck_token_set') }} (••••{{ cb_token[-4:] }}){% else %}{{ _('cheburcheck_token_not_set') }}{% endif %}</span>
+                    &middot; {{ _('cheburcheck_token_hint') }}
+                </p>
+                <p class="form-hint" style="margin-top:4px;">
+                    {{ _('cheburcheck_token_basic_only') }}
+                    <a href="https://cheburcheck.ru/kb/api#authorization" target="_blank" rel="noopener">{{ _('cheburcheck_token_docs_link') }}</a>
+                </p>
+                <p class="form-hint" style="margin-top:4px;">{{ _('cheburcheck_token_credits_hint') }}</p>
+            </div>
+            <div class="form-group">
+                <label class="form-label">{{ _('cheburcheck_servers_label') }}</label>
+                <div id="cb_servers_list" style="display:flex; flex-direction:column; gap:10px; margin-top:6px;">
+                    {% for server in servers %}
+                    {% set cb_override = (settings.get('cheburcheck', {}).get('targets') or {}).get(server.uid) or [] %}
+                    <div style="display:flex; flex-direction:column; gap:4px;" data-cb-row="{{ server.uid }}">
+                        <label class="form-label" style="font-weight:normal;">
+                            <input type="checkbox" class="cb-server" data-uid="{{ server.uid }}"
+                                data-name="{{ server.name }}" data-host="{{ server.host }}"
+                                {% if settings.get('cheburcheck', {}).get('servers', {}).get(server.uid) %}checked{% endif %}>
+                            {{ server.name }} ({{ server.host }})
+                        </label>
+                        <div class="cb-override-wrap" data-uid="{{ server.uid }}"
+                             style="display:{% if settings.get('cheburcheck', {}).get('servers', {}).get(server.uid) %}flex{% else %}none{% endif %}; align-items:center; gap:8px;">
+                            <label class="form-label" style="font-weight:normal; font-size:0.9em; white-space:nowrap;">
+                                <input type="checkbox" class="cb-override" data-uid="{{ server.uid }}"
+                                       data-had-override="{% if cb_override %}1{% else %}0{% endif %}"
+                                       {% if cb_override %}checked{% endif %}>
+                                {{ _('cheburcheck_override_toggle') }}
+                            </label>
+                            <input type="text" class="form-input cb-targets" data-uid="{{ server.uid }}"
+                                   placeholder="{{ _('cheburcheck_override_placeholder') }}"
+                                   value="{{ cb_override | join(', ') }}"
+                                   style="font-size:0.9em; display:{% if cb_override %}block{% else %}none{% endif %};">
+                        </div>
+                    </div>
+                    {% endfor %}
+                </div>
+                <p class="form-hint">{{ _('cheburcheck_servers_hint') }}</p>
+            </div>
+            <div style="margin-top: var(--space-md);">
+                <div style="display:flex; align-items:center; gap:var(--space-sm); flex-wrap:wrap;">
+                    <button type="button" class="btn btn-primary btn-sm" onclick="saveCheburcheckSettings()">{{ _('save') }}</button>
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="runAllCheburcheck()">{{ _('cheburcheck_run_all') }}</button>
+                    {# Прогресс пакетного прогона: спиннер + «проверено N из M» и полоска. #}
+                    <span id="cb_progress" class="text-muted" style="display:none; align-items:center; gap:8px;"
+                          role="status" aria-live="polite">
+                        <span class="spinner-inline" aria-hidden="true"></span>
+                        <span id="cb_progress_text"></span>
+                    </span>
+                    <span id="cb_status" class="text-muted"></span>
+                </div>
+                <div id="cb_progress_bar" class="progress-bar" style="display:none;">
+                    <div class="progress-fill" id="cb_progress_fill" style="width:0%;"></div>
+                </div>
+            </div>
+            </div>{# /cb_body #}
+        </div>
+
+        <!-- BLOCK Subscription (Xray) -->
+        <div class="card" id="settings-subscription" style="margin-top: var(--space-lg);">
+            <h3 class="card-title" style="margin-bottom: var(--space-lg);">🔗 {{ _('subscription_title') }}</h3>
+            <p class="form-hint" style="margin-bottom: var(--space-md);">{{ _('subscription_desc') }}</p>
+            <div class="form-group">
+                <label style="display: flex; align-items: center; gap: var(--space-sm); cursor: pointer;">
+                    <input type="checkbox" id="sub_enabled" {% if subscription_settings.enabled %}checked{% endif %}
+                        onchange="toggleSubscriptionFields()">
+                    {{ _('subscription_enable') }}
+                </label>
+            </div>
+            <div id="subFields" style="display: {% if subscription_settings.enabled %}block{% else %}none{% endif %};">
+                <div class="form-group">
+                    <label class="form-label">{{ _('subscription_name_label') }}</label>
+                    <input class="form-input" id="subName" value="{{ subscription_settings.name }}" placeholder="My VPN">
+                    <div class="form-hint">{{ _('subscription_name_hint') }}</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">{{ _('subscription_server_label') }}</label>
+                    <select class="form-input" id="subServer">
+                        <option value="">—</option>
+                        {% for server in subscription_servers %}
+                        <option value="{{ server.uid }}" {% if subscription_settings.server_uid == server.uid %}selected{% endif %}>{{ server.label }}</option>
+                        {% endfor %}
+                    </select>
+                    <div class="form-hint">{{ _('subscription_server_hint') }}</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">{{ _('subscription_path_label') }}</label>
+                    <input class="form-input" id="subPath" value="{{ subscription_settings.path }}" placeholder="sub">
+                    <div class="form-hint">{{ _('subscription_path_hint') }}</div>
+                </div>
+                <div class="row-between" style="margin-top: var(--space-md);">
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="pushSubscriptions()" id="subPushBtn">
+                        {{ _('subscription_push') }}
+                    </button>
+                    <button type="button" class="btn btn-primary btn-sm" onclick="saveSubscription()" id="subSaveBtn">
+                        {{ _('save') }}
+                    </button>
+                </div>
+                <div id="subStatus" style="margin-top: var(--space-md);"></div>
+            </div>
         </div>
 
         <!-- BLOCK: About & Updates -->
@@ -663,7 +1017,7 @@
 
 <!-- ===== Create API Token Modal ===== -->
 <div class="modal-backdrop" id="createTokenModal">
-    <div class="modal" style="max-width: 460px;">
+    <div class="modal">
         <div class="modal-header">
             <h2 class="modal-title">{{ _('api_tokens_create_title') }}</h2>
             <button class="modal-close" onclick="closeModal('createTokenModal')">×</button>
@@ -686,7 +1040,7 @@
 
 <!-- ===== Newly-Created Token Modal (one-time display) ===== -->
 <div class="modal-backdrop" id="newTokenModal">
-    <div class="modal" style="max-width: 560px;">
+    <div class="modal">
         <div class="modal-header">
             <h2 class="modal-title">{{ _('api_tokens_created_title') }}</h2>
             <button class="modal-close" onclick="closeModal('newTokenModal')">×</button>
@@ -717,7 +1071,7 @@
 <script>
     const serversData = {{ servers | tojson }};
     const protocolLabels = {{ server_protocol_labels | tojson }};
-    const botCurrentlyRunning = {{ 'true' if bot_running else 'false' }};
+    let botEnabled = {{ 'true' if telegram_settings.enabled else 'false' }};
 
     function updateProtocolsForSync() {
         const serverIdx = document.querySelector('[name="remnawave_server_id"]').value;
@@ -1010,6 +1364,13 @@
         }
     }
 
+    function togglePanelAccessFields() {
+        const ipOn = document.getElementById('pa_ip_enabled').checked;
+        const domOn = document.getElementById('pa_domain_only').checked;
+        document.getElementById('paIpFields').style.display = ipOn ? '' : 'none';
+        document.getElementById('paDomainFields').style.display = domOn ? '' : 'none';
+    }
+
     async function saveSettings() {
         const btn = document.getElementById('saveBtn');
         const spinner = document.getElementById('saveSpinner');
@@ -1042,11 +1403,14 @@
 
         const telegram = {
             token: document.getElementById('tg_token').value.trim(),
-            enabled: botCurrentlyRunning
+            auto_create_users: document.getElementById('tg_auto_create_users').checked,
+            create_users_disabled: document.getElementById('tg_create_users_disabled').checked,
+            webapp_initdata_auth: document.getElementById('tg_webapp_initdata_auth').checked
         };
 
         const ssl = {
             enabled: document.getElementById('ssl_enabled').checked,
+            bind_all_interfaces: document.getElementById('ssl_bind_all_interfaces').checked,
             domain: document.getElementById('ssl_domain').value.trim(),
             cert_path: document.getElementById('ssl_cert_path').value.trim(),
             key_path: document.getElementById('ssl_key_path').value.trim(),
@@ -1072,6 +1436,9 @@
         };
 
         const exit_nodes = { default_exit_uid: document.getElementById('exitDefaultNode').value || '' };
+        const ssh_jump = {
+            jump_host_uid: document.getElementById('ssh_jump_host_uid').value
+        };
 
         // The password field is intentionally never pre-filled; an empty value
         // tells the server to keep the stored one.
@@ -1088,11 +1455,18 @@
             timeout_seconds: parseInt(document.getElementById('mail_timeout').value || '30')
         };
 
+        const panel_access = {
+            ip_allowlist_enabled: document.getElementById('pa_ip_enabled').checked,
+            ip_allowlist: document.getElementById('pa_ip_list').value,
+            domain_only: document.getElementById('pa_domain_only').checked,
+            allowed_domain: document.getElementById('pa_domain').value.trim()
+        };
+
         try {
             const res = await fetch('/api/settings/save', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ appearance, sync, captcha, telegram, ssl, mail, auto_backup, self_service, exit_nodes })
+                body: JSON.stringify({ appearance, sync, captcha, telegram, ssl, mail, auto_backup, self_service, ssh_jump, exit_nodes, panel_access })
             });
             if (!res.ok) throw new Error(_('error'));
             const saved = await res.json();
@@ -1177,13 +1551,17 @@
         btn.disabled = true;
         spinner.classList.remove('hidden');
         try {
-            const res = await fetch('/api/settings/telegram/toggle', { method: 'POST' });
+            const res = await fetch('/api/settings/telegram/toggle', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enabled: !botEnabled })
+            });
             const data = await res.json();
             if (!res.ok) throw new Error(data.error || _('error'));
+            botEnabled = data.bot_enabled;
             const running = data.bot_running;
             document.getElementById('botStatusBadge').className = running ? 'badge badge-success' : 'badge badge-secondary';
             document.getElementById('botStatusBadge').textContent = running ? _('bot_running') : _('bot_stopped');
-            text.textContent = running ? _('bot_stop_btn') : _('bot_start_btn');
+            text.textContent = botEnabled ? _('bot_stop_btn') : _('bot_start_btn');
             showToast(running ? _('bot_started') : _('bot_stopped_msg'), 'success');
         } catch (err) {
             showToast(`${_('error')}: ` + err.message, 'error');
@@ -1394,13 +1772,531 @@
         }
     }
 
+    // ---- Networks outside the VPN ----
+    // The stored list as last rendered: a toggle saves this, not edits still in the box.
+    let splitStoredText = '';
+    let splitSource = 'manual';
+
+    function renderSplitTunnel(state) {
+        document.getElementById('split_enabled').checked = !!state.enabled;
+        splitStoredText = (state.networks || []).join('\n');
+        document.getElementById('split_networks').value = splitStoredText;
+        splitSource = 'manual';
+        const status = document.getElementById('splitStatus');
+        if (!state.network_count) {
+            status.textContent = _('split_status_empty');
+        } else {
+            const parts = [_('split_status')
+                .replace('{networks}', state.network_count)
+                .replace('{entries}', state.allowed_ips_entries)];
+            parts.push(state.source_detail || _('split_source_' + (state.source || 'manual')));
+            if (state.shortened) parts.push(_('split_shortened_badge'));
+            if (state.updated_at) parts.push(new Date(state.updated_at).toLocaleString());
+            parts.push(state.active ? _('split_state_on') : _('split_state_off'));
+            status.textContent = parts.join(' · ');
+        }
+        document.getElementById('splitLargeWarning').classList.toggle('hidden', !state.large);
+    }
+
+    async function loadSplitTunnel() {
+        try {
+            const res = await fetch('/api/settings/split-tunnel');
+            if (res.ok) renderSplitTunnel(await res.json());
+        } catch (err) {
+            // The card keeps its placeholder; saving still reports errors.
+        }
+    }
+
+    function splitErrorMessage(body) {
+        const key = 'split_error_' + (body.code || '');
+        let message = _(key) !== key ? _(key) : (body.error || _('error'));
+        if (body.invalid && body.invalid.length) message += ': ' + body.invalid.slice(0, 5).join(', ');
+        return message;
+    }
+
+    function loadSplitFile(input) {
+        const file = input.files && input.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+            document.getElementById('split_networks').value = String(reader.result || '');
+            splitSource = 'file';
+            showToast(_('split_file_loaded'), 'info');
+        };
+        reader.onerror = () => showToast(_('error'), 'error');
+        reader.readAsText(file);
+        input.value = '';
+    }
+
+    async function saveSplitTunnel(fromToggle) {
+        const enabledBox = document.getElementById('split_enabled');
+        const textarea = document.getElementById('split_networks');
+        const spinner = document.getElementById('splitSaveSpinner');
+        const typed = textarea.value;
+        const typedSource = splitSource;
+        spinner.classList.remove('hidden');
+        try {
+            const res = await fetch('/api/settings/split-tunnel', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    enabled: enabledBox.checked,
+                    networks: fromToggle ? splitStoredText : typed,
+                    source: splitSource
+                })
+            });
+            const body = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(splitErrorMessage(body));
+            renderSplitTunnel(body);
+            if (fromToggle) {
+                textarea.value = typed;
+                splitSource = typedSource;
+            }
+            if (body.ipv6_skipped) showToast(_('split_ipv6_skipped').replace('{}', body.ipv6_skipped), 'info');
+            showToast(body.active ? _('split_saved_on') : _('split_saved_off'), 'success');
+        } catch (err) {
+            if (fromToggle) enabledBox.checked = !enabledBox.checked;
+            showToast(err.message, 'error');
+        } finally {
+            spinner.classList.add('hidden');
+        }
+    }
+
+    async function fetchSplitPublic() {
+        if (document.getElementById('split_networks').value.trim() && !confirm(_('split_replace_confirm'))) return;
+        const btn = document.getElementById('splitFetchBtn');
+        const spinner = document.getElementById('splitFetchSpinner');
+        btn.disabled = true;
+        spinner.classList.remove('hidden');
+        try {
+            const res = await fetch('/api/settings/split-tunnel/public', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ country: 'RU', shorten: document.getElementById('split_shorten').checked })
+            });
+            const body = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(splitErrorMessage(body));
+            renderSplitTunnel(body);
+            showToast(_('split_fetched')
+                .replace('{networks}', body.network_count)
+                .replace('{full}', body.full_count)
+                .replace('{entries}', body.allowed_ips_entries), 'success');
+        } catch (err) {
+            showToast(err.message, 'error');
+        } finally {
+            btn.disabled = false;
+            spinner.classList.add('hidden');
+        }
+    }
+
     document.addEventListener('DOMContentLoaded', () => {
         loadTokens();
         loadTunnelStatus();
         loadExitNodes();
+        loadSplitTunnel();
         tunnelStatusTimer = setInterval(loadTunnelStatus, 10000);
     });
 </script>
 <script src="/static/js/settings-nav.js?v={{ static_v }}" defer></script>
 <script src="/static/js/updates.js?v={{ static_v }}" defer></script>
+<script>
+window.CHEBURCHECK_TARGETS = {{ (cheburcheck_targets or {}) | tojson }};
+function cbOverrideValues(input) {
+    return (input.value || '').split(',').map(v => v.trim()).filter(Boolean);
+}
+function cbRowAddresses(uid) {
+    const serverBox = document.querySelector(`.cb-server[data-uid="${uid}"]`);
+    if (!serverBox || !serverBox.checked) return [];
+    const toggle = document.querySelector(`.cb-override[data-uid="${uid}"]`);
+    const input = document.querySelector(`.cb-targets[data-uid="${uid}"]`);
+    if (toggle && toggle.checked && input) return cbOverrideValues(input);
+    return (window.CHEBURCHECK_TARGETS || {})[uid] || [];
+}
+function cbSyncRow(uid) {
+    const serverBox = document.querySelector(`.cb-server[data-uid="${uid}"]`);
+    const wrap = document.querySelector(`.cb-override-wrap[data-uid="${uid}"]`);
+    const toggle = document.querySelector(`.cb-override[data-uid="${uid}"]`);
+    const input = document.querySelector(`.cb-targets[data-uid="${uid}"]`);
+    if (!serverBox || !wrap || !toggle || !input) return;
+    const serverOn = serverBox.checked;
+    wrap.style.display = serverOn ? 'flex' : 'none';
+    if (!serverOn) toggle.checked = false;
+    input.style.display = (serverOn && toggle.checked) ? 'block' : 'none';
+}
+function renderCheburcheckTargets() {
+    const list = document.getElementById('cb_targets_list');
+    if (!list) return;
+    const enabled = document.getElementById('cb_enabled').checked;
+    list.textContent = '';
+    if (!enabled) return;
+    const rows = [];
+    document.querySelectorAll('.cb-server').forEach(cb => {
+        if (!cb.checked) return;
+        const uid = cb.dataset.uid;
+        const name = cb.dataset.name || uid;
+        const addresses = cbRowAddresses(uid);
+        if (!addresses.length) return;   // nothing is checked for this server
+        const row = document.createElement('div');
+        row.style.marginBottom = '8px';
+        const title = document.createElement('b');
+        title.textContent = name + ': ';
+        row.appendChild(title);
+        const addrs = document.createElement('span');
+        addrs.textContent = addresses.join(', ');
+        row.appendChild(addrs);
+        rows.push(row);
+    });
+    if (!rows.length) {
+        const empty = document.createElement('div');
+        empty.className = 'form-hint';
+        empty.textContent = {{ _('cheburcheck_none_enabled') | tojson }};
+        list.appendChild(empty);
+        return;
+    }
+    // With a long fleet the address list gets in the way: collapse it behind a
+    // spoiler as soon as more than three servers are checked.
+    if (rows.length > 3) {
+        const details = document.createElement('details');
+        const summary = document.createElement('summary');
+        const labelTemplate = {{ _('cheburcheck_targets_show') | tojson }};
+        summary.textContent = labelTemplate.replace('{count}', String(rows.length));
+        summary.style.cursor = 'pointer';
+        details.appendChild(summary);
+        const body = document.createElement('div');
+        body.style.marginTop = '6px';
+        rows.forEach(row => body.appendChild(row));
+        details.appendChild(body);
+        list.appendChild(details);
+    } else {
+        rows.forEach(row => list.appendChild(row));
+    }
+}
+
+function toggleCheburcheckBody(on) {
+    document.getElementById('cb_body').style.display = on ? '' : 'none';
+    const block = document.getElementById('cb_targets_block');
+    const off = document.getElementById('cb_master_off');
+    if (block) block.style.display = on ? '' : 'none';
+    if (off) off.style.display = on ? 'none' : '';
+    renderCheburcheckTargets();
+}
+
+function collectCheburcheckSettings() {
+    const servers = {};
+    document.querySelectorAll('.cb-server').forEach(cb => {
+        if (cb.dataset.uid) servers[cb.dataset.uid] = cb.checked;
+    });
+    const targets = {};
+    document.querySelectorAll('.cb-override').forEach(toggle => {
+        const uid = toggle.dataset.uid;
+        if (!uid) return;
+        const input = document.querySelector(`.cb-targets[data-uid="${uid}"]`);
+        if (toggle.checked) {
+            // Explicit list (an empty value removes the override).
+            targets[uid] = input ? cbOverrideValues(input) : [];
+        } else if (toggle.dataset.hadOverride === '1') {
+            targets[uid] = [];              // override was switched off
+        }
+    });
+    const payload = {
+        enabled: document.getElementById('cb_enabled').checked,
+        interval_hours: parseInt(document.getElementById('cb_interval').value || '1', 10),
+        servers,
+        targets,
+        quiet_enabled: document.getElementById('cb_quiet_enabled').checked,
+        quiet_start: parseInt(document.getElementById('cb_quiet_start').value || '0', 10),
+        quiet_end: parseInt(document.getElementById('cb_quiet_end').value || '0', 10),
+    };
+    // Токен отправляем только когда поле заполнено: обычное «Сохранить» не
+    // должно затирать уже сохранённый токен.
+    const tokenInput = document.getElementById('cb_api_token');
+    if (tokenInput && tokenInput.value.trim()) payload.api_token = tokenInput.value.trim();
+    return payload;
+}
+
+// Проверка токена: сервер дергает /api/v1/credits с Bearer и возвращает
+// только остаток кредитов либо текст ошибки. Сам токен в ответ не попадает.
+// Ответ выводится справа от кнопки, в той же манере, что проверка выходного
+// IP в модуле выходной ноды: «Проверка...» → цветной результат с иконкой.
+async function checkCheburcheckToken() {
+    const box = document.getElementById('cb_token_check_result');
+    const btn = document.getElementById('cb_token_check_btn');
+    const input = document.getElementById('cb_api_token');
+    const body = {};
+    if (input && input.value.trim()) body.api_token = input.value.trim();
+    const show = (text, color) => {
+        if (!box) return;
+        box.style.display = text ? '' : 'none';
+        box.style.color = color || '';
+        box.textContent = text || '';
+    };
+    if (btn) btn.disabled = true;
+    show(window._('checking_updates') || '…', '');
+    try {
+        const res = await apiCall('/api/settings/cheburcheck/token_check', 'POST', body);
+        if (res && res.ok) {
+            // Кредиты списываются по одному на проверку сканерами; нулевой
+            // баланс — не ошибка, сервис переходит на бесплатный лимит.
+            const credits = Number(res.credits) || 0;
+            const tpl = credits > 0
+                ? (window._('cheburcheck_token_ok') || 'token accepted, credits: {n}')
+                : (window._('cheburcheck_token_ok_free') || 'token accepted, no credits: free limits apply');
+            show('✓ ' + tpl.replace('{n}', String(credits)), 'var(--success, #4ade80)');
+        } else {
+            show('✗ ' + ((res && res.error) || window._('cheburcheck_token_failed') || 'token rejected'),
+                 'var(--danger, #f87171)');
+        }
+    } catch (e) {
+        show('✗ ' + (e.message || e), 'var(--danger, #f87171)');
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
+async function saveCheburcheckSettings() {
+    const st = document.getElementById('cb_status');
+    const payload = collectCheburcheckSettings();
+    try {
+        await apiCall('/api/settings/cheburcheck', 'POST', payload);
+        if (st) st.textContent = '✓ ' + (window._('saved') || 'saved');
+        if (payload.api_token) {
+            // Поле очищаем и показываем только хвост: полный токен на странице
+            // не остаётся ни в value, ни в тексте.
+            const state = document.getElementById('cb_token_state');
+            if (state) {
+                state.textContent = (window._('cheburcheck_token_set') || 'token set')
+                    + ' (••••' + payload.api_token.slice(-4) + ')';
+            }
+            const input = document.getElementById('cb_api_token');
+            if (input) input.value = '';
+        }
+        renderCheburcheckTargets();
+    } catch (e) {
+        if (st) st.textContent = '✗ ' + (e.message || e);
+    }
+}
+
+// The master switch gates the whole block: no checks or markup without it.
+// It persists on its own - hiding the block must look disabled AND stay disabled
+// after a reload, otherwise F5 brings the checkbox back.
+document.getElementById('cb_enabled').addEventListener('change', async (e) => {
+    toggleCheburcheckBody(e.target.checked);
+    const st = document.getElementById('cb_status');
+    if (st) st.textContent = '…';
+    try {
+        await apiCall('/api/settings/cheburcheck', 'POST', collectCheburcheckSettings());
+        if (st) st.textContent = '✓ ' + (window._('saved') || 'saved');
+    } catch (err) {
+        if (st) st.textContent = '✗ ' + (err.message || err);
+    }
+});
+
+document.querySelectorAll('.cb-server').forEach(cb => {
+    cb.addEventListener('change', () => {
+        cbSyncRow(cb.dataset.uid);
+        renderCheburcheckTargets();
+    });
+});
+document.querySelectorAll('.cb-override').forEach(toggle => {
+    toggle.addEventListener('change', () => {
+        cbSyncRow(toggle.dataset.uid);
+        renderCheburcheckTargets();
+    });
+});
+document.querySelectorAll('.cb-targets').forEach(inp => {
+    inp.addEventListener('input', renderCheburcheckTargets);
+});
+document.querySelectorAll('.cb-server').forEach(cb => {
+    cbSyncRow(cb.dataset.uid);
+});
+
+// Quiet-hour fields only make sense once the window is enabled.
+function toggleQuietFields() {
+    const on = document.getElementById('cb_quiet_enabled').checked;
+    document.getElementById('cb_quiet_fields').style.display = on ? 'flex' : 'none';
+}
+document.getElementById('cb_quiet_enabled').addEventListener('change', toggleQuietFields);
+
+// Прогресс пакетного прогона: спиннер + «проверено N из M» и полоска.
+// Источник данных — progress из /api/servers/cheburcheck_flags.
+function cbProgressShow(done, total, current) {
+    const wrap = document.getElementById('cb_progress');
+    const text = document.getElementById('cb_progress_text');
+    const bar = document.getElementById('cb_progress_bar');
+    const fill = document.getElementById('cb_progress_fill');
+    if (!wrap) return;
+    const d = Math.max(0, Number(done) || 0);
+    const t = Math.max(0, Number(total) || 0);
+    wrap.style.display = 'inline-flex';
+    if (bar) bar.style.display = t ? '' : 'none';
+    if (fill) fill.style.width = (t ? Math.min(100, Math.round(d * 100 / t)) : 0) + '%';
+    if (text) {
+        const tpl = window._('cheburcheck_progress') || 'checked {done} of {total}';
+        let line = t
+            ? tpl.replace('{done}', String(d)).replace('{total}', String(t))
+            : (window._('cheburcheck_running_all') || 'checking');
+        if (current) line += ' · ' + current;
+        text.textContent = line;
+    }
+}
+
+function cbProgressHide() {
+    const wrap = document.getElementById('cb_progress');
+    const bar = document.getElementById('cb_progress_bar');
+    if (wrap) wrap.style.display = 'none';
+    if (bar) bar.style.display = 'none';
+}
+
+// Опрашиваем flags, пока прогон не закончится: шаг 2.5 с, лимит ~20 минут
+// (один сервер — до ~90 с сканирования плюс пауза между серверами).
+async function cbPollCheckProgress(total) {
+    const st = document.getElementById('cb_status');
+    for (let i = 0; i < 480; i++) {
+        await new Promise(r => setTimeout(r, 2500));
+        let flags;
+        try { flags = await apiCall('/api/servers/cheburcheck_flags', 'GET'); }
+        catch (e) { continue; }
+        const pr = (flags && flags.progress) || {};
+        cbProgressShow(pr.done || 0, pr.total || total || 0,
+                       pr.running ? (pr.current || '') : '');
+        if (!flags || !flags.running) {
+            const banned = Object.values((flags && flags.flags) || {})
+                .filter(f => f && f.status === 'banned').length;
+            cbProgressHide();
+            if (st) {
+                st.textContent = '✓ ' + (banned
+                    ? (banned + ' ' + (window._('cheburcheck_ban_badge') || 'banned'))
+                    : (window._('done') || 'done'));
+            }
+            return;
+        }
+    }
+    cbProgressHide();
+    if (st) st.textContent = (window._('cheburcheck_running_all') || 'checking') + '…';
+}
+
+// Fire the batch run in the background (each probe takes up to ~90s) and then
+// poll the flags endpoint until it reports the run finished.
+async function runAllCheburcheck() {
+    const st = document.getElementById('cb_status');
+    const text = (key, fallback) => (window._(key) || fallback);
+    if (st) st.textContent = '';
+    try {
+        const res = await apiCall('/api/servers/cheburcheck/run_all', 'POST', {});
+        if (res && res.already_running) {
+            // Прогон уже идёт (например, из другой вкладки) — показываем его прогресс.
+            cbProgressShow(0, 0, '');
+            await cbPollCheckProgress(0);
+            return;
+        }
+        if (res && res.reason === 'disabled') {
+            if (st) st.textContent = text('cheburcheck_master_off', 'Cheburcheck master switch is off');
+            return;
+        }
+        if (res && res.reason === 'no_servers') {
+            if (st) st.textContent = text('cheburcheck_none_enabled', 'no servers selected');
+            return;
+        }
+        if (res && res.reason === 'no_targets') {
+            if (st) st.textContent = text('cheburcheck_no_targets', 'no targets configured');
+            return;
+        }
+        if (res && res.reason === 'nothing_started') {
+            if (st) st.textContent = text('cheburcheck_still_running', 'check in progress');
+            return;
+        }
+        const count = (res && res.started) || 0;
+        if (!count) return;
+        cbProgressShow(0, count, '');
+        await cbPollCheckProgress(count);
+    } catch (e) {
+        cbProgressHide();
+        if (st) st.textContent = '✗ ' + (e.message || e);
+    }
+}
+// Если прогон уже идёт (запущен из другой вкладки или до перезагрузки страницы),
+// подхватываем его прогресс при открытии настроек — иначе счётчик появится
+// только после повторного нажатия кнопки.
+(async function resumeCheburcheckProgress() {
+    const master = document.getElementById('cb_enabled');
+    if (!master || !master.checked) return;
+    let flags;
+    try { flags = await apiCall('/api/servers/cheburcheck_flags', 'GET'); }
+    catch (e) { return; }
+    if (flags && flags.running) {
+        const pr = flags.progress || {};
+        cbProgressShow(pr.done || 0, pr.total || 0, pr.current || '');
+        cbPollCheckProgress(pr.total || 0);
+    }
+})();
+renderCheburcheckTargets();
+
+// ===== Subscriptions (Xray) =====
+function toggleSubscriptionFields() {
+    const on = document.getElementById('sub_enabled').checked;
+    document.getElementById('subFields').style.display = on ? 'block' : 'none';
+}
+
+function renderSubscriptionStatus(res) {
+    const box = document.getElementById('subStatus');
+    if (!box) return;
+    box.textContent = '';
+    (res.pushed || []).forEach(row => {
+        const p = document.createElement('div');
+        p.className = 'text-muted text-sm';
+        p.textContent = row.url ? `${row.username}: ${row.url}`
+            : `${row.username}: /${res.path}/${row.token} — ${row.links || 0}`;
+        box.appendChild(p);
+    });
+    (res.errors || []).forEach(text => {
+        const p = document.createElement('div');
+        p.className = 'text-muted text-sm';
+        p.textContent = '✗ ' + text;
+        box.appendChild(p);
+    });
+}
+
+async function saveSubscription() {
+    const btn = document.getElementById('subSaveBtn');
+    btn.disabled = true;
+    try {
+            const res = await apiCall('/api/settings/subscription', 'POST', {
+                enabled: document.getElementById('sub_enabled').checked,
+                server_uid: document.getElementById('subServer').value || null,
+                path: document.getElementById('subPath').value.trim() || 'sub',
+                name: document.getElementById('subName').value.trim(),
+            });
+        renderSubscriptionStatus(res);
+        showToast(_('saved') || 'Saved', 'success');
+    } catch (err) {
+        showToast((_('error') || 'Error') + ': ' + err.message, 'error');
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+async function pushSubscriptions() {
+    const btn = document.getElementById('subPushBtn');
+    btn.disabled = true;
+    try {
+        const res = await apiCall('/api/subscription/push', 'POST', {});
+        renderSubscriptionStatus(res);
+        showToast(_('saved') || 'OK', 'success');
+    } catch (err) {
+        showToast((_('error') || 'Error') + ': ' + err.message, 'error');
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+(async function loadSubscriptionStatus() {
+    if (!document.getElementById('sub_enabled') || !document.getElementById('sub_enabled').checked) return;
+    try {
+        const res = await apiCall('/api/subscription/status', 'GET');
+        renderSubscriptionStatus({path: res.path,
+            pushed: (res.urls || []).map(u => ({username: u.username, url: u.url})),
+            errors: []});
+    } catch (e) { /* the block is optional; stay quiet */ }
+})();
+</script>
 {% endblock %}

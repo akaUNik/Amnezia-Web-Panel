@@ -46,6 +46,7 @@ class DashboardReconciliationTests(unittest.IsolatedAsyncioTestCase):
                                 current['servers'][0]['name'] = 'Edited'
                             elif mutation == 'target':
                                 current['servers'][0]['password'] = 'changed'
+                                panel.save_data(current)
                             elif mutation == 'delete':
                                 current['servers'].pop(0)
                             elif mutation == 'protocol':

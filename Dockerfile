@@ -5,6 +5,11 @@ COPY --from=ghcr.io/astral-sh/uv:0.10.5 /uv /usr/local/bin/uv
 
 WORKDIR /app
 
+# curl нужен для установки acme.sh, cron — для автоматического продления сертификатов
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl cron \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install the locked runtime dependencies using the base image's Python.
 ENV UV_PYTHON_DOWNLOADS=never \
     PATH="/app/.venv/bin:$PATH"
