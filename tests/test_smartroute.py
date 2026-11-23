@@ -427,7 +427,7 @@ class ManagerFlowTests(unittest.TestCase):
         # run_sudo_command prefixes sudo to the command. Both mkdir and the
         # marker redirection must be arguments to the privileged shell.
         self.assertEqual(shlex.split(self.ssh.commands[0]), [
-            'bash', '-c',
+            'sh', '-c',
             f'mkdir -p {SMARTR_INSTANCES} && echo {SMARTR_TABLE} > {SMARTR_INSTANCES}/amnezia-awg2',
         ])
         cmds = ' '.join(self.ssh.commands)

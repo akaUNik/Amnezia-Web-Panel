@@ -738,8 +738,9 @@ pod, as below, and delete it afterwards.
    ```
 
 The same commands work from a workstation with a checkout of the same panel
-version, `pip install -r requirements.txt` and the same `PANEL_STORAGE=s3` and
-`PANEL_S3_*` variables exported.
+version. Install dependencies with `uv sync --locked --no-dev`, run the commands
+with the project virtual environment active, and export the same `PANEL_STORAGE=s3`
+and `PANEL_S3_*` variables.
 
 ### Restoring a complete backup ZIP into the bucket
 

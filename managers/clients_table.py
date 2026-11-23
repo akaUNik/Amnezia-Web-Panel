@@ -22,7 +22,7 @@ def save_clients_table(ssh, container, path, table):
     q = shlex.quote
     try:
         ssh.upload_file(json.dumps(table, indent=2), host_file)
-        _, _, code = ssh.run_command('chmod 600 -- ' + q(host_file))
+        _, _, code = ssh.run_command('chmod -- 600 ' + q(host_file))
         if code != 0:
             raise RuntimeError('Could not protect clientsTable staging')
         _, _, code = ssh.run_sudo_command(
@@ -37,12 +37,12 @@ def save_clients_table(ssh, container, path, table):
             'set -eu',
             'trap ' + q(cleanup) + ' EXIT',
             'test -f ' + q(stage) + ' && test ! -L ' + q(stage),
-            'chmod 600 -- ' + q(stage),
+            'chmod -- 600 ' + q(stage),
             'test ! -e ' + q(backup_stage),
             'test ! -d ' + q(path + '.panel-backup'),
             'if test -e ' + q(path) + '; then',
             '  cp -p -- ' + q(path) + ' ' + q(backup_stage),
-            '  chmod 600 -- ' + q(backup_stage),
+            '  chmod -- 600 ' + q(backup_stage),
             '  mv -f -- ' + q(backup_stage) + ' ' + q(path + '.panel-backup'),
             'fi',
             'mv -f -- ' + q(stage) + ' ' + q(path),
