@@ -162,6 +162,19 @@ def _client_hello(name):
 
 
 class FrontResponseTests(unittest.TestCase):
+    def test_front_reads_backend_state_outside_working_directory(self):
+        import panel_front
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'panel.json')
+            with open(path, 'w') as destination:
+                json.dump({'settings': {'panel_access': {'domain_only': True,
+                           'allowed_domain': 'private.example'}}}, destination)
+            with mock.patch.object(panel_front, '_ACCESS', {}), mock.patch.object(
+                    panel_front, '_ACCESS_STAMP', None):
+                access = panel_front.load_access(path)
+                self.assertTrue(access['domain_only'])
+                self.assertEqual(access['domain'], 'private.example')
+
     def test_front_body_matches_the_app_denial_body(self):
         import panel_front
         self.assertEqual(panel_front.NOT_FOUND_BODY, panel._PANEL_NOT_FOUND_BODY)
@@ -231,7 +244,7 @@ class FrontResponseTests(unittest.TestCase):
         probe.close()
         threading.Thread(
             target=panel_front.serve,
-            kwargs={'host': '127.0.0.1', 'port': port, 'backend': ('127.0.0.1', 1)},
+            kwargs={'data_file': '/nonexistent/front-test.json', 'host': '127.0.0.1', 'port': port, 'backend': ('127.0.0.1', 1)},
             daemon=True).start()
         sock = None
         for _ in range(100):

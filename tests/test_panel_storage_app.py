@@ -292,7 +292,7 @@ class MainBlockTests(unittest.TestCase):
                         if isinstance(node, ast.Assign)
                         and ast.unparse(node.targets[0]) == 'uvicorn_kwargs')
         launch = next(index for index, node in enumerate(body)
-                      if 'uvicorn.run(' in ast.unparse(node))
+                      if '_run_panel_server' in ast.unparse(node))
         self.assertEqual(update, assigned + 1)
         self.assertLess(update, launch)
         front = next(node for node in body if isinstance(node, ast.Assign)

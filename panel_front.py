@@ -40,16 +40,11 @@ _ACCESS = {
 _ACCESS_STAMP = None
 
 
-def _data_path():
-    return os.environ.get('DATA_FILE') or os.path.join(os.getcwd(), 'data.json')
-
-
-def load_access():
-    """Panel access settings, re-read only when data.json changed."""
+def load_access(path):
+    """Read the same resolved state file as the backend."""
     global _ACCESS, _ACCESS_STAMP
-    path = _data_path()
     try:
-        stamp = os.path.getmtime(path)
+        stamp = (path, os.stat(path).st_mtime_ns)
     except OSError:
         return _ACCESS
     if stamp == _ACCESS_STAMP:
@@ -226,7 +221,7 @@ async def _pump(reader, writer):
             pass
 
 
-async def _handle(reader, writer, backend):
+async def _handle(reader, writer, backend, data_file):
     try:
         head = await asyncio.wait_for(reader.read(4096), timeout=15)
     except Exception:
@@ -235,7 +230,7 @@ async def _handle(reader, writer, backend):
     if not head:
         _reset(writer)
         return
-    access = load_access()
+    access = load_access(data_file)
     peer = writer.get_extra_info('peername') or ('', 0)
     client_ip = str(peer[0] or '')
     loopback = client_ip in ('127.0.0.1', '::1')
@@ -261,12 +256,12 @@ async def _handle(reader, writer, backend):
     await asyncio.gather(_pump(reader, back_writer), _pump(back_reader, writer))
 
 
-def serve(host='0.0.0.0', port=5000, backend=('127.0.0.1', 5001)):
+def serve(*, data_file, host='0.0.0.0', port=5000, backend=('127.0.0.1', 5001)):
     """Run the front forever (blocking)."""
 
     async def main():
         server = await asyncio.start_server(
-            lambda r, w: _handle(r, w, backend), host, port)
+            lambda r, w: _handle(r, w, backend, data_file), host, port)
         async with server:
             await server.serve_forever()
 

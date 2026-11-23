@@ -79,6 +79,7 @@ jobs:
         uv run --locked --no-dev --group build pyinstaller --name Amnezia-Web-Panel-Linux \
           --add-data "static:static" \
           --add-data "templates:templates" \
+          --add-data "public_port_forward.py:." \
           --add-data "translations:translations" \
           --hidden-import uvicorn \
           --hidden-import fastapi \
@@ -94,6 +95,7 @@ jobs:
         uv run --locked --no-dev --group build pyinstaller --name Amnezia-Web-Panel-Windows `
           --add-data "static;static" `
           --add-data "templates;templates" `
+          --add-data "public_port_forward.py;." `
           --add-data "translations;translations" `
           --hidden-import uvicorn `
           --hidden-import fastapi `

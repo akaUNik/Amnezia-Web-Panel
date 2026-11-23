@@ -48,8 +48,8 @@ AllowedIPs = 10.8.1.3/32
 # depending on whatever data.json happens to contain (CI has one server).
 COPY_PANEL_DATA = {
     'servers': [
-        {'name': 'SRC', 'host': '192.0.2.1'},
-        {'name': 'DST', 'host': '192.0.2.2'},
+        {'uid': 'src', 'name': 'SRC', 'host': '192.0.2.1'},
+        {'uid': 'dst', 'name': 'DST', 'host': '192.0.2.2'},
     ],
     'user_connections': [],
 }
@@ -427,6 +427,15 @@ class CopyRollbackTests(unittest.TestCase):
         self.assertTrue(listening)
         self.assertEqual(peers, 2)
 
+    def test_partial_upload_is_removed_from_private_staging(self):
+        target = FakeSSH()
+        copier = InstanceCopier(FakeSSH(), target)
+        with patch.object(copier, '_sftp_put', side_effect=OSError('interrupted')) as upload:
+            with self.assertRaises(OSError):
+                copier._push_state(self.plan(), 'local.tar')
+        upload.assert_called_once_with(target, 'local.tar', '/tmp/amnezia-private.test/state.tar')
+        self.assertIn('rm -rf -- /tmp/amnezia-private.test', target.commands)
+
     def test_export_hands_the_archive_to_the_ssh_user(self):
         """A non-root sudo account must be able to read the exported tar."""
         source = FakeSSH()
@@ -455,7 +464,7 @@ class PanelMergeTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.data_path = os.path.join(self.tmp.name, 'data.json')
         source = {
-            'name': 'NATA',
+            'uid': 'src', 'name': 'NATA',
             'host': '192.0.2.10',
             'protocols': {
                 'awg3': {
@@ -471,7 +480,7 @@ class PanelMergeTests(unittest.TestCase):
                 },
             },
         }
-        target = {'name': 'MAMKAM', 'host': '192.0.2.20', 'protocols': {}}
+        target = {'uid': 'dst', 'name': 'MAMKAM', 'host': '192.0.2.20', 'protocols': {}}
         connections = [
             {'id': 'c1', 'user_id': 'u1', 'server_id': 0, 'protocol': 'awg3',
              'client_id': 'key1=', 'name': 'phone', 'created_at': '2026-01-01T00:00:00',
@@ -492,11 +501,11 @@ class PanelMergeTests(unittest.TestCase):
         self.addCleanup(self.patch.stop)
 
     def plan(self):
-        return {'target_key': 'awg3__2', 'target_container': 'amnezia-awg3-2',
+        return {'operation_id': 'copy-test', 'target_key': 'awg3__2', 'target_container': 'amnezia-awg3-2',
                 'target_index': 2, 'port': 6000, 'base': 'awg3'}
 
     def test_apply_copies_the_protocol_and_zeroes_traffic(self):
-        copied = self.app._instance_copy_apply(self.plan(), 0, 1, 'awg3')
+        copied = self.app._instance_copy_apply(self.plan(), 'src', 'dst', 'awg3')
         self.assertEqual(copied, 2)
 
         data = json.loads(Path(self.data_path).read_text(encoding='utf-8'))
@@ -526,17 +535,28 @@ class PanelMergeTests(unittest.TestCase):
             self.assertTrue(connection['accounting_unowned'])
             self.assertNotIn(connection['id'], ('c1', 'c2'))
 
+    def test_removed_target_cannot_retarget_copy_or_rollback(self):
+        path = Path(self.data_path)
+        data = json.loads(path.read_text())
+        data['servers'][1]['uid'] = 'replacement'
+        path.write_text(json.dumps(data))
+        before = path.read_bytes()
+        with self.assertRaises(InstanceCopyError):
+            self.app._instance_copy_apply(self.plan(), 'src', 'dst', 'awg3')
+        self.app._instance_copy_rollback_panel(self.plan(), 'dst')
+        self.assertEqual(path.read_bytes(), before)
+
     def test_apply_refuses_a_taken_instance_name(self):
         data = json.loads(Path(self.data_path).read_text(encoding='utf-8'))
         data['servers'][1]['protocols']['awg3__2'] = {'container_name': 'x'}
         Path(self.data_path).write_text(json.dumps(data), encoding='utf-8')
         with self.assertRaises(InstanceCopyError) as caught:
-            self.app._instance_copy_apply(self.plan(), 0, 1, 'awg3')
+            self.app._instance_copy_apply(self.plan(), 'src', 'dst', 'awg3')
         self.assertEqual(caught.exception.code, 'name_taken')
 
     def test_rollback_removes_the_instance_and_its_connections(self):
-        self.app._instance_copy_apply(self.plan(), 0, 1, 'awg3')
-        self.app._instance_copy_rollback_panel(self.plan(), 1)
+        self.app._instance_copy_apply(self.plan(), 'src', 'dst', 'awg3')
+        self.app._instance_copy_rollback_panel(self.plan(), 'dst')
         data = json.loads(Path(self.data_path).read_text(encoding='utf-8'))
         self.assertNotIn('awg3__2', data['servers'][1]['protocols'])
         self.assertFalse([c for c in data['user_connections']
@@ -546,12 +566,12 @@ class PanelMergeTests(unittest.TestCase):
 
     def test_rollback_keeps_an_instance_it_did_not_create(self):
         """A concurrent install took the key first: do not delete its work."""
-        self.app._instance_copy_apply(self.plan(), 0, 1, 'awg3')
+        self.app._instance_copy_apply(self.plan(), 'src', 'dst', 'awg3')
         data = json.loads(Path(self.data_path).read_text(encoding='utf-8'))
-        data['servers'][1]['protocols']['awg3__2']['container_name'] = 'amnezia-awg3-9'
+        data['servers'][1]['protocols']['awg3__2']['copy_operation_id'] = 'another-copy'
         Path(self.data_path).write_text(json.dumps(data), encoding='utf-8')
 
-        self.app._instance_copy_rollback_panel(self.plan(), 1)
+        self.app._instance_copy_rollback_panel(self.plan(), 'dst')
 
         data = json.loads(Path(self.data_path).read_text(encoding='utf-8'))
         self.assertIn('awg3__2', data['servers'][1]['protocols'])
@@ -683,7 +703,7 @@ class CopyWorkerTests(unittest.IsolatedAsyncioTestCase):
     async def run_worker(self):
         op_id = 'op-1'
         self.app._inst_copy_ops[op_id] = {
-            'id': op_id, 'source_server_id': 0, 'target_server_id': 1,
+            'id': op_id, 'source_uid': 'src', 'target_uid': 'dst',
             'protocol': 'awg3', 'state': 'running', 'lines': [], 'result': None,
             'error': None, 'cancel_requested': False, 'step': 0, 'total': 8,
             'percent': 0,

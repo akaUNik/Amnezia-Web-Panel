@@ -94,12 +94,11 @@ class PanelBindHostTests(unittest.TestCase):
                         bind.assert_not_called()
                     else:
                         bind.assert_called_once_with(ssl)
-        calls = [node for node in ast.walk(startup) if isinstance(node, ast.Call)
-                 and isinstance(node.func, ast.Attribute) and node.func.attr == 'run'
-                 and isinstance(node.func.value, ast.Name) and node.func.value.id == 'uvicorn']
-        self.assertEqual(len(calls), 2, 'check backend launch in both modes')
-        for call in calls:
-            self.assertEqual(ast.unparse(call), 'uvicorn.run(**uvicorn_kwargs)')
+        launch = startup.body[-1]
+        self.assertIsInstance(launch, ast.If)
+        self.assertIn('target=_run_panel_server, args=(uvicorn_kwargs,)', ast.unparse(launch))
+        self.assertIn('data_file=DATA_FILE', ast.unparse(launch.body[-1]))
+        self.assertEqual(ast.unparse(launch.orelse[0]), '_run_panel_server(uvicorn_kwargs)')
 
     def test_settings_save_preserves_the_explicit_bind_choice(self):
         request = panel.SaveSettingsRequest(

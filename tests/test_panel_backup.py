@@ -133,6 +133,22 @@ class ArchiveTests(StateFixture, unittest.TestCase):
         self.assertNotIn('before_base64', record)
         self.assertIn('before_sealed', record)
 
+    def test_encrypted_state_requires_its_matching_key(self):
+        key = Path(default_key_path(self.data))
+        key.unlink()
+        for content in (None, os.urandom(32)):
+            with self.subTest(missing=content is None):
+                if content is not None:
+                    recovery.atomic_bytes(key, content)
+                with self.assertRaisesRegex(backup.BackupError, 'archive_credential_key_unusable'):
+                    self.create()
+
+    def test_recovery_only_archive_requires_its_key(self):
+        self.data.write_text('{"servers":[],"users":[]}')
+        Path(default_key_path(self.data)).unlink()
+        with self.assertRaisesRegex(backup.BackupError, 'archive_credential_key_unusable'):
+            self.create()
+
     def test_system_pins_included_and_missing_panel_pins_explicit(self):
         self.trust.replace(self.system)
         manifest, files, _ = backup.read_archive(self.archive())

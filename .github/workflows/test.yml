@@ -58,6 +58,8 @@ jobs:
     if: github.event_name != 'workflow_dispatch' || !inputs.qualify_published
     runs-on: ubuntu-latest
 
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
     strategy:
       matrix:
         python-version: ['3.11', '3.13']
@@ -84,6 +86,12 @@ jobs:
 
     - name: Run unit tests
       run: uv run --locked python -m scripts.ci.tests
+
+    - name: Verify public forwarding in a private Linux network namespace
+      run: |
+        sudo env PUBLIC_FORWARD_LAB_HOST_NETNS="$(stat -Lc %i /proc/self/ns/net)" \
+          PUBLIC_FORWARD_LAB_NONROOT_UID="$(id -u)" unshare --net \
+          "$PWD/.venv/bin/python" -m unittest -v tests.test_public_endpoint_dnat.NamespaceDnatTests
 
     - name: Verify backup and peer regressions as root with isolated state
       run: |

@@ -16,7 +16,7 @@ import zipfile
 import zlib
 
 from peer_recovery import STATE_FILE_LOCK, RecoveryStore, DISASTER_HOLD, digest
-from credential_store import default_key_path
+from credential_store import CredentialError, CredentialStore, default_key_path
 
 MAX_FILE_BYTES = 32 * 1024 * 1024
 MAX_TOTAL_BYTES = 128 * 1024 * 1024
@@ -189,6 +189,25 @@ def _require_migrated_content(name, raw):
             raise BackupError('legacy_recovery_snapshot_requires_migration')
 
 
+def _check_sealed_content(name, raw, store):
+    try:
+        if name == 'state/data.json':
+            for server in _json(raw)['servers']:
+                if isinstance(server, dict) and 'ssh_credentials' in server:
+                    if not server['ssh_credentials']:
+                        raise BackupError('invalid_credential_envelope')
+                    store.resolve(server)
+        elif name.startswith('state/data.json.recovery/') and name.endswith('.json'):
+            record = _json(raw)
+            if 'before_sealed' in record:
+                store.open_bytes(record['before_sealed'], 'recovery-before')
+            snapshot = record.get('peer_creates_snapshot')
+            if isinstance(snapshot, dict) and 'sealed' in snapshot:
+                store.open_bytes(snapshot['sealed'], 'peer-creates-snapshot')
+    except CredentialError as exc:
+        raise BackupError('archive_credential_key_unusable') from exc
+
+
 class ArchiveJob:
     """Anonymous private tempfile: OS closes/unlinks it even on process exit."""
     def __init__(self):
@@ -210,12 +229,16 @@ class ArchiveJob:
                         raise BackupError('state_busy')
                     stack.callback(lock.release)
                 entries, absent = _entries(data_file, trust_file, system_trust)
+                store = CredentialStore(default_key_path(data_file))
                 self.file = tempfile.TemporaryFile(mode='w+b')
                 if hasattr(os, 'fchmod'):
                     os.fchmod(self.file.fileno(), 0o600)
                 records, stamps, total = [], {}, 0
                 with zipfile.ZipFile(self.file, 'w', zipfile.ZIP_DEFLATED, compresslevel=3) as archive:
-                    for name, path in sorted(entries.items()):
+                    # Capture the key's file stamp before checking any envelopes.
+                    key_member = 'state/data.json.credential.key'
+                    for name in sorted(entries, key=lambda n: (n != key_member, n)):
+                        path = entries[name]
                         _member(name)
                         raw, stamps[name] = _read(path)
                         total += len(raw)
@@ -223,6 +246,7 @@ class ArchiveJob:
                             raise BackupError('state_too_large')
                         _validate_content(name, raw)
                         _require_migrated_content(name, raw)
+                        _check_sealed_content(name, raw, store)
                         archive.writestr(name, raw)
                         records.append({'path': name, 'size': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()})
                     # Also detect unmanaged replacements/creations during the read.
@@ -348,6 +372,10 @@ def stage_restore(archive, destination, confirmation):
             from peer_recovery import atomic_bytes
             atomic_bytes(target, raw)
         data_file = stage / 'state/data.json'
+        # Older archives may have omitted or mixed up their key.
+        store = CredentialStore(stage / 'state/data.json.credential.key')
+        for name, raw in files.items():
+            _check_sealed_content(name, raw, store)
         before = data_file.read_bytes()
         data = _json(before)
         operation = uuid.uuid4().hex

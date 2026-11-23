@@ -11330,18 +11330,25 @@ def _instance_copy_source(data, server_id, protocol):
     return server, entry, container
 
 
-def _instance_copy_apply(plan, source_server_id, target_server_id, source_protocol):
+def _instance_copy_server(data, uid):
+    index, server = find_server_by_uid(data, uid)
+    if server is None:
+        raise InstanceCopyError('server_not_found', 'Copy server no longer exists')
+    return index, server
+
+
+def _instance_copy_apply(plan, source_uid, target_uid, source_protocol):
     """Write the copied instance and its user bindings into data.json."""
     data = load_data()
-    if target_server_id < 0 or target_server_id >= len(data.get('servers', [])):
-        raise InstanceCopyError('server_not_found', 'Target server not found')
-    source_entry = data['servers'][source_server_id]['protocols'][source_protocol]
-    target = data['servers'][target_server_id]
+    source_server_id, source = _instance_copy_server(data, source_uid)
+    target_server_id, target = _instance_copy_server(data, target_uid)
+    source_entry = source['protocols'][source_protocol]
     protocols = target.setdefault('protocols', {})
     if plan['target_key'] in protocols:
         raise InstanceCopyError('name_taken', 'Target instance name is already in use')
 
     entry = copy_module.deepcopy(source_entry)
+    entry['copy_operation_id'] = plan['operation_id']
     entry['container_name'] = plan['target_container']
     entry['instance'] = plan['target_index']
     entry['port'] = str(plan['port'])
@@ -11386,14 +11393,15 @@ def _instance_copy_apply(plan, source_server_id, target_server_id, source_protoc
     return copied
 
 
-def _instance_copy_rollback_panel(plan, target_server_id):
+def _instance_copy_rollback_panel(plan, target_uid):
     try:
         data = load_data()
-        target = data['servers'][target_server_id]
+        target_server_id, target = find_server_by_uid(data, target_uid)
+        if target is None:
+            return
         protocols = target.get('protocols') or {}
         entry = protocols.get(plan['target_key'])
-        if (isinstance(entry, dict)
-                and entry.get('container_name') != plan['target_container']):
+        if not isinstance(entry, dict) or entry.get('copy_operation_id') != plan['operation_id']:
             # A concurrent install took the same key after planning: that
             # instance is not ours, so keep it and its user bindings.
             return
@@ -11434,13 +11442,9 @@ async def _run_instance_copy(op_id):
 
     try:
         data = load_data()
-        source_server, _entry, container = _instance_copy_source(
-            data, op['source_server_id'], op['protocol'])
-        if op['target_server_id'] < 0 or op['target_server_id'] >= len(data.get('servers') or []):
-            # The panel state may change between the start request and the
-            # worker (a server removed in between must not crash the task).
-            raise InstanceCopyError('server_not_found', 'Target server not found')
-        target_server = data['servers'][op['target_server_id']]
+        source_id, _ = _instance_copy_server(data, op['source_uid'])
+        source_server, _entry, container = _instance_copy_source(data, source_id, op['protocol'])
+        _, target_server = _instance_copy_server(data, op['target_uid'])
         log('planning', 'connecting to %s and %s' % (
             source_server.get('name') or source_server['host'],
             target_server.get('name') or target_server['host']))
@@ -11452,6 +11456,7 @@ async def _run_instance_copy(op_id):
         copier = InstanceCopier(source_ssh, target_ssh)
         plan = await asyncio.to_thread(
             copier.plan, op['protocol'], container, target_server.get('protocols') or {})
+        plan['operation_id'] = op_id
         op['target_key'] = plan['target_key']
         op['target_container'] = plan['target_container']
         op['port'] = plan['port']
@@ -11467,8 +11472,8 @@ async def _run_instance_copy(op_id):
             # copy snapshot.
             async with DATA_LOCK:
                 copied = await asyncio.to_thread(
-                    _instance_copy_apply, plan, op['source_server_id'],
-                    op['target_server_id'], op['protocol'])
+                    _instance_copy_apply, plan, op['source_uid'],
+                    op['target_uid'], op['protocol'])
         except Exception:
             # The container exists but the panel cannot record it: drop the
             # partial panel entry under the same lock the successful write
@@ -11476,7 +11481,7 @@ async def _run_instance_copy(op_id):
             # then remove the container.
             async with DATA_LOCK:
                 await asyncio.to_thread(
-                    _instance_copy_rollback_panel, plan, op['target_server_id'])
+                    _instance_copy_rollback_panel, plan, op['target_uid'])
             await asyncio.to_thread(copier.destroy, plan)
             raise
         result['connections'] = copied
@@ -11573,8 +11578,8 @@ async def api_instance_copy_start(request: Request, server_id: int, req: Instanc
     op_id = uuid.uuid4().hex
     op = {
         'id': op_id,
-        'source_server_id': server_id,
-        'target_server_id': req.target_server_id,
+        'source_uid': data['servers'][server_id]['uid'],
+        'target_uid': data['servers'][req.target_server_id]['uid'],
         'protocol': req.protocol,
         'state': 'running',
         'lines': [],
@@ -12191,7 +12196,7 @@ def public_port_forward_commands(protocol, public_port, listen_port, old_public_
                'server_uid': server_uid, 'l4': l4, 'listen_port': listen_port,
                'public_port': public_port, 'old_public_port': old_public_port,
                'scopes': {k: (v if v is not None else ['']) for k, v in fam.items()}}
-    with open(public_port_forward.__file__, encoding='utf-8') as f:
+    with open(os.path.join(os.path.dirname(__file__), 'public_port_forward.py'), encoding='utf-8') as f:
         source = f.read()
     return ['python3 -c ' + shlex.quote(source) + ' ' + shlex.quote(json.dumps(request))], ''
 
@@ -15208,7 +15213,11 @@ async def _save_settings(request: Request, payload: SaveSettingsRequest):
 
 # ----- DuckDNS: free domain + one-click auto-renewed Let's Encrypt cert -----
 
-DUCKDNS_CERT_DIR = '/etc/amnezia'
+DUCKDNS_STATE_DIR = os.environ.get('PANEL_DUCKDNS_STATE_DIR')
+DUCKDNS_CERT_DIR = DUCKDNS_STATE_DIR or '/etc/amnezia'
+DUCKDNS_ACME_HOME = (os.path.join(DUCKDNS_STATE_DIR, 'acme') if DUCKDNS_STATE_DIR
+                     else os.path.expanduser('~/.acme.sh'))
+_DUCKDNS_ACME_LOCK = threading.Lock()
 DUCKDNS_UPDATE_INTERVAL = 600
 
 
@@ -15239,24 +15248,27 @@ def _duckdns_update_ip(domain, token):
 
 
 def _duckdns_issue_cert(domain, token):
-    """Issue a Let's Encrypt cert via acme.sh DNS-01 (duckdns plugin) and
-    install it where the panel ssl settings expect. acme.sh drops its own
-    cron entry, so renewal (and the panel restart via --reloadcmd under
-    systemd) is automatic from then on. Returns (ok, log_tail)."""
+    """Issue and install the DuckDNS certificate. Containers schedule renewal
+    in the panel monitor, while standalone Linux hosts use acme.sh cron."""
     if os.name == 'nt':
         return False, 'DuckDNS auto-cert is supported on Linux panel hosts only'
-    acme = os.path.expanduser('~/.acme.sh/acme.sh')
+    acme = os.path.join(DUCKDNS_ACME_HOME, 'acme.sh')
+    acme_cmd = [acme, '--home', DUCKDNS_ACME_HOME]
     logs = []
     if not os.path.exists(acme):
+        install_args = ['email=admin@' + domain]
+        if DUCKDNS_STATE_DIR:
+            os.makedirs(DUCKDNS_STATE_DIR, mode=0o700, exist_ok=True)
+            install_args.extend(['--home', DUCKDNS_ACME_HOME, '--nocron'])
         inst = subprocess.run(
-            'curl -s https://get.acme.sh | sh -s email=admin@%s' % domain,
+            'curl -fsSL https://get.acme.sh | sh -s -- ' + shlex.join(install_args),
             shell=True, capture_output=True, text=True, timeout=300)
         logs.append(((inst.stdout or '') + (inst.stderr or ''))[-2000:])
         if not os.path.exists(acme):
             return False, 'acme.sh install failed:\n' + '\n'.join(logs)
     env = dict(os.environ, DuckDNS_Token=token)
     issue = subprocess.run(
-        [acme, '--issue', '--dns', 'dns_duckdns', '-d', domain,
+        acme_cmd + ['--issue', '--dns', 'dns_duckdns', '-d', domain,
          '--server', 'letsencrypt'],
         capture_output=True, text=True, timeout=300, env=env)
     logs.append(((issue.stdout or '') + (issue.stderr or ''))[-4000:])
@@ -15267,7 +15279,7 @@ def _duckdns_issue_cert(domain, token):
     os.makedirs(DUCKDNS_CERT_DIR, exist_ok=True)
     key_file = os.path.join(DUCKDNS_CERT_DIR, 'duckdns.key.pem')
     cert_file = os.path.join(DUCKDNS_CERT_DIR, 'duckdns.cert.pem')
-    cmd = [acme, '--install-cert', '-d', domain,
+    cmd = acme_cmd + ['--install-cert', '-d', domain,
            '--key-file', key_file, '--fullchain-file', cert_file]
     if os.environ.get('INVOCATION_ID'):
         # renewed/installed cert -> restart the panel so uvicorn picks it up.
@@ -15308,7 +15320,8 @@ def api_duckdns_apply(request: Request, payload: DuckDNSApplyRequest):
             return JSONResponse(
                 {'error': 'duckdns_ip_update_failed', 'detail': detail},
                 status_code=502)
-        ok, log = _duckdns_issue_cert(domain, token)
+        with _DUCKDNS_ACME_LOCK:
+            ok, log = _duckdns_issue_cert(domain, token)
         if not ok:
             save_data(data)
             return JSONResponse(
@@ -15337,17 +15350,69 @@ def api_duckdns_apply(request: Request, payload: DuckDNSApplyRequest):
 
 
 _duckdns_monitor_started = False
+_reload_duckdns_tls = None
+
+
+def _run_panel_server(options):
+    global _reload_duckdns_tls
+    if not DUCKDNS_STATE_DIR or options.get('ssl_certfile') != os.path.join(
+            DUCKDNS_CERT_DIR, 'duckdns.cert.pem'):
+        uvicorn.run(**options)
+        return
+
+    config = uvicorn.Config(**options)
+    config.load()
+    active_context = config.ssl
+
+    def select_context(connection, server_name, initial_context):
+        connection.context = active_context
+
+    def reload_certificate():
+        # Publish the replacement only after OpenSSL validates the cert/key pair.
+        # Existing TLS sessions can finish using the previous context.
+        nonlocal active_context
+        active_context = uvicorn.config.create_ssl_context(
+            config.ssl_certfile, config.ssl_keyfile, config.ssl_keyfile_password,
+            config.ssl_version, config.ssl_cert_reqs, config.ssl_ca_certs, config.ssl_ciphers)
+
+    config.ssl.sni_callback = select_context
+    _reload_duckdns_tls = reload_certificate
+    try:
+        uvicorn.Server(config).run()
+    finally:
+        _reload_duckdns_tls = None
+
+
+def _duckdns_renew(domain, token):
+    """acme.sh installs a renewed certificate at the paths saved by --install-cert."""
+    acme = os.path.join(DUCKDNS_ACME_HOME, 'acme.sh')
+    with _DUCKDNS_ACME_LOCK:
+        result = subprocess.run([acme, '--home', DUCKDNS_ACME_HOME, '--renew', '-d', domain],
+                                env=dict(os.environ, DuckDNS_Token=token),
+                                capture_output=True, timeout=300)
+    if result.returncode not in (0, 2):
+        raise RuntimeError(f'acme.sh renewal exited with {result.returncode}')
 
 
 def _duckdns_monitor_loop():
-    """Keep the duckdns record pointed at this server's current public IP."""
+    """Update the DNS record and check container-managed certificates daily."""
+    next_renewal = 0
     while True:
         try:
-            d = load_data().get('settings', {}).get('duckdns', {}) or {}
+            settings = load_data().get('settings', {})
+            d = settings.get('duckdns') or {}
             if d.get('enabled') and d.get('domain') and d.get('token'):
                 ok, detail = _duckdns_update_ip(d['domain'], d['token'])
                 if not ok:
                     logger.warning(f"duckdns monitor: ip update failed: {detail}")
+                if DUCKDNS_STATE_DIR and time.monotonic() >= next_renewal:
+                    _duckdns_renew(d['domain'], d['token'])
+                    # The running server owns the TLS context. Reload even after
+                    # acme.sh reports "not due" to retry an interrupted reload.
+                    reload_tls = _reload_duckdns_tls
+                    if reload_tls:
+                        reload_tls()
+                    next_renewal = time.monotonic() + 24 * 3600
         except Exception as e:
             logger.warning(f"duckdns monitor loop: {e}")
         time.sleep(DUCKDNS_UPDATE_INTERVAL)
@@ -15991,9 +16056,9 @@ if __name__ == '__main__':
 
     if front_enabled:
         import panel_front
-        threading.Thread(target=lambda: uvicorn.run(**uvicorn_kwargs), daemon=True).start()
+        threading.Thread(target=_run_panel_server, args=(uvicorn_kwargs,), daemon=True).start()
         logger.info(f"Panel front on 0.0.0.0:{public_port} -> 127.0.0.1:{internal_port}")
-        panel_front.serve(host='0.0.0.0', port=public_port,
+        panel_front.serve(data_file=DATA_FILE, host='0.0.0.0', port=public_port,
                           backend=('127.0.0.1', internal_port))
     else:
-        uvicorn.run(**uvicorn_kwargs)
+        _run_panel_server(uvicorn_kwargs)

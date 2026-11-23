@@ -449,10 +449,10 @@ class InstanceCopier:
     def _push_state(self, plan, archive_path, check=None):
         if check:
             check()
-        token = os.urandom(6).hex()
-        remote_tar = '/tmp/amnezia-copy-%s.tar' % token
-        self._sftp_put(self.target_ssh, archive_path, remote_tar)
+        stage = self.target_ssh._make_private_temp_dir()
+        remote_tar = stage + '/state.tar'
         try:
+            self._sftp_put(self.target_ssh, archive_path, remote_tar)
             inner = 'docker cp %s %s:/tmp/amnezia-state.tar' % (
                 shlex.quote(remote_tar), shlex.quote(plan['target_container']))
             out, err, code = self._sudo(
@@ -470,7 +470,7 @@ class InstanceCopier:
             if code != 0:
                 raise InstanceCopyError('upload_failed', err or out or 'Cannot unpack the state')
         finally:
-            self._sudo(self.target_ssh, 'rm -f ' + shlex.quote(remote_tar))
+            self._sudo(self.target_ssh, 'rm -rf -- ' + shlex.quote(stage))
 
     def _restart_container(self, plan):
         # The container was created with `docker run -d` and its start script

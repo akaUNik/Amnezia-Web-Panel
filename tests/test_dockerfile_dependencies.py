@@ -1,17 +1,15 @@
 import pathlib
-import re
 import unittest
 
 
 class DockerfileDependencyTests(unittest.TestCase):
     def test_panel_image_contains_acme_runtime_dependencies(self):
-        dockerfile = (pathlib.Path(__file__).resolve().parents[1] / 'Dockerfile').read_text(
-            encoding='utf-8')
-        install = re.search(r'apt-get install[^;\n]*(?:\\\n[^;\n]*)*', dockerfile)
-        self.assertIsNotNone(install, 'Dockerfile must install acme.sh runtime dependencies')
-        packages = set(re.findall(r'(?<![\w-])[a-z0-9][a-z0-9+.-]*(?![\w-])', install.group()))
-        self.assertIn('curl', packages)
-        self.assertIn('cron', packages)
+        root = pathlib.Path(__file__).resolve().parents[1]
+        for image in ('Dockerfile', 'Dockerfile.warp'):
+            with self.subTest(image=image):
+                dockerfile = (root / image).read_text(encoding='utf-8')
+                self.assertRegex(dockerfile, r'(?s)apt-get install.*?\bcurl\b')
+                self.assertIn('PANEL_DUCKDNS_STATE_DIR=/app/data/duckdns', dockerfile)
 
 
 if __name__ == '__main__':

@@ -254,6 +254,11 @@ Cloudflare volume. Upgrading the image keeps the existing Compose project
 name and `amnezia_data` volume. Avoid `docker compose down -v`, which deletes
 persistent volumes. Back up state before upgrading or rolling back.
 
+Both Compose images keep DuckDNS certificates and the acme.sh account in
+`/app/data/duckdns` on the panel data volume. After the first certificate is
+issued, run `docker compose restart amnezia_panel` to enable HTTPS. The panel
+checks renewal daily and loads renewed certificates for new TLS connections.
+
 Select a known version or digest for rollback without deleting volumes:
 
 ```bash

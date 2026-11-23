@@ -51,7 +51,7 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["playwright==1.62.0"]
+dev = ["playwright==1.62.0", "moto[s3]>=5,<6"]
 build = ["pyinstaller>=6,<7"]
 
 [tool.uv]

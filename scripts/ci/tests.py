@@ -19,10 +19,12 @@ def main():
                           SECRET_KEY='isolated-ci-fixture')
         suite=unittest.defaultTestLoader.discover('tests')
         result=unittest.TextTestRunner(verbosity=2).run(suite)
-        # The pre-existing pytest-only live-server module is outside unittest's
-        # required synthetic coverage. All other skipped groups are failures.
+        # CI runs the privileged namespace cases in a separate unshare step.
         required_skips=[(test,reason) for test,reason in result.skipped
-                        if not test.id().endswith('.test_playwright_e2e')]
+                        if not test.id().endswith('.test_playwright_e2e')
+                        and not (test.__class__.__module__ == 'test_public_endpoint_dnat'
+                                 and test.__class__.__name__ == 'NamespaceDnatTests'
+                                 and not os.environ.get('PUBLIC_FORWARD_LAB_HOST_NETNS'))]
         if required_skips:
             print('Required regression groups skipped:',required_skips)
         raise SystemExit(not result.wasSuccessful() or bool(required_skips))
