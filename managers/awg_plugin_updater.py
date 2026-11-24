@@ -47,12 +47,19 @@ KERNEL_MODULE = 'kernel_module'
 USERSPACE = 'userspace'
 COMPONENTS = (KERNEL_MODULE, USERSPACE)
 
-#: ``v3.1.20260812`` -> ``3.1.20260812``.  Anything else is not offered as an
-#: update target: release names, ``latest`` and free-form tags are rejected so
-#: a malicious or renamed tag can never be passed to a shell script.
-TAG_RE = re.compile(r'^v?(\d+\.\d+\.\d{8})$')
+#: ``v3.1.20260812`` -> ``3.1.20260812``.  Upstream also republishes a fixed
+#: build of the same date with a numeric suffix (``v3.1.20261113-02``); the
+#: suffix names a different tarball, so it must be kept — dropping it hides the
+#: rebuild and leaves servers on the broken build forever.  Anything else is
+#: not offered as an update target: release names, ``latest`` and free-form
+#: tags are rejected so a renamed tag can never reach a shell script, and the
+#: surviving character set stays ``[0-9.]`` plus one ``-<digits>``.
+TAG_RE = re.compile(r'^v?(\d+\.\d+\.\d{8})(?:-(\d+))?$')
 
-_VERSION_RE = re.compile(r'(\d+\.\d+\.\d{8})')
+#: Matches both ``3.1.20261113`` and ``3.1.20261113-02``.  The suffix matters:
+#: ``_update_kernel`` compares it against the loaded module version, and
+#: ``installed_versions`` must not report a rebuild as the base version.
+_VERSION_RE = re.compile(r'(\d+\.\d+\.\d{8}(?:-\d+)?)')
 
 #: GitHub tag listings change slowly; one lookup per component per process is
 #: plenty and keeps the status endpoint from being rate limited.
@@ -61,6 +68,8 @@ _tag_cache = {}
 
 CONTAINER_CONFIG_DIR = '/opt/amnezia'
 CONTAINER_CONFIG_SUBDIR = '/opt/amnezia/awg'
+UPDATER_BACKUP_TMP = '/tmp/awp-updater-warp-exclude.tgz'
+UPDATER_RESTORE_TMP = '/tmp/awp-restore.tgz'
 KERNEL_BACKUP_DIR = '/var/lib/amnezia-plugin'
 DOCKER_NETWORK_SKIP = ('bridge', 'host', 'none')
 
@@ -101,18 +110,33 @@ class PluginUpdateError(Exception):
 
 
 def parse_tag(tag):
-    """Return the bare version from a release tag, or ``None``."""
+    """Return the bare version from a release tag, or ``None``.
+
+    ``v3.1.20261113-02`` -> ``3.1.20261113-02``.  The numeric suffix is part
+    of the version, not decoration: it names a different source tarball and
+    has to survive into ``git clone --branch`` and into the DKMS version.
+    """
     match = TAG_RE.match((tag or '').strip())
-    return match.group(1) if match else None
+    if not match:
+        return None
+    base, build = match.group(1), match.group(2)
+    return '%s-%s' % (base, build) if build else base
 
 
 def version_tuple(version):
-    """Comparable ``(major, minor, date)`` tuple, or ``None``."""
+    """Comparable ``(major, minor, date, build)`` tuple, or ``None``.
+
+    ``build`` is ``0`` for a plain tag, so ``3.1.20261113-02`` sorts above
+    ``3.1.20261113`` and ``-10`` above ``-02``.  All tuples have the same
+    arity, so the existing ``sorted(..., key=version_tuple)`` and ``<``
+    comparisons keep working unchanged.
+    """
     parsed = parse_tag(version)
     if not parsed:
         return None
-    major, minor, date = parsed.split('.')
-    return int(major), int(minor), int(date)
+    base, _, build = parsed.partition('-')
+    major, minor, date = base.split('.')
+    return int(major), int(minor), int(date), int(build or 0)
 
 
 def pick_latest(tags):
@@ -531,7 +555,56 @@ class AwgPluginUpdater:
         'pacman': {'dkms': 'dkms', 'gcc': 'gcc', 'make': 'make', 'git': 'git'},
     }
 
-    def _install(self, manager, packages, log):
+    #: ``apt-get install`` works from the package lists downloaded last time.
+    #: A point release moves the pool to newer builds, so those lists name
+    #: versions that no longer exist and the install dies with 404 lines for
+    #: packages that are present in a different build.  These markers therefore
+    #: mean "the lists are stale", and the cure is ``apt-get update`` + retry.
+    #: "Unable to locate package" covers hosts whose list predates the package
+    #: itself, where there is no 404 line at all.
+    STALE_APT_RE = re.compile(
+        r'404\s+not found|failed to fetch|unable to fetch some archives'
+        r'|unable to locate package|no installation candidate'
+    )
+
+    #: DKMS wording differs between releases (2.8 on Ubuntu, 3.x on Debian),
+    #: so the "this version is already registered" check covers all of them.
+    ALREADY_REGISTERED_RE = re.compile(r'already (?:contains|added|exists|registered)')
+
+    #: A dead mirror must not hold the whole update: apt's defaults keep
+    #: retrying for minutes, and the SSH transport is shared with the status
+    #: requests of the same server.
+    APT_NET_OPTIONS = (
+        '-o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 '
+        '-o Acquire::Retries=1'
+    )
+
+    def _refresh_package_lists(self, manager, log):
+        """Refresh package metadata; a failure costs time, never the update."""
+        if manager == 'apt-get':
+            command = ('DEBIAN_FRONTEND=noninteractive apt-get update -qq %s'
+                       % self.APT_NET_OPTIONS)
+        elif manager in ('dnf', 'yum'):
+            command = '%s -q makecache' % manager
+        elif manager == 'apk':
+            command = 'apk update'
+        else:
+            # pacman is deliberately left alone: `pacman -Sy` without `-u`
+            # upgrades nothing but produces a partial-upgrade state.
+            return False
+        try:
+            _out, _err, code = self._run(
+                command, log, 'dependencies', timeout=180, sudo=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - the cached lists may still work
+            log('dependencies', 'package lists could not be refreshed (%s); using the cached ones'
+                % type(exc).__name__)
+            return False
+        if code != 0:
+            log('dependencies', 'package lists could not be refreshed; using the cached ones')
+        return code == 0
+
+    def _install(self, manager, packages, log, allow_refresh=True):
         joined = ' '.join(packages)
         if manager == 'apt-get':
             command = 'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq %s' % joined
@@ -547,6 +620,19 @@ class AwgPluginUpdater:
         if code == 0:
             return True
         text = ((out or '') + (err or '')).lower()
+        if manager == 'apt-get' and allow_refresh and self.STALE_APT_RE.search(text):
+            log('dependencies', 'the install failed on package metadata, refreshing the lists '
+                'and retrying once')
+            # `apt-get update` is not required to succeed for the retry to be
+            # useful: one dead third-party source makes it exit non-zero while
+            # the main lists were refreshed fine.
+            self._refresh_package_lists(manager, log)
+            out, err, code = self._run(
+                command, log, 'dependencies', timeout=900, sudo=True)
+            if code == 0:
+                return True
+            text = ((out or '') + (err or '')).lower()
+            log('dependencies', 'the install failed again after refreshing the package lists')
         if manager == 'apt-get' and ('lock' in text or 'held by process' in text):
             log('dependencies', 'package manager is busy, retrying once')
             time.sleep(15)
@@ -554,6 +640,109 @@ class AwgPluginUpdater:
             if code == 0:
                 return True
         return False
+
+    def _kernel_with_headers(self, running):
+        """A kernel other than the running one that already has headers.
+
+        ``[ -d ]`` follows the ``build`` symlink, so a leftover link to a
+        removed headers package is not mistaken for a usable one.
+        """
+        try:
+            out, _err, _code = self._exec(
+                'for d in /lib/modules/*/build; do '
+                '[ -d "$d" ] || continue; '
+                'basename "$(dirname "$d")"; done '
+                '| sort -V | tail -n 1'
+            )
+        except Exception:  # noqa: BLE001 - a hint must never hide the real error
+            return None
+        kernel = (out or '').strip()
+        return kernel if kernel and kernel != running else None
+
+    #: Header metapackages track the running kernel's flavour: Debian plain
+    #: amd64 is ``linux-headers-amd64``, cloud is ``linux-headers-cloud-amd64``,
+    #: Ubuntu is ``linux-headers-generic``.
+    @staticmethod
+    def _headers_metapackages(kernel):
+        flavour = re.match(r'^\d+\.\d+\.\d+-\d+-(.+)$', kernel or '')
+        candidates = []
+        if flavour:
+            candidates.append('linux-headers-' + flavour.group(1))
+        for name in ('linux-headers-amd64', 'linux-headers-generic'):
+            if name not in candidates:
+                candidates.append(name)
+        return candidates
+
+    def _headers_kernel_in_repositories(self, kernel=''):
+        """``(kernel_abi, metapackage)`` for headers that are installable now."""
+        try:
+            name = ''
+            metapackage = ''
+            for candidate in self._headers_metapackages(kernel):
+                out, _err, _code = self._exec(
+                    "apt-cache depends %s 2>/dev/null | "
+                    "awk '/Depends: linux-headers-[0-9]/{print $2; exit}'" % candidate
+                )
+                name = (out or '').strip()
+                if name.startswith('linux-headers-'):
+                    metapackage = candidate
+                    break
+            if not name.startswith('linux-headers-'):
+                # No metapackage for this distribution: look for the headers of
+                # the same flavour as the running kernel. A bare ``*-amd64``
+                # pattern would also match -cloud-amd64 and -rt-amd64.
+                suffix = re.match(r'^\d+\.\d+\.\d+-\d+-(.+)$', kernel or '')
+                if not suffix:
+                    return None
+                out, _err, _code = self._exec(
+                    "apt-cache search --names-only "
+                    "'^linux-headers-[0-9][0-9.]*-[0-9]+-%s$' 2>/dev/null | "
+                    "awk '{print $1}' | sort -V | tail -n 1" % suffix.group(1)
+                )
+                name = (out or '').strip()
+                if not name.startswith('linux-headers-'):
+                    return None
+            # `depends` only promises the name; the pool must really have it,
+            # otherwise the advice would fail with the very 404 it explains.
+            found, _err, _code = self._exec(
+                'apt-cache show %s 2>/dev/null | head -n 1' % shlex.quote(name))
+            if not (found or '').strip():
+                return None
+            return name[len('linux-headers-'):], metapackage
+        except Exception:  # noqa: BLE001 - a hint must never hide the real error
+            return None
+
+    def _headers_hint(self, manager, kernel):
+        """Explain where the headers are when the running kernel has none.
+
+        Distributions drop the ABI of superseded kernels from the pool, so on
+        a host that has not been rebooted for a while the exact header package
+        cannot be installed at all.  The panel cannot build for a kernel that
+        is not running: naming the kernel to boot is the only useful answer.
+        The reboot itself stays with the operator.
+        """
+        if manager != 'apt-get':
+            return ''
+        try:
+            installed = self._kernel_with_headers(kernel)
+            if installed:
+                return ('; headers for kernel %s are installed - reboot the server into it '
+                        '(the SSH session will drop) and run the update again' % installed)
+            offered = self._headers_kernel_in_repositories(kernel)
+            if offered:
+                abi, metapackage = offered
+                if abi != kernel:
+                    flavour = re.match(r'^\d+\.\d+\.\d+-\d+-(.+)$', abi)
+                    headers_pkg = metapackage or (
+                        'linux-headers-' + (flavour.group(1) if flavour else abi))
+                    image_pkg = headers_pkg.replace('linux-headers-', 'linux-image-', 1)
+                    return ('; the repositories carry headers only for kernel %s - install the '
+                            'latest kernel (%s and %s), reboot the server (the SSH session '
+                            'will drop) and run the update again'
+                            % (abi, image_pkg, headers_pkg))
+        except Exception:  # noqa: BLE001 - a hint must never hide the real error
+            return ''
+        return ''
 
     def _headers_candidates(self, manager, kernel):
         """Possible header packages for a kernel, most specific first."""
@@ -585,6 +774,12 @@ class AwgPluginUpdater:
             return
         manager = check['package_manager']
         log('dependencies', 'missing: %s' % ', '.join(installable))
+        # Hosts are often months behind on package lists; a point release then
+        # answers every stale version with 404 even though the package exists.
+        # Refresh once up front instead of failing on the first install.
+        # A stale index is the most common reason for a first-click failure on
+        # an old host, whichever package manager the host uses.
+        self._refresh_package_lists(manager, log)
         names = self.PACKAGE_NAMES.get(manager, {})
         packages = [names[item] for item in installable if item != 'headers' and item in names]
         if packages:
@@ -598,22 +793,24 @@ class AwgPluginUpdater:
             installed = False
             for candidate in self._headers_candidates(manager, kernel):
                 log('dependencies', 'trying %s' % candidate)
-                if self._install(manager, [candidate], log):
+                if self._install(manager, [candidate], log, allow_refresh=False):
                     installed = True
                     break
             if not installed:
                 raise PluginUpdateError(
                     'preflight_failed',
-                    'no kernel headers for %s are available in the repositories' % kernel,
+                    'no kernel headers for %s are available in the repositories%s'
+                    % (kernel, self._headers_hint(manager, kernel)),
                 )
         recheck = self.preflight(component)
         if recheck['blockers']:
             raise PluginUpdateError('preflight_failed', '; '.join(recheck['blockers']))
         missing = recheck.get('installable') or []
         if missing:
+            hint = self._headers_hint(manager, check.get('kernel') or '') if 'headers' in missing else ''
             raise PluginUpdateError(
                 'preflight_failed',
-                'still missing after installation: %s' % ', '.join(missing),
+                'still missing after installation: %s%s' % (', '.join(missing), hint),
             )
         log('dependencies', 'dependencies are ready')
 
@@ -631,6 +828,30 @@ class AwgPluginUpdater:
         log('preflight', 'kernel %s, blockers: %s' % (check.get('kernel'), check.get('blockers') or 'none'))
         if check['blockers']:
             raise PluginUpdateError('preflight_failed', '; '.join(check['blockers']))
+
+        # The kernel module may already be the target version: the operator
+        # clicked "Update" on a page that still showed the old state, or the
+        # module was installed outside the panel.  DKMS refuses to register a
+        # module/version pair twice, and removing the running pair would delete
+        # the .ko of the loaded module, so the honest answer is "nothing to do".
+        # The check also requires the module file for the running kernel to
+        # exist: a loaded module whose .ko was deleted still reports its
+        # version and must be rebuilt, not skipped.
+        # Userspace is left alone: recreating the container is idempotent by
+        # design and its version comes from the image, not from DKMS.
+        if component == KERNEL_MODULE:
+            current = (self.installed_versions(containers=[]) or {}).get(KERNEL_MODULE)
+            if current == version and self._module_file_present():
+                log('preflight', '%s %s is already installed; nothing to update'
+                    % (component, version))
+                return {
+                    'component': component,
+                    'previous': current,
+                    'installed': version,
+                    'state': 'updated',
+                    'rolled_back': False,
+                }
+
         if check['requires_interruption'] and not allow_interrupt:
             raise PluginUpdateError(
                 'requires_confirmation',
@@ -678,6 +899,14 @@ class AwgPluginUpdater:
             for line in text.splitlines()[-40:]:
                 log(stage, line)
         return out or '', err or '', code
+
+    def _module_file_present(self):
+        """True when the .ko for the running kernel is really on disk."""
+        try:
+            out, _err, _code = self._exec('modinfo -n amneziawg 2>/dev/null || true')
+        except Exception:  # noqa: BLE001 - unknown means "do the work"
+            return False
+        return bool((out or '').strip())
 
     def _dkms_remove(self, version, log, stage='cleanup'):
         # "not located in the DKMS tree" is a normal outcome on a fresh retry.
@@ -738,6 +967,21 @@ class AwgPluginUpdater:
             out, err, code = self._run(
                 'cd /tmp/awg-plugin-update/src && dkms add .', log, 'dkms-add', timeout=300,
             )
+            if code != 0 and self.ALREADY_REGISTERED_RE.search(
+                    ((out or '') + (err or '')).lower()):
+                # An earlier attempt registered this exact version, so `dkms add`
+                # refuses the fresh sources. Rebuild from the clone: its sed
+                # patches define the version string, while the registered tree
+                # may belong to something else with the same version. The loaded
+                # module is a different version (equal versions return before
+                # any work), so nothing in use is removed and the previous
+                # module plus its .ko backup stay intact.
+                log('dkms-add', 'the DKMS tree already has %s; re-registering the fresh sources'
+                    % version)
+                self._dkms_remove(version, log, 'dkms-add')
+                out, err, code = self._run(
+                    'cd /tmp/awg-plugin-update/src && dkms add .', log, 'dkms-add', timeout=300,
+                )
             if code != 0:
                 raise PluginUpdateError('update_failed', 'dkms add failed')
 
@@ -1330,17 +1574,50 @@ class AwgPluginUpdater:
             raise PluginUpdateError('update_failed', 'container %s changed during the build' % name)
         item.update(current)
         item['backup'] = self._userspace_tmp + '/backup-' + name
-        _, _, code = self._run(
-            'docker cp %s:%s %s' % (name, CONTAINER_CONFIG_DIR, shlex.quote(item['backup'])),
+        out, err, code = self._run(
+            "docker exec %s tar czf %s -C %s "
+            "--exclude='./awg/warp' --exclude='./awg/warp-link-*' "
+            "--exclude='./exit/warp' ."
+            % (name, UPDATER_BACKUP_TMP, CONTAINER_CONFIG_DIR),
             log, 'backup',
         )
-        if code:
+        if code != 0:
             raise PluginUpdateError('update_failed', 'cannot back up %s configuration' % name)
+        out, err, code = self._run(
+            'docker cp %s:%s %s' % (name, UPDATER_BACKUP_TMP, shlex.quote(item['backup'])), log, 'backup',
+        )
+        if code != 0:
+            raise PluginUpdateError('update_failed', 'cannot back up %s configuration' % name)
+        self._run(
+            'docker exec %s rm -f %s' % (name, UPDATER_BACKUP_TMP), log, 'backup',
+        )
         peers_out, _, _ = self._run(
             "docker exec %s sh -c \"grep -c '^\\[Peer\\]' %s/*.conf 2>/dev/null\" "
             % (name, CONTAINER_CONFIG_SUBDIR), log, 'backup',
         )
         item['peers'] = sum(int(value) for value in re.findall(r'\d+', peers_out or ''))
+
+    def _restore_container_config(self, name, backup, log, stage='restore'):
+        """Copy the tar backup into the container and extract it in place.
+
+        Extraction never removes the warp credentials that live under
+        ``/opt/amnezia``: the archive simply does not contain them, so an
+        update keeps an installed WARP link intact.
+        """
+        out, err, code = self._run(
+            'docker cp %s %s:%s' % (backup, name, UPDATER_RESTORE_TMP), log, stage,
+        )
+        if code != 0:
+            return code
+        out, err, code = self._run(
+            'docker exec %s tar xzf %s -C %s'
+            % (name, UPDATER_RESTORE_TMP, CONTAINER_CONFIG_DIR),
+            log, stage,
+        )
+        self._run(
+            'docker exec %s rm -f %s' % (name, UPDATER_RESTORE_TMP), log, stage,
+        )
+        return code
 
     def _apply_container_update(self, item, version, log, should_cancel=None):
         name = item['name']
@@ -1379,10 +1656,7 @@ class AwgPluginUpdater:
             if code != 0:
                 raise PluginUpdateError('update_failed', 'cannot attach %s to %s' % (name, network))
 
-        out, err, code = self._run(
-            'docker cp %s/. %s:%s/' % (item['backup'], name, CONTAINER_CONFIG_DIR),
-            log, 'restore',
-        )
+        code = self._restore_container_config(name, item['backup'], log)
         if code != 0:
             raise PluginUpdateError('update_failed', 'cannot restore the configuration of %s' % name)
         out, err, code = self._run('docker restart %s' % name, log, 'restore')
@@ -1505,4 +1779,13 @@ class AwgPluginUpdater:
             if code != 0:
                 log('rollback', 'ERROR: %s did not start' % name)
                 failures.append(name)
+            else:
+                # The predecessor kept its own filesystem, but re-applying the
+                # archive through the same tar path keeps rollback and update
+                # symmetric (and never removes warp credentials).
+                restore_code = self._restore_container_config(
+                    name, item.get('backup'), log, stage='rollback',
+                )
+                if restore_code != 0:
+                    log('rollback', 'WARNING: could not restore the configuration of %s' % name)
         return failures

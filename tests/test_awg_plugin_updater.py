@@ -104,13 +104,29 @@ class TagTests(unittest.TestCase):
         self.assertIsNone(parse_tag('v3.1.2026'))
         self.assertIsNone(parse_tag('v3.1.20260906-rc1'))
 
+    def test_parse_tag_keeps_rebuild_suffix(self):
+        self.assertEqual(parse_tag('v3.1.20261113-02'), '3.1.20261113-02')
+        self.assertEqual(parse_tag('3.1.20261113-2'), '3.1.20261113-2')
+        # Only ``-<digits>`` may follow the date; anything else stays rejected.
+        self.assertIsNone(parse_tag('v3.1.20261113-'))
+        self.assertIsNone(parse_tag('v3.1.20261113-02; rm -rf /'))
+
     def test_version_tuple(self):
-        self.assertEqual(version_tuple(NEW), (3, 1, 20260906))
+        self.assertEqual(version_tuple(NEW), (3, 1, 20260906, 0))
+        self.assertEqual(version_tuple('3.1.20261113-02'), (3, 1, 20261113, 2))
         self.assertIsNone(version_tuple('nope'))
 
     def test_pick_latest_orders_by_date(self):
         tags = ['v3.1.20260812', 'v3.1.20260906', 'v3.1.20260828', 'release-notes']
         self.assertEqual(pick_latest(tags), '3.1.20260906')
+
+    def test_pick_latest_prefers_rebuild_of_same_date(self):
+        tags = ['v3.1.20261113', 'v3.1.20261113-02', 'v3.1.20260906']
+        self.assertEqual(pick_latest(tags), '3.1.20261113-02')
+
+    def test_pick_latest_orders_rebuilds_numerically(self):
+        tags = ['v3.1.20261113-02', 'v3.1.20261113-10', 'v3.1.20261113']
+        self.assertEqual(pick_latest(tags), '3.1.20261113-10')
 
     def test_pick_latest_ignores_invalid(self):
         self.assertIsNone(pick_latest(['latest', 'v2.0', '']))
@@ -213,6 +229,23 @@ class StatusTests(unittest.TestCase):
         )
         self.assertTrue(status['components'][KERNEL_MODULE]['update_available'])
         self.assertFalse(status['components'][USERSPACE]['update_available'])
+
+    def test_rebuild_is_offered_over_base_tag(self):
+        """A fixed rebuild of the installed date must still be offered."""
+        status = AwgPluginUpdater(self._ssh_with_userspace()).status(
+            latest={KERNEL_MODULE: '3.1.20261113-02', USERSPACE: None},
+            installed={KERNEL_MODULE: '3.1.20261113', USERSPACE: '0.0.20250522'},
+        )
+        kernel = status['components'][KERNEL_MODULE]
+        self.assertTrue(kernel['update_available'])
+        self.assertEqual(kernel['available'], '3.1.20261113-02')
+
+    def test_installed_rebuild_is_up_to_date(self):
+        status = AwgPluginUpdater(self._ssh_with_userspace()).status(
+            latest={KERNEL_MODULE: '3.1.20261113-02', USERSPACE: None},
+            installed={KERNEL_MODULE: '3.1.20261113-02', USERSPACE: '0.0.20250522'},
+        )
+        self.assertFalse(status['components'][KERNEL_MODULE]['update_available'])
 
 
 class PreflightTests(unittest.TestCase):
@@ -454,6 +487,65 @@ class UserspaceUpdateTests(unittest.TestCase):
         self.assertTrue(ssh.find('docker rename amnezia-awg3 amnezia-awg3.old-'))
         # The old container is only removed after the new one is verified.
         self.assertTrue(ssh.find('docker rm -f amnezia-awg3.old-'))
+
+    def test_backup_uses_tar_with_warp_excludes(self):
+        ssh = FakeSSH(self._handler())
+        AwgPluginUpdater(ssh).update(USERSPACE, GO_NEW, allow_interrupt=True)
+
+        backups = ssh.find('tar czf')
+        self.assertEqual(len(backups), 1)
+        self.assertIn(
+            'docker exec amnezia-awg3 tar czf /tmp/awp-updater-warp-exclude.tgz '
+            '-C /opt/amnezia ',
+            backups[0],
+        )
+        self.assertIn("--exclude='./awg/warp'", backups[0])
+        self.assertIn("--exclude='./awg/warp-link-*'", backups[0])
+        self.assertIn("--exclude='./exit/warp'", backups[0])
+        # The whole /opt/amnezia directory is no longer copied directly.
+        self.assertFalse(
+            [c for c in ssh.commands if ':/opt/amnezia ' in c],
+            'plain docker cp of the config directory must be gone',
+        )
+        self.assertTrue(ssh.find(
+            'docker cp amnezia-awg3:/tmp/awp-updater-warp-exclude.tgz '
+            '/tmp/awg-plugin-userspace.0123456789/backup-amnezia-awg3',
+        ))
+        self.assertTrue(ssh.find(
+            'docker exec amnezia-awg3 rm -f /tmp/awp-updater-warp-exclude.tgz',
+        ))
+
+    def test_restore_uses_tar_extract_and_keeps_warp_credentials(self):
+        ssh = FakeSSH(self._handler())
+        AwgPluginUpdater(ssh).update(USERSPACE, GO_NEW, allow_interrupt=True)
+
+        extracts = ssh.find('tar xzf')
+        self.assertEqual(len(extracts), 1)
+        self.assertIn(
+            'docker exec amnezia-awg3 tar xzf /tmp/awp-restore.tgz '
+            '-C /opt/amnezia',
+            extracts[0],
+        )
+        self.assertFalse(
+            [c for c in ssh.commands if c.startswith('docker cp /tmp/awg-plugin-backup')
+             and ':/opt/amnezia/' in c],
+            'a directory copy into /opt/amnezia/ must no longer be used',
+        )
+        self.assertTrue(ssh.find(
+            'docker cp /tmp/awg-plugin-userspace.0123456789/backup-amnezia-awg3 '
+            'amnezia-awg3:/tmp/awp-restore.tgz',
+        ))
+        self.assertTrue(ssh.find(
+            'docker exec amnezia-awg3 rm -f /tmp/awp-restore.tgz',
+        ))
+
+    def test_cleanup_removes_both_temporary_archives(self):
+        ssh = FakeSSH(self._handler())
+        AwgPluginUpdater(ssh).update(USERSPACE, GO_NEW, allow_interrupt=True)
+
+        self.assertIn('docker exec amnezia-awg3 rm -f /tmp/awp-updater-warp-exclude.tgz', ssh.commands)
+        self.assertIn('docker exec amnezia-awg3 rm -f /tmp/awp-restore.tgz', ssh.commands)
+        self.assertIn('rm -rf -- /tmp/awg-plugin-userspace.0123456789', ssh.commands)
 
     def test_dropped_peers_roll_back(self):
         ssh = FakeSSH(self._handler(peers='5', peers_after='0'))

@@ -69,13 +69,36 @@ class UpdateIpTests(unittest.TestCase):
         self.assertIn('no route', detail)
 
 
+class ContainerRenewalTests(unittest.TestCase):
+    def test_monitor_renews_daily_and_reloads_only_after_success(self):
+        settings = {'duckdns': {'enabled': True, 'domain': 'panel.duckdns.org', 'token': 'test'}}
+        with mock.patch.object(panel, 'DUCKDNS_STATE_DIR', '/app/data/duckdns'), \
+             mock.patch.object(panel, 'load_data', return_value={'settings': settings}), \
+             mock.patch.object(panel, '_duckdns_update_ip', return_value=(True, 'OK')), \
+             mock.patch.object(panel, '_duckdns_renew', side_effect=[RuntimeError('retry'), None]) as renew, \
+             mock.patch.object(panel, '_reload_duckdns_tls') as reload_tls, \
+             mock.patch.object(panel.time, 'sleep', side_effect=[None, None, KeyboardInterrupt]):
+            with self.assertRaises(KeyboardInterrupt):
+                panel._duckdns_monitor_loop()
+        self.assertEqual(renew.call_count, 2)
+        reload_tls.assert_called_once_with()
+
+    def test_renew_uses_persistent_acme_home_and_saved_token(self):
+        with mock.patch.object(panel, 'DUCKDNS_ACME_HOME', '/app/data/duckdns/acme'), \
+             mock.patch.object(panel.subprocess, 'run', return_value=mock.Mock(returncode=2)) as run:
+            panel._duckdns_renew('panel.duckdns.org', 'saved-token')
+        self.assertEqual(run.call_args.args[0], ['/app/data/duckdns/acme/acme.sh', '--home',
+                         '/app/data/duckdns/acme', '--renew', '-d', 'panel.duckdns.org'])
+        self.assertEqual(run.call_args.kwargs['env']['DuckDNS_Token'], 'saved-token')
+
+
 class ApplyApiTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self._data_file = panel.DATA_FILE
         panel.DATA_FILE = os.path.join(self.tmp, 'data.json')
         with open(panel.DATA_FILE, 'w', encoding='utf-8') as f:
-            json.dump({'servers': [], 'users': [], 'user_connections': []}, f)
+            json.dump({'servers': [], 'users': [{'id': 'admin-id', 'username': 'admin', 'password_hash': panel.hash_password('admin'), 'role': 'admin', 'enabled': True}], 'user_connections': []}, f)
         self._flags = (panel._conn_monitor_started, panel._duckdns_monitor_started)
         panel._conn_monitor_started = True
         panel._duckdns_monitor_started = True

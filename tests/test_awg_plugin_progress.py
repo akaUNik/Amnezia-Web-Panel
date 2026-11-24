@@ -84,7 +84,7 @@ class AwgPluginProgressTests(unittest.TestCase):
                 'username': 'root', 'password': 'x', 'private_key': '',
                 'server_info': {}, 'uid': 'u0', 'protocols': {},
             }],
-            'users': [], 'user_connections': [],
+            'users': [{'id': 'admin-id', 'username': 'admin', 'password_hash': panel.hash_password('admin'), 'role': 'admin', 'enabled': True}], 'user_connections': [],
         }
         Path(panel.DATA_FILE).write_text(json.dumps(seed), encoding='utf-8')
 
@@ -256,8 +256,16 @@ class AwgPluginProgressTests(unittest.TestCase):
 
         store = Path(panel._awg_plugin_store_path())
         self.assertTrue(store.exists())
-        stored = json.loads(store.read_text(encoding='utf-8'))
-        entry = next(item for item in stored if item.get('id') == op_id)
+        # The worker publishes the terminal state in memory before replacing the journal.
+        deadline = time.monotonic() + 5
+        while True:
+            stored = json.loads(store.read_text(encoding='utf-8'))
+            entry = next(item for item in stored if item.get('id') == op_id)
+            if entry.get('finished_at'):
+                break
+            if time.monotonic() >= deadline:
+                self.fail('terminal update was not persisted')
+            time.sleep(0.01)
         for key in ('step', 'total', 'percent'):
             self.assertIn(key, entry)
         self.assertEqual(entry['total'], TOTAL_STEPS)

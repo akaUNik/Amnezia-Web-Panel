@@ -21,8 +21,8 @@ class TestServerTemplateIntegrity(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp, \
              patch.object(app, 'DATA_FILE', str(Path(tmp) / 'data.json')):
-            # Seed an empty data file so startup migrations create the default admin.
-            Path(app.DATA_FILE).write_text(_json.dumps({'servers': [], 'users': []}), encoding='utf-8')
+            # Seed a synthetic admin explicitly; startup never creates defaults.
+            Path(app.DATA_FILE).write_text(_json.dumps({'servers': [], 'users': [{'id': 'admin-id', 'username': 'admin', 'password_hash': app.hash_password('admin'), 'role': 'admin', 'enabled': True}]}), encoding='utf-8')
             with TestClient(app.app) as client:
                 login = client.post(
                     "/api/auth/login",
@@ -57,7 +57,7 @@ class TestServerTemplateIntegrity(unittest.TestCase):
 
     def test_smartroute_probe_does_not_block_protocol_rendering(self):
         source = SERVER_TEMPLATE.read_text(encoding="utf-8")
-        start = source.index("async function checkServer()")
+        start = source.index("async function checkServer(")
         end = source.index("function updateStatusCounts", start)
         body = source[start:end]
         self.assertLess(body.index("loadSmartRouteStatus().then("), body.index("await apiCall("))
@@ -76,14 +76,16 @@ class TestServerTemplateIntegrity(unittest.TestCase):
         self.assertIn("btn.textContent = oldText", function)
 
     def test_awg_plugin_button_sits_next_to_the_server_actions(self):
-        """The entry point must live in the existing header action row."""
+        """The plugin entry point lives in the header tools; IP config moved to the meta row."""
         source = SERVER_TEMPLATE.read_text(encoding="utf-8")
-        header = source.index('class="page-header__actions"')
-        check_btn = source.index('id="checkBtn"', header)
-        plugin_btn = source.index('id="awgPluginBtn"', header)
-        self.assertLess(plugin_btn, check_btn)
-        self.assertIn('onclick="openAwgPluginModal()"', source[plugin_btn:check_btn])
-        self.assertIn('class="awg-plugin-dot"', source[plugin_btn:check_btn])
+        start = source.index('class="page-header__actions srv-header__tools"')
+        end = source.index('<div class="srv-header__meta">', start)
+        tools = source[start:end]
+        self.assertIn('id="awgPluginBtn"', tools)
+        self.assertIn('onclick="openAwgPluginModal()"', tools)
+        self.assertIn('class="awg-plugin-dot"', tools)
+        meta = source[end:source.index('<div id="serverStatus"', end)]
+        self.assertIn('id="ipSettingsBtn"', meta)
 
     def test_awg_plugin_modal_uses_the_shared_modal_shell(self):
         source = SERVER_TEMPLATE.read_text(encoding="utf-8")

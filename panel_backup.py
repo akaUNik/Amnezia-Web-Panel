@@ -16,6 +16,7 @@ import zipfile
 import zlib
 
 from peer_recovery import STATE_FILE_LOCK, RecoveryStore, DISASTER_HOLD, digest
+from credential_store import CredentialError, CredentialStore, default_key_path
 
 MAX_FILE_BYTES = 32 * 1024 * 1024
 MAX_TOTAL_BYTES = 128 * 1024 * 1024
@@ -123,7 +124,13 @@ def _entries(data_file, trust_file, system_trust):
     data = _path(data_file)
     result = {'state/data.json': data}
     optional = {'state/data.json.peer-creates.json': Path(str(data) + '.peer-creates.json'),
+                'state/data.json.credential.key': Path(default_key_path(data_file)),
                 'state/data.json.lifecycle-uncertain.json': Path(str(data) + '.lifecycle-uncertain.json'),
+                'state/data.json.srv_warp_state.json': Path(str(data) + '.srv_warp_state.json'),
+                # Плагин «Защита от торрентов»: без записи установки восстановленный
+                # data.json даёт режимы инстансов, но невидимую в UI фичу.
+                'state/data.json.plugins_state.json': Path(str(data) + '.plugins_state.json'),
+                'state/torrent_events.json': data.with_name('torrent_events.json'),
                 'trust/ssh_known_hosts': _path(trust_file)}
     if system_trust is not None:
         optional['trust/system_known_hosts'] = _path(system_trust)
@@ -167,6 +174,40 @@ def _validate_content(name, raw):
             raise BackupError('invalid_state_structure')
 
 
+def _require_migrated_content(name, raw):
+    """Fail closed rather than exporting legacy reusable secrets."""
+    if name == 'state/data.json':
+        state = _json(raw)
+        for server in state.get('servers', []):
+            if isinstance(server, dict) and (server.get('password') or server.get('private_key')):
+                raise BackupError('plaintext_ssh_credentials_require_migration')
+    elif name.startswith('state/data.json.recovery/') and name.endswith('.json'):
+        record = _json(raw)
+        snapshot = record.get('peer_creates_snapshot') if isinstance(record, dict) else None
+        if (isinstance(record, dict) and 'before_base64' in record) or \
+                (isinstance(snapshot, dict) and 'base64' in snapshot):
+            raise BackupError('legacy_recovery_snapshot_requires_migration')
+
+
+def _check_sealed_content(name, raw, store):
+    try:
+        if name == 'state/data.json':
+            for server in _json(raw)['servers']:
+                if isinstance(server, dict) and 'ssh_credentials' in server:
+                    if not server['ssh_credentials']:
+                        raise BackupError('invalid_credential_envelope')
+                    store.resolve(server)
+        elif name.startswith('state/data.json.recovery/') and name.endswith('.json'):
+            record = _json(raw)
+            if 'before_sealed' in record:
+                store.open_bytes(record['before_sealed'], 'recovery-before')
+            snapshot = record.get('peer_creates_snapshot')
+            if isinstance(snapshot, dict) and 'sealed' in snapshot:
+                store.open_bytes(snapshot['sealed'], 'peer-creates-snapshot')
+    except CredentialError as exc:
+        raise BackupError('archive_credential_key_unusable') from exc
+
+
 class ArchiveJob:
     """Anonymous private tempfile: OS closes/unlinks it even on process exit."""
     def __init__(self):
@@ -188,18 +229,24 @@ class ArchiveJob:
                         raise BackupError('state_busy')
                     stack.callback(lock.release)
                 entries, absent = _entries(data_file, trust_file, system_trust)
+                store = CredentialStore(default_key_path(data_file))
                 self.file = tempfile.TemporaryFile(mode='w+b')
                 if hasattr(os, 'fchmod'):
                     os.fchmod(self.file.fileno(), 0o600)
                 records, stamps, total = [], {}, 0
                 with zipfile.ZipFile(self.file, 'w', zipfile.ZIP_DEFLATED, compresslevel=3) as archive:
-                    for name, path in sorted(entries.items()):
+                    # Capture the key's file stamp before checking any envelopes.
+                    key_member = 'state/data.json.credential.key'
+                    for name in sorted(entries, key=lambda n: (n != key_member, n)):
+                        path = entries[name]
                         _member(name)
                         raw, stamps[name] = _read(path)
                         total += len(raw)
                         if total > MAX_TOTAL_BYTES:
                             raise BackupError('state_too_large')
                         _validate_content(name, raw)
+                        _require_migrated_content(name, raw)
+                        _check_sealed_content(name, raw, store)
                         archive.writestr(name, raw)
                         records.append({'path': name, 'size': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()})
                     # Also detect unmanaged replacements/creations during the read.
@@ -242,7 +289,12 @@ def _member(name):
             any(s in ('', '.', '..') for s in name.split('/')) or p.as_posix() != name):
         raise BackupError('unsafe_archive_path')
     fixed = {'state/data.json', 'state/data.json.peer-creates.json',
-             'state/data.json.lifecycle-uncertain.json', 'trust/ssh_known_hosts', 'trust/system_known_hosts'}
+             'state/data.json.credential.key',
+             'state/data.json.lifecycle-uncertain.json',
+             'state/data.json.srv_warp_state.json',
+             'state/data.json.plugins_state.json',
+             'state/torrent_events.json',
+             'trust/ssh_known_hosts', 'trust/system_known_hosts'}
     if name not in fixed and not name.startswith('state/data.json.recovery/'):
         raise BackupError('unexpected_archive_member')
     return p
@@ -320,6 +372,10 @@ def stage_restore(archive, destination, confirmation):
             from peer_recovery import atomic_bytes
             atomic_bytes(target, raw)
         data_file = stage / 'state/data.json'
+        # Older archives may have omitted or mixed up their key.
+        store = CredentialStore(stage / 'state/data.json.credential.key')
+        for name, raw in files.items():
+            _check_sealed_content(name, raw, store)
         before = data_file.read_bytes()
         data = _json(before)
         operation = uuid.uuid4().hex

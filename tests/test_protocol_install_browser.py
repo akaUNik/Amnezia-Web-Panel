@@ -77,7 +77,7 @@ class ProtocolInstallBrowserTests(unittest.TestCase):
 
         page.route('**/*', route_request)
         page.goto('http://panel.test/server/0')
-        expect(page.locator('#checkBtn')).to_be_enabled()
+        expect(page.locator('#managementBtn')).to_be_enabled()
         return page
 
     def start_install(self, page, protocol='awg3', another=False):

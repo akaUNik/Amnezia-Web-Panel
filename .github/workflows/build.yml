@@ -70,15 +70,20 @@ jobs:
     - name: Install dependencies
       run: uv sync --locked --no-dev --group build
 
+    # botocore is only used by PANEL_STORAGE=s3 (container deployments, see
+    # docs/S3_STORAGE.md); excluding it keeps ~25 MB of AWS service models out
+    # of the one-file binaries, which run on local storage only.
     - name: Build Linux
       if: runner.os == 'Linux'
       run: |
         uv run --locked --no-dev --group build pyinstaller --name Amnezia-Web-Panel-Linux \
           --add-data "static:static" \
           --add-data "templates:templates" \
+          --add-data "public_port_forward.py:." \
           --add-data "translations:translations" \
           --hidden-import uvicorn \
           --hidden-import fastapi \
+          --exclude-module botocore \
           --clean \
           -y \
           -F app.py
@@ -90,9 +95,11 @@ jobs:
         uv run --locked --no-dev --group build pyinstaller --name Amnezia-Web-Panel-Windows `
           --add-data "static;static" `
           --add-data "templates;templates" `
+          --add-data "public_port_forward.py;." `
           --add-data "translations;translations" `
           --hidden-import uvicorn `
           --hidden-import fastapi `
+          --exclude-module botocore `
           --clean `
           -y `
           -F app.py

@@ -15,7 +15,7 @@ from peer_recovery import GENERATION
 
 TTL = {'stats': 15, 'status': 30}
 STAT_FIELDS = frozenset(('cpu', 'ram_used', 'ram_total', 'ram_percent', 'disk_used',
-    'disk_total', 'disk_percent', 'net_rx', 'net_tx', 'uptime', 'ipv6'))
+    'disk_total', 'disk_percent', 'swap_used', 'swap_total', 'swap_percent', 'net_rx', 'net_tx', 'uptime', 'ipv6'))
 PROTOCOL_FIELDS = frozenset(('protocol', 'base_protocol', 'instance', 'display_name',
     'container_name', 'container_exists', 'container_running', 'installed', 'port',
     'header_protection', 'protocol_version', 'status_preserved', 'clients_count', 'peers_count', 'mode',
@@ -29,7 +29,7 @@ def projection(kind, value):
         # Keep bounded probe status codes so cached unavailable fields do not
         # become successful zero readings. Never cache remote error messages.
         errors = {field: code for field, code in value.get('errors', {}).items()
-                  if field in ('batch', 'cpu', 'ram', 'disk', 'network', 'uptime', 'ipv6')
+                  if field in ('batch', 'cpu', 'ram', 'disk', 'swap', 'network', 'uptime', 'ipv6')
                   and code in ('invalid_framing', 'probe_failed', 'command_failed',
                                'incomplete_response', 'unavailable', 'invalid_value')}
         if errors:

@@ -76,7 +76,7 @@ class DashboardLoadingBrowserTests(unittest.TestCase):
                     def answer_check(protocols):
                         held.pop('check').fulfill(json={'connection': 'ok', 'docker_installed': True,
                             'protocols': protocols})
-                        page.wait_for_function("!document.getElementById('checkBtn').disabled")
+                        page.wait_for_function("document.getElementById('serverStatus').getAttribute('aria-busy') !== 'true'")
 
                     running = {'awg2': {'container_exists': True, 'container_running': True},
                                'awg2__2': {'container_exists': True, 'container_running': True}}
@@ -87,7 +87,7 @@ class DashboardLoadingBrowserTests(unittest.TestCase):
                         pump_until(lambda: connections)
                         self.assertEqual(answer_connection(), 'awg2')
                         page.locator('.client-name').wait_for()
-                        self.assertTrue(page.locator('#checkBtn').is_disabled())
+                        self.assertEqual(page.locator('#serverStatus').get_attribute('aria-busy'), 'true')
                     else:
                         self.assertEqual(connections, [])
                     answer_check(running)

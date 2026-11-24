@@ -12,17 +12,98 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import closing
 
 import paramiko
 
 LOCK = threading.RLock()
 _SECRET = secrets.token_bytes(32)
 _DATA_FILE = None
+_JUMP_RESOLVER = None
+
+
+class SystemTrustConflict(ValueError):
+    """The system known_hosts pins another key; the panel must not overwrite it."""
+
+
+class TrustChanged(ValueError):
+    """The trust snapshot moved between inspection and confirmation."""
+
+
+class TrustFileReadOnly(PermissionError):
+    """The panel trust file cannot be written by the service user."""
+
+
+def system_trust_path():
+    """The file paramiko's load_system_host_keys() reads for this process."""
+    return os.path.expanduser('~/.ssh/known_hosts')
+
+
+def remediation(server, reason='system_conflict'):
+    """Copy-ready console steps for a pin the panel refuses to repair itself.
+
+    The panel must never rewrite an independent system-level pin, so the only
+    safe exit is a human running the same command where the panel runs. Paths
+    are resolved from this installation at call time, not hard-coded, so the
+    same hint is correct for any host, port and deployment directory.
+
+    The generated commands assume a POSIX panel host (`~/.ssh/known_hosts`,
+    `ssh-keygen`, `find`), which matches the shipped Linux systemd deployment.
+    A Windows-hosted panel would need an equivalent hint, and `verify_command`
+    additionally assumes OpenSSH host keys live under /etc/ssh.
+    """
+    import getpass
+    import shlex
+
+    host, port = identity(server)
+    name = host_name(host, port)
+    system_file = system_trust_path()
+    panel_file = trust_path()
+    # A slim container may have no uid entry or hostname; a hint must never
+    # turn a clean 409 into a 500.
+    try:
+        service_user = getpass.getuser()
+    except Exception:
+        service_user = 'root'
+    try:
+        panel_host = socket.gethostname()
+    except Exception:
+        panel_host = 'the panel host'
+    readonly = False
+    try:
+        readonly = (os.path.exists(panel_file)
+                    and not os.stat(panel_file).st_mode & stat.S_IWRITE)
+    except OSError:
+        readonly = False
+    result = {
+        'reason': reason,
+        'endpoint': name,
+        'service_user': service_user,
+        'panel_host': panel_host,
+        'system_file': system_file,
+        'panel_file': panel_file,
+        'verify_command': "find /etc/ssh -maxdepth 1 -name 'ssh_host_*_key.pub' "
+                          '-exec ssh-keygen -lf {} \\;',
+        'remove_system': 'ssh-keygen -R %s -f %s'
+                         % (shlex.quote(name), shlex.quote(system_file)),
+        'remove_panel': 'ssh-keygen -R %s -f %s'
+                        % (shlex.quote(name), shlex.quote(panel_file)),
+        'panel_readonly': readonly,
+        'chmod_panel': '',
+    }
+    if readonly:
+        result['chmod_panel'] = 'chmod u+w %s' % shlex.quote(panel_file)
+    return result
 
 
 def configure(data_file):
     global _DATA_FILE
     _DATA_FILE = data_file
+
+
+def configure_jump_resolver(resolver):
+    global _JUMP_RESOLVER
+    _JUMP_RESOLVER = resolver
 
 
 def trust_path():
@@ -71,9 +152,19 @@ def panel_keys():
     return keys
 
 
-def probe(host, port):
+def probe(host, port, jump_manager=None):
     # No username, password, private key, SSH agent or auth method enters here.
-    with socket.create_connection((host, port), timeout=10) as sock:
+    if jump_manager is not None:
+        jump_manager.ensure_connected()
+        jump_transport = (jump_manager.client.get_transport()
+                          if jump_manager.client else None)
+        if not jump_transport or not jump_transport.is_active():
+            raise ConnectionError('SSH jump host transport is unavailable')
+        sock_context = closing(jump_transport.open_channel(
+            'direct-tcpip', (host, port), ('127.0.0.1', 0), timeout=30))
+    else:
+        sock_context = socket.create_connection((host, port), timeout=10)
+    with sock_context as sock:
         transport = paramiko.Transport(sock)
         try:
             # Match SSHClient.connect: system pins take precedence, and its
@@ -99,8 +190,8 @@ def _token(payload):
 def inventory_binding(server):
     # Bind draft edits to saved connection settings without exposing credentials
     # or a password-verifiable unkeyed hash in the browser's signed token.
-    values = {k: server.get(k) for k in
-              ('uid', 'host', 'ssh_port', 'username', 'password', 'private_key')}
+    values = {k: server.get(k) for k in ('uid', 'host', 'ssh_port', 'username')}
+    values['credential_revision'] = (server.get('ssh_credentials') or {}).get('revision')
     return hmac.new(_SECRET, json.dumps(values, sort_keys=True).encode(), hashlib.sha256).hexdigest()
 
 
@@ -119,7 +210,8 @@ def saved_status(server):
 
 def inspect(server):
     host, port = identity(server)
-    key = probe(host, port)
+    jump_manager = _JUMP_RESOLVER(server) if _JUMP_RESOLVER else None
+    key = probe(host, port, jump_manager)
     name = host_name(host, port)
     with LOCK:
         system, local = system_keys().lookup(name), panel_keys().lookup(name)
@@ -129,6 +221,11 @@ def inspect(server):
         status = 'unknown' if not effective else ('trusted' if effective.get(key.get_name()) == key else 'changed')
         result = {'host': host, 'port': port, 'algorithm': key.get_name(),
                   'fingerprint': fingerprint(key), 'old_fingerprints': old, 'status': status}
+        if status == 'changed' and system and system.get(key.get_name()) != key:
+            # The confirmation step is guaranteed to fail while the system
+            # store holds a different key for the same name. Attach the exact
+            # commands now, so the operator sees them before pressing it.
+            result['remediation'] = remediation(server, 'system_conflict')
         result['token'] = _token({'host': host, 'port': port, 'uid': server.get('uid'),
                                   'context': server.get('enrollment_context'),
                                   'key': key.get_base64(), 'algorithm': key.get_name(),
@@ -158,7 +255,8 @@ def prepare_enrollment(server, token):
     """Re-probe without authentication or inventory locks; do not write trust."""
     host, port = identity(server)
     payload = _confirmation(server, token)
-    key = probe(host, port)
+    jump_manager = _JUMP_RESOLVER(server) if _JUMP_RESOLVER else None
+    key = probe(host, port, jump_manager)
     if key.get_base64() != payload['key'] or key.get_name() != payload['algorithm']:
         raise ValueError('SSH candidate changed; inspect and verify again')
     return key
@@ -180,12 +278,12 @@ def commit_enrollment(server, token, key, validate_endpoint=None):
             raise ValueError('Server endpoint changed; probe again')
         system = system_keys().lookup(name)
         if system and system.get(key.get_name()) != key:
-            raise ValueError('Conflicting system known_hosts entry; administrator must correct it independently first')
+            raise SystemTrustConflict('Conflicting system known_hosts entry; administrator must correct it independently first')
         if payload.get('trust') != _trust_snapshot(name):
-            raise ValueError('Trust changed; probe again')
+            raise TrustChanged('Trust changed; probe again')
         path = trust_path()
         if os.path.exists(path) and not os.stat(path).st_mode & stat.S_IWRITE:
-            raise PermissionError('SSH trust file is read-only')
+            raise TrustFileReadOnly('SSH trust file is read-only')
         keys = panel_keys()
         # Remove all entries for this endpoint, including hashed names and old
         # algorithms, preserving aliases on shared lines and unrelated hosts.

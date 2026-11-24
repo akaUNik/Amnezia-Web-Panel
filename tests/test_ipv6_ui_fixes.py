@@ -1,0 +1,618 @@
+"""Source-level regressions for the server IPv4/IPv6 UI fixes (C1-C7).
+
+The checked artefacts are text only: templates/server.html,
+static/css/style.css and translations/*.json. No browser and no server.
+"""
+
+import hashlib
+import json
+import os
+import re
+import unittest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TEMPLATE_FILE = os.path.join(ROOT, "templates", "server.html")
+CSS_FILE = os.path.join(ROOT, "static", "css", "style.css")
+DESIGN_FILE = os.path.join(ROOT, "design", "server-ipv6-i18n.json")
+I18N_TEST_FILE = os.path.join(ROOT, "tests", "test_ipv6_i18n.py")
+
+LOCALES = ("ru", "en", "fr", "zh", "fa")
+NON_RU = ("en", "fr", "zh", "fa")
+KEY_LITERAL_RE = re.compile(r"(server_ipv6_[A-Za-z0-9_]+)")
+
+NEW_KEYS = {
+    "server_ipv6_state_env_off",
+    "server_ipv6_state_env_on",
+    "server_ipv6_badge_peer_lifecycle_busy",
+    "server_ipv6_badge_ip6tables_unsupported",
+    "server_ipv6_save_preference",
+    "server_ipv6_cancel",
+    "server_ipv6_discard_confirm",
+    "server_ipv6_enable_docker_first",
+    "server_ipv6_apply_or_revert_hint",
+    "cheburcheck_title",
+    "cheburcheck_loading",
+    "cheburcheck_hint",
+    "cheburcheck_ban_badge",
+    "cheburcheck_unknown_badge",
+    "cheburcheck_no_data",
+    "cheburcheck_error",
+    "cheburcheck_checked_at",
+    "cheburcheck_regions_blocked",
+    "cheburcheck_banned",
+    "cheburcheck_clean",
+    "cheburcheck_unknown",
+    "cheburcheck_run_now",
+    "cheburcheck_checking",
+    "cheburcheck_settings_title",
+    "cheburcheck_settings_intro",
+    "cheburcheck_enable",
+    "cheburcheck_enable_hint",
+    "cheburcheck_interval",
+    "cheburcheck_interval_hint",
+    "cheburcheck_servers_label",
+    "cheburcheck_servers_hint",
+    "cheburcheck_run_all",
+    "cheburcheck_none_enabled",
+    "cheburcheck_running_all",
+    "cheburcheck_banned_count",
+    "cheburcheck_target",
+    "cheburcheck_status",
+    "cheburcheck_regions_short",
+    "cheburcheck_partial",
+    "cheburcheck_no_targets",
+    "cheburcheck_targets_intro",
+    "cheburcheck_targets_show",
+    "cheburcheck_restrictions",
+    "cheburcheck_remarks_badge",
+    "cheburcheck_remarks_only",
+    "cheburcheck_remarks_found",
+    "cheburcheck_static_hit",
+    "cheburcheck_static_rkn",
+    "cheburcheck_override_toggle",
+    "cheburcheck_override_placeholder",
+    "cheburcheck_probe_no_data",
+    "cheburcheck_token_label",
+    "cheburcheck_token_placeholder",
+    "cheburcheck_token_set",
+    "cheburcheck_token_not_set",
+    "cheburcheck_token_hint",
+    "cheburcheck_token_check",
+    "cheburcheck_token_ok",
+    "cheburcheck_token_failed",
+    "cheburcheck_token_required",
+    "cheburcheck_token_open_settings",
+    "cheburcheck_token_docs",
+    "cheburcheck_token_basic_only",
+    "cheburcheck_token_docs_link",
+    "cheburcheck_static_only",
+    "cheburcheck_static_only_note",
+}
+
+# The catalogue had 1218 key names right before panel access (#305). Freeze
+# the names, not translated values: a count alone misses a removed key
+# replaced by an unrelated one. Future additions must be registered here.
+TORRENT_GUARD_KEYS = {
+    'torrent_badge',
+    'torrent_guard_title',
+    'torrent_guard_on',
+    'torrent_guard_count',
+    'torrent_guard_off',
+    'torrent_guard_saved',
+    'torrent_activity_text',
+    'torrent_sig_handshake',
+    'torrent_sig_dht_query',
+    'torrent_sig_dht_short',
+    'torrent_sig_tracker',
+    'torrent_sig_unknown',
+    'torrent_clear_confirm',
+}
+
+TORRENT_PLUGIN_KEYS = {
+    'tp_clear_marks_on_disable',
+    'tp_control_off_hint',
+    'tp_days',
+    'tp_default_mode',
+    'tp_degraded_title',
+    'tp_err_unreachable',
+    'tp_err_no_iptables_modules',
+    'tp_err_container_stopped',
+    'tp_default_mode_hint',
+    'tp_desc',
+    'tp_disabled_toast',
+    'tp_enabled_toast',
+    'tp_health_degraded',
+    'tp_health_ok',
+    'tp_health_peers',
+    'tp_health_unknown',
+    'tp_include_wireguard',
+    'tp_install',
+    'tp_install_done',
+    'tp_instances_title',
+    'tp_limits_hint',
+    'tp_marks_clear',
+    'tp_marks_clear_confirm',
+    'tp_marks_cleared',
+    'tp_marks_last',
+    'tp_marks_title',
+    'tp_marks_total',
+    'tp_marks_ttl',
+    'tp_master_hint',
+    'tp_master_title',
+    'tp_mode_count',
+    'tp_mode_label',
+    'tp_mode_off',
+    'tp_mode_on',
+    'tp_name',
+    'tp_no_instances',
+    'tp_no_instances_hint',
+    'tp_open',
+    'tp_poll_manual',
+    'tp_poll_seconds',
+    'tp_reapplied',
+    'tp_reapply',
+    'tp_refresh',
+    'tp_refreshed',
+    'tp_save',
+    'tp_saved',
+    'tp_settings_title',
+    'tp_short',
+    'tp_state_count',
+    'tp_state_degraded',
+    'tp_state_needs_start',
+    'tp_state_not_installed',
+    'tp_state_off',
+    'tp_state_on',
+    'tp_state_unknown',
+    'tp_state_unsupported',
+    'tp_uninstall',
+    'tp_uninstall_confirm',
+    'tp_uninstall_done',
+}
+
+# Keys of the "What to do?" console help for a changed host key.
+SSH_HELP_KEYS = {
+    'ssh_help_summary', 'ssh_help_copy', 'ssh_help_step_verify',
+    'ssh_help_label_target', 'ssh_help_step_remove', 'ssh_help_label_panel',
+    'ssh_help_step_readonly', 'ssh_help_retry',
+    'enroll_error_retest', 'enroll_error_trust_conflict',
+    'enroll_error_trust_readonly',
+}
+
+PRE_PANEL_ACCESS_KEYS_SHA256 = 'c70dff505a825b0a8506b2d1ca7d76fca9378e3f9514cc44231f7fd2a847af36'
+# Keys of the "Copy instance" panel: a later addition, declared here so the
+# frozen catalogue hash keeps guarding the original keys.
+COPY_INSTANCE_KEYS = {
+    "copy_instance_btn", "copy_instance_title", "copy_instance_desc",
+    "copy_instance_source", "copy_instance_target", "copy_instance_target_missing",
+    "copy_instance_checking", "copy_instance_preview", "copy_instance_port_busy",
+    "copy_instance_image", "copy_instance_key_warning", "copy_instance_start",
+    "copy_instance_running", "copy_instance_step", "copy_instance_success",
+    "copy_instance_failed", "copy_instance_cancelled", "copy_instance_cancel",
+    "copy_instance_close", "copy_instance_log", "copy_instance_connections",
+    "copy_instance_disk_low",
+}
+PANEL_ACCESS_KEYS = {
+    'panel_access_title',
+    'panel_access_intro',
+    'panel_access_ip_enable',
+    'panel_access_ip_hint',
+    'panel_access_ip_list_label',
+    'panel_access_domain_only',
+    'panel_access_domain_hint',
+    'panel_access_domain_label',
+}
+
+# Explicit additions from #319; keep the pre-existing catalogue fingerprint.
+USER_LIMIT_KEYS = {'max_connections_per_user_label', 'max_connections_per_user_hint'}
+TELEGRAM_ACCOUNT_KEYS = {
+    'telegram_auto_create_users', 'telegram_auto_create_users_desc',
+    'telegram_create_users_disabled', 'telegram_create_users_disabled_desc',
+    'telegram_webapp_auth', 'telegram_webapp_auth_desc',
+    'telegram_webapp_auth_invalid', 'telegram_webapp_auth_unavailable',
+    'telegram_webapp_account_not_found',
+}
+# Read-only S3 storage card on the Settings page (docs/S3_STORAGE.md).
+STORAGE_KEYS = {
+    'storage_title', 'storage_bucket', 'storage_prefix', 'storage_prefix_root',
+    'storage_endpoint', 'storage_endpoint_default', 'storage_region',
+    'storage_fencing', 'storage_fencing_enforced', 'storage_fencing_unfenced',
+    'storage_unfenced_hint', 'storage_generation', 'storage_files',
+    'storage_last_sync', 'storage_never', 'storage_last_error', 'storage_no_error',
+    'storage_fenced_warning', 'storage_env_hint',
+}
+
+PROTOCOL_UNINSTALL_KEYS = {
+    'uninstall_archive_confirm', 'uninstall_archived',
+    'blocked_peer_still_active',
+}
+
+SUBSCRIPTION_KEYS = {
+    'subscription_title', 'subscription_desc', 'subscription_enable',
+    'subscription_server_label', 'subscription_server_hint',
+    'subscription_path_label', 'subscription_path_hint', 'subscription_push',
+    'subscription_name_label', 'subscription_name_hint', 'subscription_copy',
+    'vless_enc_btn', 'vless_enc_title', 'vless_enc_subtitle',
+    'vless_enc_enable', 'vless_enc_disable', 'vless_enc_state_on',
+    'vless_enc_warning', 'vless_enc_xhttp_required', 'vless_enc_apply',
+}
+
+# `close` просят крестики модалок. В каталоге ключа не было, поэтому
+# aria-label/title показывали сырое слово вместо перевода.
+CLOSE_KEYS = {'close'}
+
+# Server IPv4 policy (egress SNAT + ingress binding) in the IP settings modal.
+IPV4_POLICY_KEYS = {
+    'ipv4_egress_title', 'ipv4_egress_label', 'ipv4_egress_hint',
+    'ipv4_status_none', 'ipv4_status_rule', 'ipv4_status_assigned',
+    'ipv4_status_verified', 'ipv4_status_container', 'ipv4_ingress_title',
+    'ipv4_ingress_label', 'ipv4_ingress_hint', 'ipv4_recreate_btn',
+    'ipv4_recreate_confirm', 'ipv4_ingress_saved',
+}
+
+# I1 masking block (per-instance special-junk packet): install and settings.
+AWG_I1_KEYS = {
+    'awg_i1_ascii_only', 'awg_i1_auto_badge', 'awg_i1_bad_tag',
+    'awg_i1_badge_custom', 'awg_i1_canonical_tag',
+    'awg_i1_badge_default', 'awg_i1_badge_unknown', 'awg_i1_bytes_unit',
+    'awg_i1_clear', 'awg_i1_custom_domain', 'awg_i1_domain',
+    'awg_i1_domain_custom', 'awg_i1_domain_hint', 'awg_i1_empty',
+    'awg_i1_extra_hint', 'awg_i1_generate', 'awg_i1_install_memo',
+    'awg_i1_install_status', 'awg_i1_intro', 'awg_i1_manual',
+    'awg_i1_manual_hint', 'awg_i1_memo_default', 'awg_i1_memo_generated',
+    'awg_i1_need_domain', 'awg_i1_packet', 'awg_i1_pool',
+    'awg_i1_pool_hint', 'awg_i1_profile', 'awg_i1_profile_android',
+    'awg_i1_profile_any', 'awg_i1_profile_apple', 'awg_i1_profile_hint',
+    'awg_i1_profile_linux', 'awg_i1_profile_windows', 'awg_i1_regenerate',
+    'awg_i1_row_answer', 'awg_i1_row_flags', 'awg_i1_row_id',
+    'awg_i1_row_id_value', 'awg_i1_row_question', 'awg_i1_row_size',
+    'awg_i1_settings_status', 'awg_i1_title', 'awg_i1_valid',
+}
+# WARP refuses to install on a host without an AmneziaWG instance; the
+# marketplace badge and the operation error share this wording.
+SRV_WARP_NO_AWG_KEYS = {
+    'srv_warp_no_awg', 'srv_warp_err_no_awg',
+# Keys of later panels that were merged without registering them here; before
+# this set existed the frozen hash failed on an unchanged catalogue.
+}
+LATER_FEATURE_KEYS = {
+    'exit_awg3', 'exit_awg3_hint',
+    'max_connections_per_user_hint', 'max_connections_per_user_label',
+    'haproxy_desc', 'haproxy_port_hint', 'last_seen',
+    'smartroute_mark_lost', 'smartroute_mark_lost_hint',
+    'smartroute_mark_on', 'smartroute_mark_on_hint',
+    'smartroute_mark_paused', 'smartroute_mark_paused_hint',
+    'sort', 'sort_ascending', 'sort_by', 'sort_created',
+    'sort_descending', 'sort_direction', 'sort_expiry', 'sort_handshake',
+    'sort_ip', 'sort_max_speed', 'sort_name', 'sort_quota', 'sort_rx',
+    'sort_total_traffic', 'sort_tx',
+    'xray_domain', 'xray_domain_hint',
+    'xray_fingerprint_btn', 'xray_fingerprint_hint',
+    'xray_fingerprint_label', 'xray_fingerprint_saved',
+    'xray_fingerprint_title',
+    'xray_selfsteal', 'xray_selfsteal_apply', 'xray_selfsteal_current',
+    'xray_selfsteal_empty', 'xray_selfsteal_hint',
+    'xray_selfsteal_not_running', 'xray_selfsteal_note',
+    'xray_selfsteal_success', 'xray_selfsteal_target', 'xray_selfsteal_title',
+    'xray_transport', 'xray_transport_hint', 'xray_transport_tcp',
+    'xray_transport_xhttp', 'xray_update_hint',
+    'xray_update_stage_arch', 'xray_update_stage_build',
+    'xray_update_stage_check', 'xray_update_stage_done',
+    'xray_update_stage_host', 'xray_update_stage_start',
+    'xray_update_stage_swap', 'xray_update_stage_verify',
+    'xray_update_stage_version',
+    'subscription_copy', 'subscription_desc', 'subscription_enable',
+    'subscription_name_hint', 'subscription_name_label',
+    'subscription_path_hint', 'subscription_path_label', 'subscription_push',
+    'subscription_server_hint', 'subscription_server_label',
+    'subscription_title', 'vless_enc_apply', 'vless_enc_btn',
+    'vless_enc_disable', 'vless_enc_enable', 'vless_enc_state_on',
+    'vless_enc_subtitle', 'vless_enc_title', 'vless_enc_warning',
+    'vless_enc_xhttp_required',
+}
+# Added by the v1.8.11 release (max connections per user + Telegram WebApp auth).
+# Registered here so the frozen catalogue hash keeps checking the older keys.
+RELEASE_1811_KEYS = {
+    'max_connections_per_user_label', 'max_connections_per_user_hint',
+    'telegram_auto_create_users', 'telegram_auto_create_users_desc',
+    'telegram_create_users_disabled', 'telegram_create_users_disabled_desc',
+    'telegram_webapp_account_not_found', 'telegram_webapp_auth',
+    'telegram_webapp_auth_desc', 'telegram_webapp_auth_invalid',
+    'telegram_webapp_auth_unavailable',
+}
+
+
+# Smart Route timer health (self-heal PR): a later addition, declared here so
+# the frozen catalogue hash keeps guarding the original keys.
+SMARTROUTE_TIMER_KEYS = {
+    'smartroute_timer_warn', 'smartroute_timer_age', 'smartroute_timer_never',
+    'smartroute_timer_stale', 'smartroute_timer_armed', 'smartroute_card_warn',
+}
+
+# Lifecycle fence banner (#341): a later addition, declared here so the frozen
+# catalogue hash keeps guarding the original keys.
+LIFECYCLE_FENCE_KEYS = {
+    'lifecycle_fence_title', 'lifecycle_fence_how', 'lifecycle_fence_steps',
+    'lifecycle_fence_scope_global', 'lifecycle_fence_server',
+    'lifecycle_fence_operation', 'lifecycle_fence_reason',
+    'lifecycle_fence_since',
+}
+
+SECURITY_SETUP_KEYS = {
+    'setup_title', 'setup_password_confirm', 'setup_submit', 'setup_creating',
+    'setup_error', 'setup_username_invalid', 'setup_password_short',
+    'setup_password_mismatch', 'setup_already_completed', 'legacy_backup_disabled',
+}
+
+# Cheburcheck (Russia block check) keys. They are registered in NEW_KEYS too, but
+# the frozen catalogue hash still contains the ipv6 additions, so the hash may
+# only subtract the sets that came after it.
+CHEBURCHECK_KEYS = {
+    'cheburcheck_title', 'cheburcheck_loading', 'cheburcheck_hint',
+    'cheburcheck_ban_badge', 'cheburcheck_unknown_badge', 'cheburcheck_no_data',
+    'cheburcheck_error', 'cheburcheck_checked_at', 'cheburcheck_regions_blocked',
+    'cheburcheck_banned', 'cheburcheck_clean', 'cheburcheck_unknown',
+    'cheburcheck_run_now', 'cheburcheck_checking', 'cheburcheck_settings_title',
+    'cheburcheck_settings_intro', 'cheburcheck_enable', 'cheburcheck_enable_hint',
+    'cheburcheck_interval', 'cheburcheck_interval_hint', 'cheburcheck_servers_label',
+    'cheburcheck_servers_hint', 'cheburcheck_run_all', 'cheburcheck_none_enabled',
+    'cheburcheck_running_all', 'cheburcheck_banned_count',
+    'cheburcheck_just_now', 'cheburcheck_min_ago', 'cheburcheck_hours_ago',
+    'cheburcheck_days_ago', 'cheburcheck_stale', 'cheburcheck_master_off',
+    'cheburcheck_still_running',
+    'cheburcheck_button', 'cheburcheck_quiet_enable', 'cheburcheck_quiet_hint',
+    'cheburcheck_quiet_from', 'cheburcheck_quiet_to',
+    'cheburcheck_target', 'cheburcheck_status', 'cheburcheck_regions_short',
+    'cheburcheck_partial', 'cheburcheck_no_targets', 'cheburcheck_targets_intro',
+    'cheburcheck_targets_show',
+    'cheburcheck_restrictions',
+    'cheburcheck_remarks_badge',
+    'cheburcheck_remarks_only',
+    'cheburcheck_remarks_found',
+    'cheburcheck_static_hit',
+    'cheburcheck_static_rkn',
+    'cheburcheck_override_toggle',
+    'cheburcheck_override_placeholder',
+    'cheburcheck_probe_no_data',
+    'cheburcheck_token_label', 'cheburcheck_token_placeholder',
+    'cheburcheck_token_set', 'cheburcheck_token_not_set',
+    'cheburcheck_token_hint', 'cheburcheck_token_check',
+    'cheburcheck_token_ok', 'cheburcheck_token_failed',
+    'cheburcheck_token_required', 'cheburcheck_token_open_settings',
+    'cheburcheck_token_docs',
+    'cheburcheck_token_basic_only', 'cheburcheck_token_docs_link',
+    'cheburcheck_static_only', 'cheburcheck_static_only_note',
+    'cheburcheck_progress',
+    'cheburcheck_token_ok_free', 'cheburcheck_token_credits_hint',
+}
+
+
+def read_text(path):
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
+
+
+def load_json(path):
+    return json.loads(read_text(path))
+
+
+def region(start, end):
+    template = read_text(TEMPLATE_FILE)
+    first = template.index(start)
+    return template[first:template.index(end, first)]
+
+
+def translation(locale):
+    return load_json(os.path.join(ROOT, "translations", locale + ".json"))
+
+
+class TestC1ChipStates(unittest.TestCase):
+    def setUp(self):
+        self.chip = region("function ipHostChipStyle", "function renderIpSettings")
+
+    def test_ipv4_uses_the_shared_state_mapping(self):
+        self.assertIn("host.ipv4_state", self.chip)
+        self.assertIn("absent", self.chip)
+        self.assertIn("no_route", self.chip)
+        self.assertIn("disabled", self.chip)
+        self.assertIn("state: 'bad'", self.chip)
+        self.assertIn("state: 'neutral'", self.chip)
+        self.assertNotIn("ipChip('on', '✓', `IPv4", self.chip)
+
+    def test_chip_carries_address_and_counts(self):
+        self.assertIn("server_ipv6_state_in_use_desc", self.chip)
+        self.assertIn("{n}", self.chip)
+        self.assertIn("{m}", self.chip)
+        self.assertIn("host.ipv4", self.chip)
+        self.assertIn("host.ipv6", self.chip)
+
+
+class TestC2PreferenceModal(unittest.TestCase):
+    def setUp(self):
+        self.modal = region(
+            '<div class="modal-backdrop" id="ipSettingsModal">',
+            '<div class="modal-backdrop" id="awgSettingsModal">',
+        )
+        self.script = read_text(TEMPLATE_FILE)
+
+    def test_radios_mark_dirty_instead_of_saving(self):
+        self.assertEqual(self.modal.count('onchange="markIpv6PrefDirty()"'), 3)
+        self.assertNotIn('onchange="saveIpv6Preference()"', self.modal)
+
+    def test_primary_save_and_cancel_exist(self):
+        self.assertIn('id="ipPrefSave"', self.modal)
+        self.assertIn('onclick="saveIpv6Preference()"', self.modal)
+        self.assertIn('onclick="closeIpSettings()"', self.modal)
+        self.assertIn("disabled", self.modal.split('id="ipPrefSave"', 1)[1][:120])
+
+    def test_close_guards_dirty_state_and_restores(self):
+        self.assertIn("function closeIpSettings", self.script)
+        self.assertIn("server_ipv6_discard_confirm", self.script)
+        self.assertIn("function restoreIpv6Preference", self.script)
+        self.assertIn("if (ipv6PrefDirty", self.script)
+
+
+class TestC3SingleWriter(unittest.TestCase):
+    def setUp(self):
+        self.row = region("function awgIpv6Changed", "async function saveInstanceIpv6")
+        self.open_settings = region("async function openAwgSettings", "async function saveAwgSettings")
+        self.save_settings = region("async function saveAwgSettings", "// ========== Exit node ==========")
+
+    def test_enable_and_apply_follow_capabilities(self):
+        self.assertIn("canEnable", self.row)
+        self.assertIn("canWrite", self.row)
+        self.assertIn("on.disabled = !!exitLinked || !enableAllowed", self.row)
+        self.assertIn("applyBtn.disabled = !awgIpv6CanWrite", self.row)
+        self.assertIn("blockedReason", self.row)
+
+    def test_changed_ipv6_blocks_the_general_save(self):
+        self.assertIn("awgSaveBtn", self.row)
+        self.assertIn("server_ipv6_apply_or_revert_hint", self.row)
+        self.assertIn("btn.disabled = awgIpv6Changed()", self.save_settings)
+
+    def test_open_passes_can_enable_and_can_write(self):
+        self.assertIn("ipInst.can_enable", self.open_settings)
+        self.assertIn("ipStatusCache.can_write", self.open_settings)
+
+
+class TestC4InstallGate(unittest.TestCase):
+    def setUp(self):
+        self.note = region("function setInstallIpv6Pending", "async function saveIpv6Preference")
+        self.install = region("async function installProtocol", "function formatBackupTime")
+
+    def test_pending_docker_blocks_install(self):
+        self.assertIn("server_ipv6_after_docker_restart", self.note)
+        self.assertIn("kind = 'pending'", self.note)
+        self.assertIn("setInstallIpv6Pending(kind === 'pending')", self.note)
+        self.assertIn("installBtn", self.note)
+        self.assertIn("server_ipv6_enable_docker_first", self.note)
+
+    def test_install_error_maps_docker_pending(self):
+        self.assertIn("switch (err.payload?.code)", self.install)
+        self.assertIn("'docker_pending'", self.install)
+        self.assertIn("server_ipv6_enable_docker_first", self.install)
+
+
+class TestC5Styles(unittest.TestCase):
+    def setUp(self):
+        self.css = read_text(CSS_FILE)
+
+    def test_switch_component_is_complete(self):
+        self.assertIn(".switch {", self.css)
+        self.assertIn(".switch .slider", self.css)
+        self.assertIn(":focus-visible", self.css)
+        self.assertIn(":disabled + .slider", self.css)
+        self.assertIn("inset-inline-start", self.css)
+
+    def test_rtl_and_red_states(self):
+        self.assertIn("border-inline-start", self.css)
+        self.assertIn("text-align: start", self.css)
+        self.assertIn('data-state="bad"', self.css)
+
+    def test_phone_table_becomes_cards(self):
+        self.assertIn("@media (max-width: 640px)", self.css)
+        self.assertIn(".ip-modal-table tr {", self.css)
+        self.assertIn("attr(data-label)", self.css)
+
+    def test_server_ip_chips_wrap_without_resizing_header_actions(self):
+        template = read_text(TEMPLATE_FILE)
+        header = template[template.index('<!-- Server Info Header -->'):
+                          template.index('<!-- Installed Applications Section -->')]
+        self.assertIn('class="srv-header__identity"', header)
+        self.assertIn('class="srv-header__ident"', header)
+        self.assertIn('class="page-header__actions srv-header__tools"', header)
+        self.assertIn('id="serverIpChips"', header)
+        identity = re.search(r'\.srv-header__identity\s*\{([^}]+)\}', template).group(1)
+        self.assertRegex(identity, r'min-width:\s*0')
+        for selector in (r'\.srv-header__tools', r'\.srv-header \.ip-chips',
+                         r'\.srv-header__actions'):
+            rule = re.search(selector + r'\s*\{([^}]+)\}', template).group(1)
+            self.assertRegex(rule, r'flex-wrap:\s*wrap')
+        self.assertRegex(template, r'(?s)@media \(max-width: 640px\).*?'
+                                  r'\.srv-header__tools\s*\{\s*display:\s*grid;')
+
+
+FORK_KEYS = {
+    'dashboard_no_snapshot',
+    'dashboard_observed',
+    'dashboard_refresh_error',
+    'dashboard_refreshing',
+    'dashboard_stale',
+    'install_lifecycle_busy',
+    'install_outcome_unknown',
+    'install_recovery_required',
+    'install_still_running',
+    'install_waiting',
+    'update_error',
+    'update_no_newer',
+    'update_no_release',
+    'update_rate_limit',
+    'update_timeout',
+    'update_uncomparable',
+    'view_releases',
+}
+
+
+class TestC6Translations(unittest.TestCase):
+    def test_key_sets_are_equal_and_keep_existing_keys(self):
+        sets = {locale: set(translation(locale)) for locale in LOCALES}
+        base = sets[LOCALES[0]]
+        for locale in LOCALES[1:]:
+            self.assertEqual(sets[locale], base, locale)
+        self.assertTrue(PANEL_ACCESS_KEYS <= base, 'panel access translations missing')
+        # Panels added after the snapshot must declare their keys here, the way
+        # PANEL_ACCESS_KEYS does. The keys already inside the frozen hash (e.g.
+        # the ipv6 set) must NOT be subtracted again.
+        previous = '\n'.join(sorted(base - PANEL_ACCESS_KEYS - SECURITY_SETUP_KEYS
+                                    - CHEBURCHECK_KEYS - PROTOCOL_UNINSTALL_KEYS
+                                    - TORRENT_GUARD_KEYS
+                                    - TORRENT_PLUGIN_KEYS
+                                    - AWG_I1_KEYS - SRV_WARP_NO_AWG_KEYS
+                                    - COPY_INSTANCE_KEYS - LATER_FEATURE_KEYS
+                                    - RELEASE_1811_KEYS - USER_LIMIT_KEYS - TELEGRAM_ACCOUNT_KEYS
+                                    - LIFECYCLE_FENCE_KEYS - STORAGE_KEYS
+                                    - SUBSCRIPTION_KEYS - CLOSE_KEYS
+                                    - SSH_HELP_KEYS - SMARTROUTE_TIMER_KEYS
+                                    - IPV4_POLICY_KEYS - FORK_KEYS))
+        self.assertEqual(hashlib.sha256(previous.encode('utf-8')).hexdigest(),
+                         PRE_PANEL_ACCESS_KEYS_SHA256,
+                         'Existing catalogue changed outside the declared additions')
+
+    def test_new_keys_present_in_every_locale(self):
+        for locale in LOCALES:
+            data = translation(locale)
+            for key in (NEW_KEYS | PANEL_ACCESS_KEYS | PROTOCOL_UNINSTALL_KEYS
+                        | TORRENT_GUARD_KEYS | TORRENT_PLUGIN_KEYS | AWG_I1_KEYS | USER_LIMIT_KEYS | TELEGRAM_ACCOUNT_KEYS
+                        | LIFECYCLE_FENCE_KEYS | SUBSCRIPTION_KEYS | CLOSE_KEYS
+                        | SMARTROUTE_TIMER_KEYS | IPV4_POLICY_KEYS):
+                self.assertIn(key, data)
+                self.assertTrue(str(data[key]).strip(), "%s empty in %s" % (key, locale))
+
+    def test_new_keys_have_no_cyrillic_outside_russian(self):
+        for locale in NON_RU:
+            data = translation(locale)
+            for key in NEW_KEYS:
+                bad = [c for c in data[key] if "\u0400" <= c <= "\u04ff"]
+                self.assertFalse(bad, "%s has Cyrillic in %s" % (key, locale))
+
+
+class TestC7DesignParity(unittest.TestCase):
+    def test_design_file_lists_every_template_key(self):
+        design = load_json(DESIGN_FILE)
+        used = set(KEY_LITERAL_RE.findall(read_text(TEMPLATE_FILE)))
+        self.assertEqual(set(design), used)
+        self.assertIn("server_ipv6_state_in_use_desc", design)
+
+    def test_design_file_has_every_locale(self):
+        for key, value in load_json(DESIGN_FILE).items():
+            for locale in LOCALES:
+                self.assertIn(locale, value, "%s missing %s" % (key, locale))
+
+    def test_i18n_test_scans_map_literals(self):
+        source = read_text(I18N_TEST_FILE)
+        self.assertIn("KEY_LITERAL_RE", source)
+        self.assertIn("KEY_LITERAL_RE.findall(template)", source)
+
+
+if __name__ == "__main__":
+    unittest.main()

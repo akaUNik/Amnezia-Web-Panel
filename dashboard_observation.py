@@ -4,7 +4,7 @@ import copy
 from peer_recovery import GENERATION
 
 
-TARGET_FIELDS = ('uid', 'host', 'ssh_port', 'username', 'password', 'private_key')
+TARGET_FIELDS = ('uid', 'host', 'ssh_port', 'username', 'password', 'private_key', 'ssh_credentials')
 
 
 def same_target(left, right):

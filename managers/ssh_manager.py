@@ -10,11 +10,59 @@ import threading
 import logging
 import shlex
 import os
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from managers import ssh_trust
 from managers.ssh_errors import SSHConnectionUnavailable
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_JUMP = object()
+_JUMP_RESOLVER = None
+
+# How long a worker may queue for the per-server exec lock on top of the
+# command's own budget. Without a bound, a single stuck command parks every
+# other request thread on this lock until uvicorn runs out of workers.
+_EXEC_LOCK_SLACK = 15.0
+# Ceiling for that wait. A legitimately long operation may hold the lock for
+# minutes (docker build 600s, smartroute 420s, archive transfer 900s); an
+# interactive request must not inherit that wait, or the panel stops serving
+# again — it gets "busy" instead.
+_EXEC_WAIT_MAX = 120.0
+
+_SFTP_TIMEOUT = 120.0
+# Extra time the kill switch gives the graceful timeout path before it closes
+# the socket underneath a blocked paramiko call.
+_KILL_SWITCH_GRACE = 15.0
+# How long disconnect()/force_disconnect() wait for an in-flight operation.
+_LOCK_WAIT_MAXIMUM = 5.0
+
+# Jump hosts: opening the direct-tcpip channel through a jump transport uses
+# paramiko's per-transport channel_timeout, which defaults to one hour.
+_CHANNEL_OPEN_TIMEOUT = 30.0
+
+
+class SSHBusy(ConnectionError):
+    """The server is busy with another SSH operation; nothing was executed.
+
+    Deliberately not a plain ConnectionError for the peer lifecycle interlock:
+    a refusal to start must never fence the panel ("nothing ran" is a known
+    outcome), while a lost reply is.
+    """
+
+    code = 'ssh_busy'
+    nothing_executed = True
+
+
+class SSHBackoff(SSHBusy, SSHConnectionUnavailable):
+    """The connect circuit breaker is open; nothing was executed either."""
+
+    code = 'ssh_backoff'
+
+
+def configure_jump_resolver(resolver):
+    """Set the panel callback that resolves a jump manager for an endpoint."""
+    global _JUMP_RESOLVER
+    _JUMP_RESOLVER = resolver
 
 
 def _conn_lock_of(obj):
@@ -22,16 +70,34 @@ def _conn_lock_of(obj):
     return getattr(obj, '_conn_lock', None) or nullcontext()
 
 
+def _exec_lock_of(obj):
+    """_exec_lock, or None for objects built without __init__ (tests)."""
+    return getattr(obj, '_exec_lock', None)
+
+
 class SSHManager:
     """Manages SSH connections and command execution on remote servers."""
 
+    # Class-level default: tests build managers via __new__() without __init__,
+    # and a missing identity must mean "unknown target" (the fence then behaves
+    # globally) rather than an AttributeError on every command.
+    server_scope = None
+
     def __init__(self, host, port, username, password=None, private_key=None,
-                 connect_cooldown_base=30.0):
+                 connect_cooldown_base=30.0, jump_manager=_DEFAULT_JUMP,
+                 server_scope=None):
         self.host = host
         self.port = int(port)
         self.username = username
+        # Identity used by the lifecycle fence: a fence recorded for this
+        # server must block its commands, while an unrelated server keeps
+        # working. Refreshed by app.get_ssh() when a pooled manager is reused.
+        self.server_scope = server_scope
         self.password = password
         self.private_key = private_key
+        self.jump_manager = (_JUMP_RESOLVER(host, int(port), username)
+                             if jump_manager is _DEFAULT_JUMP and _JUMP_RESOLVER
+                             else (None if jump_manager is _DEFAULT_JUMP else jump_manager))
         self.client = None
         self._is_root = (username == 'root')
         # Serializes connect/disconnect so concurrent threads (UI request
@@ -77,7 +143,10 @@ class SSHManager:
         # producing "Unable to open channel" bursts and hanging service checks.
         # Use the same lock as command execution and make a live pooled
         # connection idempotent.
-        with self._exec_lock:
+        with self._exec_slot(None) as slot:
+            if not slot:
+                raise SSHBusy(
+                    f"SSH to {self.host} is still busy with another operation")
             with self._conn_lock:
                 if self.pooled:
                     try:
@@ -121,6 +190,98 @@ class SSHManager:
                     raise SSHConnectionUnavailable('SSH connection could not be established') from last_exc
                 self._reset_connect_failures()
         return True
+
+    @contextmanager
+    def _exec_slot(self, timeout):
+        """Bounded wait for the per-server exec lock (yields True when held).
+
+        A command that never returns used to leave every later request blocked
+        on this lock *forever*: sync endpoints and `asyncio.to_thread` SSH calls
+        share uvicorn's 40-thread pool, so those parked threads end up serving
+        no HTTP request at all and the whole panel stops answering while the
+        container still looks healthy.
+
+        The wait is the caller's own budget, never the holder's: a long archive
+        transfer or a docker build must not park every request to that server.
+        The request gets an honest "busy" instead, and the panel stays alive.
+        """
+        lock = _exec_lock_of(self)
+        if lock is None:
+            yield True
+            return
+        budget = (float(timeout) if timeout else 60.0) + _EXEC_LOCK_SLACK
+        acquired = lock.acquire(timeout=min(budget, _EXEC_WAIT_MAX))
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                lock.release()
+
+    @contextmanager
+    def _kill_switch(self, seconds, what='call'):
+        """Close the transport when a single SSH call outlives its budget.
+
+        paramiko has waits without a timeout of their own: `recv_exit_status()`
+        blocks on an Event, channel reads and SFTP requests have none at all.
+        When the route to a managed node changes, packets are blackholed — the
+        TCP socket stays open, `is_active()` keeps returning True and every
+        blocked call stays blocked for hours. The timer closes the socket so
+        the blocked call raises instead of holding a worker thread forever.
+        """
+        client = self.client
+        done = threading.Event()
+        fired = []
+
+        def _abort():
+            # cancel() cannot stop a callback that already started, and by then
+            # the command may have finished and a new transport may be in use.
+            if done.is_set():
+                return
+            fired.append(True)
+            logger.error(
+                f"SSH {what} on {self.host} exceeded {seconds:g}s; "
+                f"closing a transport that may be dead")
+            # Close the transport this call started on *and* the current one:
+            # ensure_connected() may have replaced it while the call was stuck.
+            targets = []
+            for candidate in (client, self.client):
+                if candidate is not None and all(candidate is not t for t in targets):
+                    targets.append(candidate)
+            for target in targets:
+                if done.is_set():
+                    return
+                try:
+                    target.close()
+                except Exception:
+                    pass
+
+        timer = threading.Timer(max(0.05, float(seconds)), _abort)
+        timer.daemon = True
+        timer.start()
+        try:
+            yield fired
+        finally:
+            done.set()
+            timer.cancel()
+
+    def _drop_transport(self):
+        """Close a dead/suspect transport (caller holds _conn_lock)."""
+        try:
+            self._disconnect_locked()
+        except Exception:
+            self.client = None
+
+    def _transport_alive(self):
+        """True while paramiko still believes the transport works.
+
+        For a blackholed route this stays True (nothing arrives to close it),
+        but after the kill switch closes the socket it reports the truth.
+        """
+        try:
+            transport = self.client.get_transport() if self.client else None
+            return bool(transport and transport.is_active())
+        except Exception:
+            return False
 
     def _record_connect_failure(self):
         """Feed the breaker from any failed connect path (caller holds
@@ -176,6 +337,16 @@ class SSHManager:
         elif self.password:
             kwargs['password'] = self.password
 
+        if self.jump_manager is not None:
+            self.jump_manager.ensure_connected()
+            transport = (self.jump_manager.client.get_transport()
+                         if self.jump_manager.client else None)
+            if not transport or not transport.is_active():
+                raise ConnectionError('SSH jump host transport is unavailable')
+            kwargs['sock'] = transport.open_channel(
+                'direct-tcpip', (self.host, self.port), ('127.0.0.1', 0),
+                timeout=_CHANNEL_OPEN_TIMEOUT)
+
         client = self.client
         watchdog = threading.Timer(timeout, client.close)
         watchdog.daemon = True
@@ -185,6 +356,15 @@ class SSHManager:
         finally:
             watchdog.cancel()
             watchdog.join()
+        # paramiko's default channel_timeout is one hour: with a blackholed
+        # route, open_session()/open_sftp() stay blocked that long with no
+        # error. 30s is plenty for a channel open on a live transport.
+        try:
+            transport = self.client.get_transport()
+            if transport is not None:
+                transport.channel_timeout = 30.0
+        except Exception:
+            pass
         # Keep NAT/stateful firewalls from silently dropping the idle
         # long-lived transport between command bursts.
         try:
@@ -210,13 +390,25 @@ class SSHManager:
         """
         if self.pooled:
             return
-        with self._conn_lock:
+        # Bounded: an archive transfer can hold this lock for minutes and a
+        # legacy finally-block must not park a worker behind it.
+        if not self._conn_lock.acquire(timeout=_LOCK_WAIT_MAXIMUM):
+            logger.warning(f"SSH disconnect on {self.host} skipped: connection busy")
+            return
+        try:
             self._disconnect_locked()
+        finally:
+            self._conn_lock.release()
 
     def force_disconnect(self):
         """Unconditionally close SSH connection (pool eviction etc.)."""
-        with self._conn_lock:
+        if not self._conn_lock.acquire(timeout=_LOCK_WAIT_MAXIMUM):
+            logger.warning(f"SSH eviction on {self.host} skipped: connection busy")
+            return
+        try:
             self._disconnect_locked()
+        finally:
+            self._conn_lock.release()
 
     # ----- docker container state snapshot (batch status checks) -----
 
@@ -282,7 +474,7 @@ class SSHManager:
         # Cooldown after a recent failed attempt: fail fast instead of
         # blocking the worker on another 15s connect to a dead server.
         if time.time() - self._last_connect_fail < self._connect_cooldown:
-            raise SSHConnectionUnavailable(
+            raise SSHBackoff(
                 f"SSH to {self.host} recently failed, backing off "
                 f"{int(self._connect_cooldown)}s")
         # connect() itself feeds the breaker on failure and resets it on
@@ -301,9 +493,16 @@ class SSHManager:
         eviction) cannot tear down the transport mid-command.
         """
         from peer_lifecycle_lock import check_remote_fence
-        check_remote_fence()
-        with self._exec_lock, _conn_lock_of(self):
-            return self._run_command_locked(command, timeout, _retried, stdin_input)
+        check_remote_fence(self.server_scope)
+        with self._exec_slot(timeout) as slot:
+            if not slot:
+                logger.error(
+                    f"SSH to {self.host} is still busy with a previous command; "
+                    f"refusing to queue another request thread")
+                return "", (f"SSH to {self.host} is still busy with a previous "
+                            f"command"), -1
+            with _conn_lock_of(self):
+                return self._run_command_locked(command, timeout, _retried, stdin_input)
 
     @staticmethod
     def _reason(exc):
@@ -314,6 +513,7 @@ class SSHManager:
 
     def _run_command_locked(self, command, timeout, _retried, stdin_input=None):
         from peer_lifecycle_lock import note_ssh_uncertainty, check_remote_fence
+        timeout = float(timeout) if timeout else 60.0
         self.ensure_connected()
         deadline = time.monotonic() + timeout
         logger.info(f"Running command: {command[:100]}...")
@@ -340,7 +540,7 @@ class SSHManager:
                         raise
                     self._disconnect_locked()
                     self.connect(deadline=deadline)
-            check_remote_fence()
+            check_remote_fence(self.server_scope)
             channel.settimeout(remaining())
             # Paramiko's exec ACK wait ignores settimeout. Closing this exact
             # channel wakes it; no command worker is left behind on timeout.
@@ -387,7 +587,11 @@ class SSHManager:
                         raise EOFError('SSH command exited before stdin delivery')
                     code = channel.recv_exit_status()
                     if code == -1:
-                        raise EOFError('SSH exit status missing')
+                        note_ssh_uncertainty(self.server_scope)
+                        if not self._transport_alive():
+                            raise EOFError('remote exit status was not received')
+                        if not stderr:
+                            stderr.append(b'remote command was killed before reporting an exit status')
                     return (b''.join(stdout).decode('utf-8', errors='replace').strip(),
                             b''.join(stderr).decode('utf-8', errors='replace').strip(), code)
                 if channel.closed:
@@ -396,8 +600,10 @@ class SSHManager:
                     time.sleep(min(.01, remaining()))
         except Exception as exc:
             if dispatched:
-                note_ssh_uncertainty()
+                note_ssh_uncertainty(self.server_scope)
             reason = self._reason(exc)
+            if not self._transport_alive():
+                self._disconnect_locked()
             logger.error('SSH command failed: %s', reason)
             return '', f'SSH connection lost while running the command ({reason})', -1
         finally:
@@ -463,8 +669,71 @@ class SSHManager:
 
     def upload_file(self, content, remote_path):
         """Upload text content to a remote file via SFTP."""
-        with self._exec_lock, _conn_lock_of(self):
-            return self._upload_file_locked(content, remote_path)
+        from peer_lifecycle_lock import check_remote_fence
+        check_remote_fence(self.server_scope)
+        return self._sftp_call(
+            _SFTP_TIMEOUT, lambda: self._upload_file_locked(content, remote_path))
+
+    def _sftp_call(self, budget, operation):
+        """Run one SFTP operation under the exec lock and a hard deadline.
+
+        SFTP has no timeout of its own and open_sftp() waits on a channel open,
+        so a blackholed route parks the worker forever without the kill switch.
+        """
+        with self._exec_slot(budget) as slot:
+            if not slot:
+                raise RuntimeError(
+                    f"SSH to {self.host} is still busy with a previous command")
+            with _conn_lock_of(self), self._kill_switch(budget, 'sftp') as fired:
+                try:
+                    return operation()
+                except Exception as e:
+                    if fired:
+                        raise TimeoutError(
+                            f"SSH SFTP operation on {self.host} exceeded "
+                            f"{budget:g}s") from e
+                    raise
+
+    # Archives (backups, instance copies) are far bigger than the config files
+    # upload_file/download_file handle, so the whole operation gets a generous
+    # wall-clock budget and a stalled read is caught much earlier by the
+    # channel timeout.
+    SFTP_TRANSFER_BUDGET = 900.0
+    SFTP_INACTIVITY_TIMEOUT = 60.0
+
+    @contextmanager
+    def sftp_transfer(self, budget=None, inactivity=None):
+        """SFTP session for archives: bounded inactivity and a hard deadline.
+
+        `sftp.get()`/`sftp.put()` and `open_sftp()` have no timeout of their
+        own, so on a blackholed route they block a worker thread forever — the
+        issue #347 failure mode, reachable from the backup and copy endpoints
+        just as from the command path.
+        """
+        budget = float(budget or self.SFTP_TRANSFER_BUDGET)
+        inactivity = float(inactivity or self.SFTP_INACTIVITY_TIMEOUT)
+        with self._exec_slot(budget) as slot:
+            if not slot:
+                raise RuntimeError(
+                    f"SSH to {self.host} is still busy with a previous command")
+            with _conn_lock_of(self), self._kill_switch(budget, 'sftp transfer') as fired:
+                try:
+                    self.ensure_connected()
+                    sftp = self.client.open_sftp()
+                    try:
+                        sftp.get_channel().settimeout(inactivity)
+                        yield sftp
+                    finally:
+                        try:
+                            sftp.close()
+                        except Exception:
+                            pass
+                except Exception as e:
+                    if fired:
+                        raise TimeoutError(
+                            f"SSH transfer on {self.host} exceeded "
+                            f"{budget:g}s") from e
+                    raise
 
     def _upload_file_locked(self, content, remote_path):
         self.ensure_connected()
@@ -474,6 +743,7 @@ class SSHManager:
 
         sftp = self.client.open_sftp()
         try:
+            sftp.get_channel().settimeout(self.SFTP_INACTIVITY_TIMEOUT)
             with sftp.file(remote_path, 'w') as f:
                 f.write(content)
         finally:
@@ -505,14 +775,17 @@ class SSHManager:
 
     def download_file(self, remote_path):
         """Download text content from a remote file."""
-        with self._exec_lock, _conn_lock_of(self):
-            return self._download_file_locked(remote_path)
+        from peer_lifecycle_lock import check_remote_fence
+        check_remote_fence(self.server_scope)
+        return self._sftp_call(
+            _SFTP_TIMEOUT, lambda: self._download_file_locked(remote_path))
 
     def _download_file_locked(self, remote_path):
         self.ensure_connected()
 
         sftp = self.client.open_sftp()
         try:
+            sftp.get_channel().settimeout(self.SFTP_INACTIVITY_TIMEOUT)
             with sftp.file(remote_path, 'r') as f:
                 return f.read().decode('utf-8', errors='replace')
         finally:
@@ -520,14 +793,17 @@ class SSHManager:
 
     def file_exists(self, remote_path):
         """Check if a remote file exists."""
-        with self._exec_lock, _conn_lock_of(self):
-            return self._file_exists_locked(remote_path)
+        from peer_lifecycle_lock import check_remote_fence
+        check_remote_fence(self.server_scope)
+        return self._sftp_call(
+            _SFTP_TIMEOUT, lambda: self._file_exists_locked(remote_path))
 
     def _file_exists_locked(self, remote_path):
         self.ensure_connected()
 
         sftp = self.client.open_sftp()
         try:
+            sftp.get_channel().settimeout(self.SFTP_INACTIVITY_TIMEOUT)
             sftp.stat(remote_path)
             return True
         except FileNotFoundError:
